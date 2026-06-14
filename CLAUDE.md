@@ -72,6 +72,10 @@ Output resolution: input 640×640, WanVideo generates at 832×480, composites ba
 Original Tier 2: MobileFaceSwap on phone (Delaunay triangulation + Poisson blend).
 Our Tier 2: WanVideo 14B on cloud — much higher capacity, expect better FID/SSIM.
 
+## Reference Paper
+Original SITARA paper: `paper/PerCom 2026.pdf` (in this repo)
+Full notes extracted from it are in `docs/project-context.md` Section 2.
+
 ## Dataset
 - Currently downloaded: LUMS face-only dataset (16,500 frames, Ray-Ban Meta Stories)
   - Located: `data/dataset/` (gitignored)
