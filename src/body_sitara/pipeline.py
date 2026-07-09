@@ -5,6 +5,7 @@ import csv
 import urllib.request
 import numpy as np
 import mediapipe as mp
+from concurrent.futures import ThreadPoolExecutor
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 from rtmlib import Body, draw_skeleton
@@ -17,6 +18,10 @@ from .pose import (
     COCO_NOSE, COCO_LEFT_EYE, COCO_RIGHT_EYE, LK_PARAMS,
 )
 from .blur import blur_all_persons
+from .blur_seg import SelfieSegBlur
+from .blur_mobilesam import MobileSAMBlur, bboxes_from_keypoints
+from .blur_yoloseg import YOLOSegBlur
+from .face_canonical import FaceCanonicalizer, CANONICAL_SIZE
 from .tracking import PersonState, propagate_bboxes
 from .encryption import generate_ttp_keypair
 from .embedding import EmbeddingExtractor, EDGEFACE_ONNX_PATH
@@ -50,6 +55,7 @@ def process_video(
     skip_n            = 5,
     movement_adaptive = False,
     csv_out           = None,
+    anonymizer        = "convexhull",   # "convexhull" | "selfie_seg0" | "selfie_seg1" | "mobilesam" | "yoloseg"
 ):
     if benchmark:
         save_video = False
@@ -90,7 +96,7 @@ def process_video(
             ))
         print(f"    TTP private key saved to: {priv_path}")
     else:
-        print("\n[0/4] Benchmark mode — skipping RSA keypair generation")
+        print("\n[0/4] Benchmark mode -- skipping RSA keypair generation")
         ttp_private_key, ttp_public_key = None, None
 
     # [1] RTMPose
@@ -134,8 +140,36 @@ def process_video(
             print("  Running WITHOUT face embedding.")
             embedder = None
     else:
-        print("\n[3/4] Benchmark mode — skipping EdgeFace embedding model")
+        print("\n[3/4] Benchmark mode -- skipping EdgeFace embedding model")
         embedder = None
+
+    # [3b] Anonymizer backend
+    selfie_seg       = None
+    mobile_sam       = None
+    yolo_seg         = None
+    face_canonicalizer = None
+    if anonymizer.startswith("selfie_seg"):
+        _models_dir = os.path.join(os.path.dirname(__file__), "..", "..", "models")
+        _model_file = ("selfie_segmenter_landscape.tflite"
+                       if anonymizer == "selfie_seg1"
+                       else "selfie_segmenter.tflite")
+        _model_path = os.path.join(_models_dir, _model_file)
+        print(f"\n[3b] Loading MediaPipe SelfieSegmentation ({_model_file})...")
+        selfie_seg = SelfieSegBlur(model_path=_model_path)
+        print(f"     Anonymizer: {anonymizer}")
+        print(f"\n[3c] Loading FaceCanonicalizer (expression signal)...")
+        face_canonicalizer = FaceCanonicalizer(model_path='face_landmarker.task')
+    elif anonymizer == "mobilesam":
+        _ckpt = os.path.join(os.path.dirname(__file__), "..", "..", "models", "mobile_sam.pt")
+        print(f"\n[3b] Loading MobileSAM (ViT-Tiny)...")
+        mobile_sam = MobileSAMBlur(checkpoint_path=_ckpt, device="cpu")
+        print(f"     Anonymizer: mobilesam")
+    elif anonymizer == "yoloseg":
+        print(f"\n[3b] Loading YOLOv8-seg-nano (instance segmentation)...")
+        yolo_seg = YOLOSegBlur(model_name="yolov8n-seg.pt", infer_size=320, conf=0.4)
+        print(f"     Anonymizer: yoloseg")
+    else:
+        print(f"\n[3b] Anonymizer: convexhull")
 
     # [4] Video IO
     print("\n[4/4] Opening video...")
@@ -161,12 +195,17 @@ def process_video(
     print(f"FAR={FAR_THRESHOLD}px  MED={MEDIUM_THRESHOLD}px  "
           f"SLOW={SLOW_THRESHOLD}px  FAST={FAST_THRESHOLD}px\n")
 
+    # Three-panel output when canonicalizer is active: original | blurred | canonical
+    DISPLAY_H  = 640
+    _out_w     = (DISPLAY_H * 2 + DISPLAY_H) if face_canonicalizer is not None else width
+    _out_h     = DISPLAY_H                   if face_canonicalizer is not None else height
+
     out = None
     if save_video:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out    = cv2.VideoWriter(output_path, fourcc, fps_input, (width, height))
+        out    = cv2.VideoWriter(output_path, fourcc, fps_input, (_out_w, _out_h))
         if not out.isOpened():
-            print("  Warning: Could not open VideoWriter — video will not be saved.")
+            print("  Warning: Could not open VideoWriter -- video will not be saved.")
             out = None
 
     frame_idx        = 0
@@ -176,10 +215,14 @@ def process_video(
     active_indices   = set()
     current_N        = SKIP_N["medium"]
     movement_tier    = "medium"
-    last_keypoints   = None
-    last_scores      = None
-    last_bboxes      = None
-    last_mesh_cache  = {}
+    last_keypoints        = None
+    last_scores           = None
+    last_bboxes           = None
+    last_scaled_bboxes    = None   # YOLOX bboxes scaled to frame resolution for MobileSAM
+    last_seg_mask         = None   # last selfie-seg mask (bool H×W), propagated on skip frames
+    seg_mask_keypoints    = None   # keypoints at the time last_seg_mask was computed/warped
+    last_mesh_cache       = {}
+    last_canonical_face   = None   # last canonical expression image (CANONICAL_SIZE×CANONICAL_SIZE)
     prev_gray        = None
 
     prev_time   = time.time()
@@ -191,11 +234,18 @@ def process_video(
     t_facemesh_total = 0.0
     t_of_body_total  = 0.0
     t_of_face_total  = 0.0
-    t_blur_total     = 0.0
+    t_seg_total      = 0.0   # selfie-seg inference (runs parallel to det+pose)
+    t_canonical_total = 0.0  # face canonicalizer (every frame)
+    t_blur_total     = 0.0   # mask apply + warp only
     t_draw_total     = 0.0
     t_write_total    = 0.0
     t_encrypt_total  = 0.0
     t_embed_total    = 0.0
+
+    # Thread pools for parallelism (all C++ backends release the GIL)
+    _seg_pool   = ThreadPoolExecutor(max_workers=1)  # selfie seg ∥ det+pose
+    _lk_pool    = ThreadPoolExecutor(max_workers=2)  # body LK ∥ face LK
+    _write_pool = ThreadPoolExecutor(max_workers=1)  # async VideoWriter
 
     streams_flushed = 0
     loop_start      = time.time()
@@ -213,10 +263,33 @@ def process_video(
             full_frame_count += 1
             infer_frame = cv2.resize(frame, (INFER_SIZE, INFER_SIZE))
 
+            # yolo_seg runs BEFORE det+pose so ONNX Runtime CPU threads are idle.
+            # PyTorch and OnnxRuntime both use all CPU threads; running concurrently
+            # (or even back-to-back while ORT threads linger) causes severe slowdown.
+            if yolo_seg is not None and blur_bodies:
+                _t_yolo0 = time.time()
+                last_seg_mask = yolo_seg.get_mask(frame)
+                t_seg_total += time.time() - _t_yolo0
+
+            # selfie_seg: thread pool (TFLite releases GIL → true parallel with det+pose)
+            if selfie_seg is not None and blur_bodies:
+                _future_seg = _seg_pool.submit(selfie_seg.get_mask, frame, 256)
+            else:
+                _future_seg = None
+            _t_seg0 = time.time()
+
             t0     = time.time()
             bboxes = body.det_model(infer_frame)
             t_det_total += time.time() - t0
             last_bboxes = bboxes
+            # scale YOLOX bboxes from infer_frame space to original frame space
+            if bboxes is not None and len(bboxes) > 0:
+                sb = bboxes.copy().astype(float)
+                sb[:, 0] *= kp_scale_x; sb[:, 2] *= kp_scale_x
+                sb[:, 1] *= kp_scale_y; sb[:, 3] *= kp_scale_y
+                last_scaled_bboxes = sb[:, :4].tolist()
+            else:
+                last_scaled_bboxes = []
 
             t2 = time.time()
             keypoints, scores = body.pose_model(infer_frame, bboxes=bboxes)
@@ -243,7 +316,7 @@ def process_video(
                     t_embed_total   += emb_t
                     streams_flushed += 1
                     sid = person_states[dep_idx].stream_id[:8]
-                    print(f"  [STREAM] Person {dep_idx} departed → "
+                    print(f"  [STREAM] Person {dep_idx} departed -> "
                           f"stream {sid}... flushed "
                           f"(enc={enc_t*1000:.1f}ms emb={emb_t*1000:.1f}ms)")
                     del person_states[dep_idx]
@@ -256,7 +329,7 @@ def process_video(
                             ttp_public_key, enc_output_dir,
                             embedder, benchmark=benchmark
                         )
-                        print(f"  [STREAM] Person {i} appeared → "
+                        print(f"  [STREAM] Person {i} appeared -> "
                               f"stream {person_states[i].stream_id[:8]}... created")
 
                 per_person_movement = []
@@ -292,16 +365,26 @@ def process_video(
                                 x_off, y_off,
                                 x_off + crop_dims[0], y_off + crop_dims[1],
                             )
-                            crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-                            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=crop_rgb)
-                            result   = face_mesh.detect(mp_image)
-                            if result.face_landmarks:
-                                pts = project_landmarks(
-                                    result.face_landmarks[0],
-                                    x_off, y_off, crop_dims[0], crop_dims[1],
-                                )
-                                state.face_mesh_pts = pts
-                                last_mesh_cache[i]  = pts
+                            if face_canonicalizer is not None:
+                                # selfie_seg mode: canonicalizer handles face detection
+                                # (only run on person 0 — primary subject)
+                                if i == 0:
+                                    tc0 = time.time()
+                                    cf = face_canonicalizer.get_canonical_face(crop)
+                                    t_canonical_total += time.time() - tc0
+                                    if cf is not None:
+                                        last_canonical_face = cf
+                            else:
+                                crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+                                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=crop_rgb)
+                                result   = face_mesh.detect(mp_image)
+                                if result.face_landmarks:
+                                    pts = project_landmarks(
+                                        result.face_landmarks[0],
+                                        x_off, y_off, crop_dims[0], crop_dims[1],
+                                    )
+                                    state.face_mesh_pts = pts
+                                    last_mesh_cache[i]  = pts
                     else:
                         state.face_mesh_pts = None
                     t_facemesh_total += time.time() - t_fm0
@@ -326,6 +409,16 @@ def process_video(
                     if movement_adaptive:
                         current_N = SKIP_N[movement_tier]
 
+            # Update seg_mask_keypoints now that keypoints are known (yolo_seg ran before det)
+            if yolo_seg is not None and blur_bodies:
+                seg_mask_keypoints = keypoints.copy() if keypoints is not None and len(keypoints) > 0 else None
+
+            # Collect selfie-seg result (may already be done; blocks only if det+pose faster)
+            if _future_seg is not None:
+                last_seg_mask      = _future_seg.result()
+                seg_mask_keypoints = keypoints.copy() if keypoints is not None and len(keypoints) > 0 else None
+                t_seg_total       += time.time() - _t_seg0  # wall-time waited, not thread time
+
             prev_gray = curr_gray.copy()
 
             if full_frame_count % TIMING_INTERVAL == 0:
@@ -347,32 +440,54 @@ def process_video(
             skip_frame_count += 1
 
             if last_keypoints is not None and len(last_keypoints) > 0:
-                tracked_keypoints = []
+                n_persons = len(last_keypoints)
 
-                for i in range(len(last_keypoints)):
-                    old_pts = last_keypoints[i][:, :2].astype(np.float32).reshape(-1, 1, 2)
-                    tob0 = time.time()
-                    new_pts, _, _ = cv2.calcOpticalFlowPyrLK(
-                        prev_gray, curr_gray, old_pts, None, **LK_PARAMS
-                    )
-                    t_of_body_total += time.time() - tob0
+                # --- body LK tasks (one per person) ---
+                def _body_lk(i):
+                    old = last_keypoints[i][:, :2].astype(np.float32).reshape(-1, 1, 2)
+                    new, _, _ = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, old, None, **LK_PARAMS)
+                    return i, new
 
-                    tracked_kpts = last_keypoints[i].copy()
-                    tracked_kpts[:, :2] = new_pts.reshape(-1, 2)
-                    tracked_keypoints.append(tracked_kpts)
+                # Face LK only needed for convexhull blur (face_mesh_pts → hull)
+                # When canonicalizer active, skip face LK and run canonicalizer instead
+                face_mesh_inputs = {}
+                if face_canonicalizer is None:
+                    for i in range(n_persons):
+                        if i in person_states and person_states[i].face_mesh_pts is not None:
+                            face_mesh_inputs[i] = np.array(
+                                person_states[i].face_mesh_pts, dtype=np.float32
+                            ).reshape(-1, 1, 2)
 
-                    if i in person_states and person_states[i].face_mesh_pts is not None:
-                        old_face_pts = np.array(
-                            person_states[i].face_mesh_pts, dtype=np.float32
-                        ).reshape(-1, 1, 2)
-                        tof0 = time.time()
-                        new_face_pts, _, _ = cv2.calcOpticalFlowPyrLK(
-                            prev_gray, curr_gray, old_face_pts, None, **LK_PARAMS
-                        )
-                        t_of_face_total += time.time() - tof0
-                        person_states[i].face_mesh_pts = [
-                            (int(pt[0][0]), int(pt[0][1])) for pt in new_face_pts
-                        ]
+                def _face_lk(i, old_face):
+                    new, _, _ = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, old_face, None, **LK_PARAMS)
+                    return i, new
+
+                # Submit body LK and face LK (if needed) in parallel
+                t_lk0 = time.time()
+                body_futures = [_lk_pool.submit(_body_lk, i) for i in range(n_persons)]
+                face_futures = {i: _lk_pool.submit(_face_lk, i, old)
+                                for i, old in face_mesh_inputs.items()}
+
+                # Collect body results
+                tracked_keypoints = [None] * n_persons
+                for fut in body_futures:
+                    i, new_pts = fut.result()
+                    tk = last_keypoints[i].copy()
+                    tk[:, :2] = new_pts.reshape(-1, 2)
+                    tracked_keypoints[i] = tk
+                t_of_body_total += time.time() - t_lk0
+
+                # Collect face LK results (convexhull mode only)
+                t_face0 = time.time()
+                for i, fut in face_futures.items():
+                    _, new_face = fut.result()
+                    person_states[i].face_mesh_pts = [
+                        (int(pt[0][0]), int(pt[0][1])) for pt in new_face
+                    ]
+                t_of_face_total += time.time() - t_face0
+
+                # Canonical runs only on full frames (hidden in selfie-seg parallel wait).
+                # Skip frames reuse last_canonical_face — expression changes ~10fps is enough.
 
                 keypoints      = np.array(tracked_keypoints)
                 scores         = last_scores
@@ -381,12 +496,41 @@ def process_video(
             prev_gray = curr_gray.copy()
 
         tb0 = time.time()
-        if blur_bodies and keypoints is not None and len(keypoints) > 0:
-            all_face_mesh_pts = [
-                person_states[i].face_mesh_pts if i in person_states else None
-                for i in range(len(keypoints))
-            ]
-            annotated = blur_all_persons(annotated, keypoints, scores, all_face_mesh_pts)
+        if blur_bodies:
+            if mobile_sam is not None and keypoints is not None and len(keypoints) > 0:
+                # Full frames: use YOLOX bboxes (more accurate, includes head).
+                # Skip frames: fall back to keypoint-derived bboxes.
+                if is_full_frame and last_scaled_bboxes:
+                    sam_bboxes = last_scaled_bboxes
+                else:
+                    sam_bboxes = bboxes_from_keypoints(
+                        keypoints, scores, height, width, padding=80
+                    )
+                annotated = mobile_sam.blur_frame(annotated, sam_bboxes)
+            elif selfie_seg is not None or yolo_seg is not None:
+                # Full-frame mask already fetched in parallel above.
+                # Skip frames: warp stored mask by affine from keypoint motion.
+                if not is_full_frame and last_seg_mask is not None \
+                        and seg_mask_keypoints is not None \
+                        and keypoints is not None and len(keypoints) > 0:
+                    old_pts = seg_mask_keypoints[:, :, :2].reshape(-1, 2).astype(np.float32)
+                    new_pts = keypoints[:, :, :2].reshape(-1, 2).astype(np.float32)
+                    M, _ = cv2.estimateAffinePartial2D(old_pts, new_pts, method=cv2.RANSAC)
+                    if M is not None:
+                        last_seg_mask = cv2.warpAffine(
+                            last_seg_mask.astype(np.uint8), M, (width, height),
+                            flags=cv2.INTER_NEAREST
+                        ).astype(bool)
+                    seg_mask_keypoints = keypoints.copy()
+                if last_seg_mask is not None:
+                    applier = selfie_seg if selfie_seg is not None else yolo_seg
+                    annotated = applier.apply_mask(annotated, last_seg_mask)
+            elif keypoints is not None and len(keypoints) > 0:
+                all_face_mesh_pts = [
+                    person_states[i].face_mesh_pts if i in person_states else None
+                    for i in range(len(keypoints))
+                ]
+                annotated = blur_all_persons(annotated, keypoints, scores, all_face_mesh_pts)
         t_blur_total += time.time() - tb0
 
         td0 = time.time()
@@ -420,7 +564,22 @@ def process_video(
 
         tw0 = time.time()
         if out is not None:
-            out.write(annotated)
+            if face_canonicalizer is not None:
+                # Three panels: original | blurred | canonical
+                orig_panel    = cv2.resize(frame,    (DISPLAY_H, DISPLAY_H))
+                blurred_panel = cv2.resize(annotated, (DISPLAY_H, DISPLAY_H))
+                canon_panel   = np.full((DISPLAY_H, DISPLAY_H, 3), (228, 225, 222), dtype=np.uint8)
+                if last_canonical_face is not None:
+                    cf_resized = cv2.resize(last_canonical_face, (DISPLAY_H, DISPLAY_H))
+                    canon_panel[:] = cf_resized
+                _label = cv2.FONT_HERSHEY_SIMPLEX
+                cv2.putText(orig_panel,    "ORIGINAL",   (8, 24), _label, 0.6, (255, 255, 255), 2)
+                cv2.putText(blurred_panel, "BLURRED",    (8, 24), _label, 0.6, (255, 255, 255), 2)
+                cv2.putText(canon_panel,   "EXPRESSION", (8, 24), _label, 0.6, (40,  40,  40),  2)
+                combined = np.hstack([orig_panel, blurred_panel, canon_panel])
+                _write_pool.submit(out.write, combined)
+            else:
+                _write_pool.submit(out.write, annotated.copy())
         t_write_total += time.time() - tw0
 
         if not headless:
@@ -437,10 +596,15 @@ def process_video(
         t_encrypt_total += enc_t
         t_embed_total   += emb_t
         streams_flushed += 1
-        print(f"  [STREAM] Person {idx} (EOV) → "
+        print(f"  [STREAM] Person {idx} (EOV) -> "
               f"stream {state.stream_id[:8]}... flushed "
               f"(enc={enc_t*1000:.1f}ms emb={emb_t*1000:.1f}ms)")
     person_states.clear()
+
+    # Flush async write queue before releasing VideoWriter
+    _write_pool.shutdown(wait=True)
+    _seg_pool.shutdown(wait=False)
+    _lk_pool.shutdown(wait=False)
 
     cap.release()
     if out is not None:
@@ -448,6 +612,11 @@ def process_video(
     if not headless:
         cv2.destroyAllWindows()
     face_mesh.close()
+    if selfie_seg is not None:
+        selfie_seg.close()
+    if face_canonicalizer is not None:
+        face_canonicalizer.close()
+    # MobileSAM has no explicit close; PyTorch model is GC'd
 
     total_time = time.time() - loop_start
     n  = max(full_frame_count, 1)
@@ -469,13 +638,15 @@ def process_video(
     print(f"Total time          : {total_time:.1f}s")
     print(f"Average FPS         : {avg_fps:.2f}")
     print()
-    print(f"── Per-component (benchmark-clean) ──────────────────")
+    print(f"-- Per-component (benchmark-clean) ------------------")
     print(f"Avg Det/full frame  : {t_det_total      / n * 1000:.1f}ms")
     print(f"Avg Pose/full frame : {t_pose_total     / n * 1000:.1f}ms")
     print(f"Avg FaceMesh/full   : {t_facemesh_total / n * 1000:.1f}ms")
-    print(f"Avg OF-body/skip    : {t_of_body_total  / s * 1000:.1f}ms")
-    print(f"Avg OF-face/skip    : {t_of_face_total  / s * 1000:.1f}ms")
-    print(f"Avg Blur/frame      : {t_blur_total     / f * 1000:.1f}ms")
+    print(f"Avg SelfieSeg/full  : {t_seg_total        / n * 1000:.1f}ms  (parallel w/ det+pose)")
+    print(f"Avg Canonical/full  : {t_canonical_total / n * 1000:.1f}ms  (full frames only, reused on skip)")
+    print(f"Avg OF-body/skip    : {t_of_body_total   / s * 1000:.1f}ms  (parallel w/ OF-face)")
+    print(f"Avg OF-face/skip    : {t_of_face_total   / s * 1000:.1f}ms  (parallel w/ OF-body)")
+    print(f"Avg Blur/frame      : {t_blur_total     / f * 1000:.1f}ms  (mask apply + warp only)")
     if not benchmark:
         print(f"Avg Draw/frame      : {t_draw_total     / f * 1000:.1f}ms")
         print(f"Avg Write/frame     : {t_write_total    / f * 1000:.1f}ms")
@@ -486,7 +657,7 @@ def process_video(
         file_exists = os.path.isfile(csv_out)
         with open(csv_out, 'a', newline='') as csvfile:
             fieldnames = [
-                'input_file', 'benchmark', 'movement_adaptive', 'skip_n',
+                'input_file', 'anonymizer', 'benchmark', 'movement_adaptive', 'skip_n',
                 'total_frames', 'full_frames', 'skip_frames',
                 'full_pct', 'skip_pct', 'avg_fps',
                 'det_ms', 'pose_ms', 'facemesh_ms',
@@ -499,6 +670,7 @@ def process_video(
                 writer.writeheader()
             writer.writerow({
                 'input_file'       : os.path.basename(input_path),
+                'anonymizer'       : anonymizer,
                 'benchmark'        : benchmark,
                 'movement_adaptive': movement_adaptive,
                 'skip_n'           : skip_n if not movement_adaptive else 'adaptive',
@@ -519,7 +691,7 @@ def process_video(
                 'streams_flushed'  : streams_flushed,
                 'total_time_s'     : round(total_time, 2),
             })
-        print(f"\nMetrics appended → {csv_out}")
+        print(f"\nMetrics appended -> {csv_out}")
 
     if save_video and out is not None:
         print(f"\nOutput video: {output_path}")

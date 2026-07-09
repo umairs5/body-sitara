@@ -1,6 +1,6 @@
 # bodySITARA — Project Context & Research Record
 
-**Last updated:** 2026-06-14  
+**Last updated:** 2026-06-15  
 **Author:** Muhammad Umair, MS AI Year 1, LUMS (25280013@lums.edu.pk)  
 **Advisors:** Muhammad Hamad Alizai, Naveed Anwar Bhatti (LUMS CS)  
 **Target venue:** IEEE PerCom 2027
@@ -101,37 +101,57 @@ The PerCom 2027 paper will need to:
 
 **`pipeline.py`** — Main orchestrator (`process_video()`)
 - YOLOX-Nano + RTMPose-T loaded via `rtmlib.Body` (CPU, ONNX)
-- MediaPipe FaceLandmarker for 468-point face mesh
-- Adaptive movement tier (slow/medium/fast) → skip-N
-- Per-person `PersonState` management (appear/depart events)
-- LK optical flow on body keypoints AND face mesh points on skip frames
-- Benchmark mode (disables save/encrypt, measures pure inference time)
+- MediaPipe FaceLandmarker for 468-point face mesh (used in canonical mode; used for convex hull in baseline mode)
+- Selfie-seg (TFLite) runs in thread pool parallel to det+pose on full frames
+- FaceCanonicalizer runs on full frames only, hidden in selfie-seg parallel wait
+- Skip frames: body LK only; canonical face reused from last full frame
+- 3-panel VideoWriter output: ORIGINAL | BLURRED | EXPRESSION (1920×640) when canonicalizer active
+- Benchmark mode (`--no-save`) excludes write overhead (matches paper methodology)
 - CSV metrics output for paper tables
+- `--anonymizer` flag: `convexhull` | `selfie_seg0` | `selfie_seg1` | `mobilesam` | `yoloseg`
 
-**`blur.py`** — Tier 1 anonymization
+**`blur.py`** — Convex hull anonymization (baseline)
 - Builds convex hull from: 17 COCO body keypoints + 36 face oval landmark indices
 - Adaptive padding: `shoulder_width × 0.40` (clamped 20–100 px)
 - Fallback: bounding rectangle if hull area < 0.5% of frame
-- Shoulder/hip lateral expansion to cover clothing edges
 - **Known limitation:** hull over-covers gaps (between legs, arm-torso gaps)
-- **Upgrade path:** Replace with SAM2 segmentation mask
+
+**`blur_seg.py`** — SelfieSegBlur (active anonymizer)
+- MediaPipe ImageSegmenter (Tasks API), TFLite models
+- `selfie_segmenter.tflite` (seg0, general) or `selfie_segmenter_landscape.tflite` (seg1)
+- ~130ms on laptop CPU; releases GIL → runs parallel to det+pose in thread pool
+- Skip frames: stored mask warped by affine from keypoint motion
+
+**`blur_yoloseg.py`** — YOLOv8-seg-nano instance segmentation
+- PT model (47ms) faster than ONNX export (117ms) on CPU
+- GIL contention with ORT threads causes slowdown when threaded — fix deferred
+- Available via `--anonymizer yoloseg`
+
+**`face_canonical.py`** — FaceCanonicalizer (Tier 2 expression signal)
+- Runs FaceLandmarker internally on face crop from RTMPose keypoints
+- Renders filled cartoon face onto 512×512 warm-gray canvas:
+  - Skin-tone filled face oval
+  - White sclera + dark iris + pupil + specular highlight (eye openness visible)
+  - Dark eyebrows (7px thick polyline)
+  - Rose-pink filled lips (outer + darker inner cavity — mouth open/close visible)
+  - Subtle nose bridge + nostril circles
+  - GaussianBlur(3,3) for smoothness
+- Diffusion-friendly: no identity, no texture, no background — only expression geometry
+- ~28ms per full frame, completely hidden in selfie-seg parallel wait
 
 **`pose.py`** — Keypoint utilities
 - COCO keypoint index constants (0=nose, 1=left_eye, ... 16=right_ankle)
 - `LK_PARAMS` for Lucas-Kanade optical flow
 - `derive_face_crop()`, `derive_body_crop()` — extract crops from keypoints
 - `get_face_size_tier()`, `get_movement_tier()` — adaptive skip logic
-- `project_landmarks()` — map MediaPipe local coords to frame coords
 
 **`tracking.py`** — Per-person state machine
-- `PersonState`: holds AES key, best face/body crop (by RTMPose confidence), face mesh pts
+- `PersonState`: holds AES key, best face/body crop (by RTMPose confidence)
 - `flush_to_disk()`: encrypts and saves `.packet` files
-- `propagate_bboxes()`: LK optical flow on bboxes
 
 **`encryption.py`** — Crypto layer
 - AES-128-GCM per frame crop
-- RSA-2048 wraps AES key (NOTE: paper uses RSA-4096)
-- `encode_crop()` → JPEG bytes → encrypt
+- RSA-2048 wraps AES key (NOTE: paper uses RSA-4096 — needs reconciling)
 
 **`embedding.py`** — Face embedding
 - EdgeFace-s-gamma-05 via ONNX Runtime (CPU)
@@ -147,6 +167,15 @@ INFER_SIZE = 320           # resize to this for RTMPose inference
 SKIP_N_DEFAULTS = {"slow": 7, "medium": 4, "fast": 1}
 FACE_MESH_MIN_CONF = 0.3
 ```
+
+### Benchmark Numbers (Intel Core Ultra 5 125U, skip=5, --no-save, 6_single_face.mp4 1264×1264)
+
+| Pipeline | FPS | Full-frame wall time |
+|---|---|---|
+| `convexhull` — det+pose+facemesh+LK | **21.3 FPS** | ~57ms (det+pose bottleneck) |
+| `selfie_seg0` + canonical | **13.1 FPS** | ~130ms (selfie-seg bottleneck) |
+
+Note: laptop had 85% RAM usage during tests (Chrome 2.9GB + VS Code 1.2GB). Close both for clean benchmarks.
 
 ---
 
@@ -232,13 +261,24 @@ These are unresolved decisions that affect both the implementation and the paper
 
 ---
 
-## 8. Immediate Next Steps (as of 2026-06-14)
+## 8. Immediate Next Steps (as of 2026-06-15)
 
-1. Test Tier 1 pipeline (`scripts/run.py`) on the downloaded face dataset — get baseline AP/AR numbers with current convex hull approach
-2. Record first batch of full-body test footage (indoor, 1–3 persons, various distances)
-3. Run the ComfyUI Tier 2 workflow end-to-end on a short clip to verify outputs
-4. Decide SAM2 integration plan for Python codebase (replace `blur.py` or run in parallel for comparison)
-5. Reconcile RSA key size (2048 vs 4096) — pick one and be consistent
+**Done:**
+- [x] Tier 1 selfie-seg pipeline functional with 3-panel output video
+- [x] FaceCanonicalizer implemented (diffusion-friendly filled cartoon face)
+- [x] Benchmarked convex hull (21.3 FPS) vs selfie_seg+canonical (13.1 FPS) at skip=5
+
+**Next session (2026-06-16):**
+1. Run convex hull baseline on Raspberry Pi 5: `python scripts/run.py <video> --anonymizer convexhull --skip-n 5 --no-save --headless`
+2. Run selfie_seg pipeline on RPi 5: same with `--anonymizer selfie_seg0`
+3. Compare RPi 5 vs laptop numbers — hardware gap characterization for paper
+4. Clean up: make standalone `face_mesh` load conditional on `--anonymizer convexhull`
+
+**Medium term:**
+5. Record first batch of full-body test footage (indoor, 1–3 persons, various distances)
+6. Run the ComfyUI Tier 2 workflow end-to-end on a short clip to verify outputs
+7. Decide SAM2 integration plan for Python codebase (replace `blur_seg.py` or run in parallel for comparison)
+8. Reconcile RSA key size (2048 vs 4096) — pick one and be consistent
 
 ---
 

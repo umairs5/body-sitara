@@ -20,7 +20,7 @@ data/dataset/
 *.pem
 
 # Models (large binaries — store separately)
-models/*.onnx
+models/
 *.task
 
 # IDE
