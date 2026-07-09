@@ -1,3 +1,4 @@
+
 import argparse
 import sys
 import os
@@ -27,7 +28,11 @@ if __name__ == "__main__":
     parser.add_argument("--no-save", action="store_true",
                         help="Skip VideoWriter.")
     parser.add_argument("--no-blur", action="store_true",
-                        help="Disable hull blur.")
+                        help="Disable anonymization.")
+    parser.add_argument("--anonymizer", type=str, default="convexhull",
+                        choices=["convexhull", "selfie_seg0", "selfie_seg1"],
+                        help="Anonymization backend: convexhull (default), "
+                             "selfie_seg0 (MediaPipe general), selfie_seg1 (MediaPipe landscape).")
 
     args = parser.parse_args()
 
@@ -42,4 +47,5 @@ if __name__ == "__main__":
         skip_n            = args.skip_n,
         movement_adaptive = args.movement_adaptive,
         csv_out           = args.csv_out,
+        anonymizer        = args.anonymizer,
     )
