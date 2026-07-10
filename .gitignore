@@ -15,9 +15,11 @@ build/
 # Data & outputs
 data/output/
 data/dataset/
+output-videos/
 *.packet
 *.key
 *.pem
+scratch_boxes.txt
 
 # Models (large binaries — store separately)
 models/

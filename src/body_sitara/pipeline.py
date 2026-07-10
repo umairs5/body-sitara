@@ -18,13 +18,14 @@ from .pose import (
     COCO_NOSE, COCO_LEFT_EYE, COCO_RIGHT_EYE, LK_PARAMS,
 )
 from .blur import blur_all_persons
-from .blur_seg import SelfieSegBlur
+from .blur_seg import SelfieSegBlur, bbox_region_mask
 from .blur_mobilesam import MobileSAMBlur, bboxes_from_keypoints
 from .blur_yoloseg import YOLOSegBlur
 from .face_canonical import FaceCanonicalizer, CANONICAL_SIZE
 from .tracking import PersonState, propagate_bboxes
 from .encryption import generate_ttp_keypair
 from .embedding import EmbeddingExtractor, EDGEFACE_ONNX_PATH
+from .detector_patch import apply_detector_patch
 
 BASE_RESOLUTION       = 1280.0
 BASE_FAR_THRESHOLD    = 30
@@ -42,6 +43,20 @@ FACE_MESH_MIN_CONF = 0.3
 INFER_SIZE         = 320
 TIMING_INTERVAL    = 30
 DEBUG_DRAW         = True
+
+# Consecutive full frames a stale selfie-seg gate region may be reused for
+# when det+pose both fail to produce any usable bbox on a given frame (e.g.
+# transient motion-blur pose dropout). Small enough that a person who truly
+# leaves the frame stops being blurred within a fraction of a second.
+GATE_REGION_TTL = 5
+
+# Minimum ratio (this box's area / largest box's area in the same frame) for
+# a YOLOX detection to be treated as a trackable person, when more than one
+# box is detected. Filters out distant background bystanders relative to
+# whoever is dominant/closest to camera in that frame, without relying on a
+# fragile absolute pixel-size cutoff (subject box size varies a lot with
+# distance from camera across a clip).
+MIN_BOX_AREA_RATIO = 0.20
 
 
 def process_video(
@@ -101,6 +116,7 @@ def process_video(
 
     # [1] RTMPose
     print("\n[1/4] Loading RTMPose (YOLOX-Nano + RTMPose-T)...")
+    apply_detector_patch()
     body = Body(
         det='https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/yolox_nano_8xb8-300e_humanart-40f6f0d0.zip',
         det_input_size=(416, 416),
@@ -221,6 +237,8 @@ def process_video(
     last_scaled_bboxes    = None   # YOLOX bboxes scaled to frame resolution for MobileSAM
     last_seg_mask         = None   # last selfie-seg mask (bool H×W), propagated on skip frames
     seg_mask_keypoints    = None   # keypoints at the time last_seg_mask was computed/warped
+    last_gate_region      = None   # last non-empty bbox_region_mask, held over brief det+pose dropout
+    gate_region_stale_for = 0      # consecutive full frames since last_gate_region was refreshed
     last_mesh_cache       = {}
     last_canonical_face   = None   # last canonical expression image (CANONICAL_SIZE×CANONICAL_SIZE)
     prev_gray        = None
@@ -281,6 +299,20 @@ def process_video(
             t0     = time.time()
             bboxes = body.det_model(infer_frame)
             t_det_total += time.time() - t0
+
+            # Reject boxes too small relative to the frame's largest detection
+            # to plausibly be the video's subject -- e.g. distant background
+            # bystanders in a hallway shot that flicker in/out of detection as
+            # they walk and otherwise get tracked/encrypted as short-lived
+            # phantom person streams. An absolute pixel threshold doesn't work
+            # here: the subject's own box size varies hugely with distance
+            # from camera, so a bystander can be taller in pixels than the
+            # subject is in another frame. Relative-to-largest adapts to that.
+            if bboxes is not None and len(bboxes) > 1:
+                box_area  = (bboxes[:, 2] - bboxes[:, 0]) * (bboxes[:, 3] - bboxes[:, 1])
+                max_area  = box_area.max()
+                bboxes    = bboxes[box_area >= MIN_BOX_AREA_RATIO * max_area]
+
             last_bboxes = bboxes
             # scale YOLOX bboxes from infer_frame space to original frame space
             if bboxes is not None and len(bboxes) > 0:
@@ -415,9 +447,70 @@ def process_video(
 
             # Collect selfie-seg result (may already be done; blocks only if det+pose faster)
             if _future_seg is not None:
-                last_seg_mask      = _future_seg.result()
+                raw_seg_mask       = _future_seg.result()
                 seg_mask_keypoints = keypoints.copy() if keypoints is not None and len(keypoints) > 0 else None
                 t_seg_total       += time.time() - _t_seg0  # wall-time waited, not thread time
+
+                # Selfie-seg segments the whole frame with no notion of "where
+                # RTMPose actually detected a person" -- it will happily paint
+                # over background clutter (tree branches, textured walls) that
+                # merely looks person-shaped. Gate the mask to the union of
+                # detected person regions so nothing outside those regions can
+                # ever be blurred; if no one was detected, apply no mask at all.
+                #
+                # last_scaled_bboxes comes from YOLOX and can be [] even when
+                # keypoints is non-empty: rtmlib's RTMPose silently falls back
+                # to a whole-frame box when given zero detector boxes, so it
+                # still produces a pose for a real, visible person the
+                # detector merely missed on this frame. Gating on the empty
+                # detector boxes alone would wipe the mask for a real person
+                # still being tracked -- fall back to a keypoint-derived
+                # region in that case instead of gating with nothing.
+                #
+                # But the fallback pose itself can also be low-confidence
+                # (e.g. mid-stride motion blur): every keypoint scores below
+                # kpt_thr, so bboxes_from_keypoints returns [] too. Both
+                # signals failing on the same frame doesn't mean the person
+                # vanished -- it means det+pose had a bad frame. Hold the
+                # last known-good gate region for a short TTL instead of
+                # collapsing to an all-False mask.
+                if raw_seg_mask is not None:
+                    if last_scaled_bboxes:
+                        gate_bboxes = last_scaled_bboxes
+                    elif keypoints is not None and len(keypoints) > 0:
+                        gate_bboxes = bboxes_from_keypoints(
+                            keypoints, scores, height, width, padding=40
+                        )
+                    else:
+                        gate_bboxes = []
+
+                    fresh_gate = bool(gate_bboxes)
+                    if gate_bboxes:
+                        region = bbox_region_mask(gate_bboxes, height, width, padding=40)
+                        last_gate_region      = region
+                        gate_region_stale_for = 0
+                    elif last_gate_region is not None and gate_region_stale_for < GATE_REGION_TTL:
+                        region = last_gate_region
+                        gate_region_stale_for += 1
+                    else:
+                        region = bbox_region_mask([], height, width, padding=40)
+                        last_gate_region       = None
+                        gate_region_stale_for  = 0
+
+                    last_seg_mask = raw_seg_mask & region
+
+                    # Selfie-seg can also fail outright on a confidently-detected
+                    # person: small/angled figures against a similarly-toned
+                    # background sometimes make the confidence field come back
+                    # near all-zero even inside a correct, fresh detector bbox.
+                    # Gating can't help there since raw_seg_mask has nothing to
+                    # gate. If that happens on a fresh (non-stale) detection,
+                    # fall back to solid-filling the tight bbox itself -- a
+                    # coarser silhouette beats leaving a real person unmasked.
+                    if fresh_gate and last_seg_mask.sum() < 0.02 * region.sum():
+                        last_seg_mask = bbox_region_mask(gate_bboxes, height, width, padding=0)
+                else:
+                    last_seg_mask = None
 
             prev_gray = curr_gray.copy()
 
@@ -539,6 +632,10 @@ def process_video(
             for i in range(len(keypoints)):
                 if i in person_states and person_states[i].face_mesh_pts:
                     draw_face_mesh_pts(annotated, person_states[i].face_mesh_pts)
+        if draw_enabled and last_scaled_bboxes:
+            for bbox in last_scaled_bboxes:
+                x1, y1, x2, y2 = [int(v) for v in bbox]
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 0, 255), 2)
         t_draw_total += time.time() - td0
 
         if not benchmark:
