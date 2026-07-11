@@ -92,7 +92,8 @@ def process_video(
     if export_enabled:
         dense_export = True
         os.makedirs(export_dir, exist_ok=True)
-        if not anonymizer.startswith("selfie_seg"):
+        _export_ok_anonymizers = ("selfie_seg", "yoloseg")
+        if not anonymizer.startswith(_export_ok_anonymizers):
             print(f"  NOTE: export mode forces anonymizer='selfie_seg1' (was '{anonymizer}')")
             anonymizer = "selfie_seg1"
 

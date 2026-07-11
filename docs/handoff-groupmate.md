@@ -279,40 +279,58 @@ exists in that folder.
 `class_type` fields), NOT the "API format" ComfyUI needs to accept programmatic requests via
 its `/prompt` endpoint. It also contains a large number of `GetNode`/`SetNode` pairs (60/29) —
 ComfyUI's variable-aliasing mechanism for avoiding long visual connection lines in a big graph
-— which makes naive JSON-level editing risky; **the safe way to produce the pruned API-format
-graph is inside ComfyUI's own browser UI** (open the workflow, manually delete the
-simulation-only nodes below, then use "Save (API format)"), not by hand-editing the JSON blind.
+— which makes naive JSON-level editing risky in general.
 
-### What needs to be pruned out of the graph
+### Do NOT prune the graph's simulation branches
 
-The current graph contains nodes that **simulate** Tier 1's output from a raw test video —
-useful while building/testing without real Pi data, but wasteful (and privacy-incorrect, since
-the cloud shouldn't be re-deriving signals from richer data than it should ever see) once real
-Tier 1 export bundles exist (which they now do — see §4/§5 above). Specifically:
-`RTMPoseTinyPoseAndFace`, `Sam2Segmentation` (×6), `DownloadAndLoadSAM2Model`,
-`OnnxDetectionModelLoader`, `DWPreprocessor`, `INPAINT_LoadInpaintModel`/`INPAINT_InpaintWithModel`,
-and probably the `VHS_LoadVideo` raw-video-loading node — these should all be **removed**, and
-the graph's real inputs should instead be the 3-4 signal files the phone will upload (pose
-video, face video, blockified mask video, lighting-plate video) plus `avatar_id`.
+An earlier draft of this doc suggested deleting the nodes that simulate Tier 1's output
+(`RTMPoseTinyPoseAndFace`, `Sam2Segmentation`, `INPAINT_LoadInpaintModel`, etc.) from the graph.
+**That's wrong — don't do that.** Keep V5's structure fully intact, exactly as it is. The
+reason: your first job isn't to build the final pruned production graph, it's to **replicate
+this project's actual Tier 1 pipeline in your own ComfyUI setup and confirm your RunPod
+environment produces correct results** — i.e. verify your pod, your model weights, your node
+versions all actually work end-to-end, using the graph as it already exists and is already
+proven to work in Umair's ComfyUI. Deleting nodes before you've even confirmed your own setup
+reproduces the known-good result would make it much harder to tell "my pod is misconfigured"
+apart from "I broke the graph by editing it."
 
-Keep: `WanVideoModelLoader`/`Sampler`/`Decode`/`AnimateEmbeds`, `WanVideoClipVisionEncode`,
-`CLIPVisionLoader`, `SITARAFaceCanonicalizer` (×3 — one per person slot; though note Tier 1 now
-computes this on-device, so check whether this node is even still needed post-pruning or
-whether the phone-rendered face video replaces its job entirely), `BlockifyMask`,
-`ImageCompositeMasked`, `SITARAPersonPresent`/`SITARACombineMasks` (the per-slot
-presence-gating logic — also see the known bug below), the LoRA/VAE loaders, and the
-`VHS_VideoCombine` output-encoding nodes.
+### What to actually do instead: replicate real Tier 1, not ComfyUI's simulated version
 
-### A known bug to fix while you're in there
+The graph's simulation nodes (`RTMPoseTinyPoseAndFace`, `Sam2Segmentation`, etc.) exist to
+approximate Tier 1's output *inside ComfyUI* when you don't have real Pi/pipeline data handy.
+But this repo's actual Tier 1 pipeline is real, working code (`src/body_sitara/`, see §4 above)
+— use **that**, exactly as it exists in this repo, not ComfyUI's approximation of it, as your
+input source. Concretely:
+
+1. Run this repo's real pipeline on a test clip to produce a real dense-export bundle (see the
+   command in §8's data-source note below). **Use `--anonymizer yoloseg11int8`** specifically
+   (YOLO11n-seg, INT8-quantized ONNX — one of the alternative segmentation backends built and
+   benchmarked this session, see §4) rather than the shipped default `selfie_seg1`. This
+   backend auto-builds itself on first use (auto-exports ONNX from the auto-downloaded `.pt`
+   checkpoint, then auto-quantizes to INT8) — see `src/body_sitara/blur_yoloseg.py` if you want
+   the details, you don't need to pre-stage any model files yourself.
+2. Feed the real files this produces (`keypoints_p{i}.npy`, `face_params_p{i}.npy`, `mask.mp4`,
+   `output_rtm.mp4`) into your ComfyUI setup as the actual source data, in place of whatever
+   ComfyUI's own simulation nodes would have derived from a raw test video.
+3. Confirm your RunPod pod, when driven by this *real* Tier 1 data, produces a correct,
+   sensible generated result — that's the actual validation goal for this step, not graph
+   pruning.
+
+Graph pruning (removing the now-genuinely-unnecessary simulation nodes, building the real
+pruned API-format production graph) is real, valuable future work, but it comes **after** this
+replication step confirms everything upstream actually works — don't jump ahead to it.
+
+### A known bug, for later (not your first priority)
 
 WanVideo currently runs full generation for **all 3 person-slots unconditionally**, even when
 a slot has no real detected person in that clip — `SITARAPersonPresent` only gates
-*compositing*, not generation itself. This wastes real GPU cycles. Fix: the FastAPI gateway
-(see below) should construct the per-job API-format prompt **dynamically**, omitting the
-WanVideo generation subgraph entirely for slots with no detections — not just gating the output
-after the fact.
+*compositing*, not generation itself. This wastes real GPU cycles. Worth fixing once you get to
+building the real pruned API-format graph/gateway (later, not part of the replication step
+above) — the gateway should construct the per-job prompt dynamically, omitting the WanVideo
+generation subgraph entirely for slots with no detections, not just gate the output after the
+fact.
 
-### The gateway you need to build
+### The gateway you'll eventually build (after replication is confirmed working)
 
 A thin FastAPI process on the RunPod pod, sitting in front of ComfyUI's own native API
 (`/prompt`, `/history/{id}`, `/view`, and its `/ws` progress socket) — the phone should never
@@ -328,34 +346,45 @@ doc §2.2:
 Auth: a bearer API key + short-lived signed per-job token (exact scheme still open — this
 wasn't built yet, use your judgement or ask Umair).
 
-### Suggested build order (per the plan's phased roadmap, §7 Phase 2)
+### Suggested build order
 
-1. **Prune the graph and get "Save (API format)" working inside ComfyUI's UI first** — before
-   writing any gateway code, prove you can manually POST the pruned API-format JSON to
-   ComfyUI's own `/prompt` endpoint (via curl or Postman) using a manually-prepared static test
-   bundle (you can use the real files in `tier2_export_root/` in this repo — pulled from an
-   earlier Pi run, real keypoints/face-params/mask data) and get a real generated result back.
-   Do this before involving the phone at all.
-2. Once that round-trip works, build the FastAPI gateway wrapping it.
-3. Only after that, build the real phone-side signal-rendering code (pose video render, face
+1. **Replicate real Tier 1 → your ComfyUI setup, using the graph exactly as it exists (no
+   pruning)** — generate a real dense-export bundle with this repo's actual pipeline (command
+   below, note the `yoloseg11int8` anonymizer), feed those real files into your ComfyUI setup
+   in place of what the graph's simulation nodes would otherwise derive, and confirm your
+   RunPod pod produces a correct, sensible generated result end-to-end. This is your actual
+   first goal — validating your own environment against known-good real data, not graph editing.
+2. Once you've confirmed your pod reproduces correct results from real Tier 1 data, *then* look
+   at pruning the now-redundant simulation nodes and exporting a real API-format graph (ComfyUI
+   "Save (API format)", from inside the UI, not by hand-editing the JSON — see the `GetNode`/
+   `SetNode` aliasing caveat above).
+3. Build the FastAPI gateway wrapping the pruned graph.
+4. Only after that, build the real phone-side signal-rendering code (pose video render, face
    video render from `face_params_p{i}.npy`, mask blockify, lighting-plate reduction) and wire
    it to actually call your gateway.
 
-### A real, already-identified data source you can use for step 1
-
-`tier2_export_root/0d876282-e50a-4fad-b379-8e02e8886576/` in this repo (if still present after
-gitignore — check `.gitignore`, this directory is intentionally *not* committed since it's
-generated output, so you may need to regenerate it yourself) contains a real single-person
-dense export bundle: `keypoints_p0.npy` (900 frames × 17 keypoints), `face_params_p0.npy` (900
-frames × 12 scalars), `mask.mp4`, `manifest.json`. To regenerate it yourself:
+### Generating a real Tier 1 bundle for step 1
 
 ```bash
-python scripts/run.py <any_test_clip.mp4> --anonymizer selfie_seg1 --skip-n 1 \
+python scripts/run.py <any_test_clip.mp4> --anonymizer yoloseg11int8 --skip-n 1 \
     --headless --export-dir tier2_export_root/<some_clip_id>
 ```
 
-(Note: `--export-dir` forces `dense_export=True` and `anonymizer=selfie_seg1` automatically,
-and forces no-skip — see `pipeline.py`'s export-forcing logic if you want the details.)
+Use **`--anonymizer yoloseg11int8`** specifically (YOLO11n-seg, INT8-quantized ONNX) — not the
+shipped default `selfie_seg1` — per Umair's instruction for this replication step. This
+anonymizer auto-builds itself on first use (exports ONNX from the auto-downloaded `.pt`
+checkpoint, then quantizes to INT8) — no manual model staging needed, just let the first run
+take a bit longer while it builds these once.
+
+(`--export-dir` also forces `dense_export=True` and no-skip automatically — see
+`pipeline.py`'s export-forcing logic if you want the details. As of this doc, the export-dir
+gate was widened to allow any `yoloseg*` anonymizer through, not just `selfie_seg*` — if you
+see a `NOTE: export mode forces anonymizer='selfie_seg1'` message when using `yoloseg11int8`,
+your checkout predates that fix; `git pull` should resolve it.)
+
+This repo doesn't currently ship a pre-generated bundle in git (`tier2_export_root/` is
+gitignored, generated output) — you'll need to run the command above yourself once you have a
+test clip.
 
 ---
 
