@@ -70,7 +70,9 @@ Tier 3 — TTP (Cloud consent server)
 
 Writing overhead costs ~1.4 FPS additional. Paper benchmarks should use `--no-save` (matches SITARA paper methodology of excluding write overhead).
 
-**RPi 5 8GB estimate (bare, no Hailo):** ~4–6 FPS convex hull, ~2–3 FPS selfie_seg.
+**RPi 5 8GB (bare, no Hailo, measured 2026-07-11):** selfie_seg1 + canonical, skip=1 (no-skip), no-save, `6_single_face.mp4` (Debian 13 trixie aarch64, Python 3.11.9 venv) — **5.28 FPS** (900/900 full-inference frames, 170.6s total). Full-frame bottleneck: SelfieSeg ~156ms (parallel w/ det+pose); Det ~78ms (no NPU/Hailo — pure ARM CPU). Beat the earlier hand-estimate below, which predated any real hardware test.
+
+Superseded pre-hardware estimate (kept for reference only): ~4–6 FPS convex hull, ~2–3 FPS selfie_seg.
 Note: laptop benchmarks inflated by 85% RAM usage (Chrome + VS Code). Close both before benchmarking.
 
 ## Tier 2 Workflow: ComfyUI (`Blur Trail - V4.4_workflow-*.json`, Downloads folder)
