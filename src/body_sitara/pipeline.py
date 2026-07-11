@@ -203,12 +203,13 @@ def process_video(
         mobile_sam = MobileSAMBlur(checkpoint_path=_ckpt, device="cpu")
         print(f"     Anonymizer: mobilesam")
     elif anonymizer == "yoloseg":
-        print(f"\n[3b] Loading YOLOv8-seg-nano (instance segmentation)...")
-        yolo_seg = YOLOSegBlur(model_name="yolov8n-seg.pt", infer_size=320, conf=0.4)
+        _y8_ckpt = os.path.join(os.path.dirname(__file__), "..", "..", "models", "yolov8n-seg.onnx")
+        print(f"\n[3b] Loading YOLOv8-seg-nano ONNX (instance segmentation)...")
+        yolo_seg = YOLOSegBlur(model_name=_y8_ckpt, infer_size=320, conf=0.4)
         print(f"     Anonymizer: yoloseg")
     elif anonymizer == "yoloseg11":
-        _y11_ckpt = os.path.join(os.path.dirname(__file__), "..", "..", "models", "yolo11n-seg.pt")
-        print(f"\n[3b] Loading YOLO11n-seg (instance segmentation)...")
+        _y11_ckpt = os.path.join(os.path.dirname(__file__), "..", "..", "models", "yolo11n-seg.onnx")
+        print(f"\n[3b] Loading YOLO11n-seg ONNX (instance segmentation)...")
         yolo_seg = YOLOSegBlur(model_name=_y11_ckpt, infer_size=320, conf=0.4)
         print(f"     Anonymizer: yoloseg11")
     else:
