@@ -20,6 +20,8 @@ output-videos/
 *.key
 *.pem
 scratch_boxes.txt
+scratch/
+tier2_export/
 
 # Models (large binaries — store separately)
 models/
