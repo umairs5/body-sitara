@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="16dp">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Server host:port"
+        android:textStyle="bold" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:layout_marginTop="4dp">
+
+        <EditText
+            android:id="@+id/editHostPort"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:inputType="text"
+            android:text="10.130.155.182:8443"
+            android:hint="e.g. 10.130.155.182:8443" />
+
+        <Button
+            android:id="@+id/btnRefresh"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Refresh" />
+    </LinearLayout>
+
+    <Button
+        android:id="@+id/btnDiscover"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:text="Discover on network (mDNS)" />
+
+    <CheckBox
+        android:id="@+id/checkUseHttps"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:checked="true"
+        android:text="Use HTTPS (TOFU pinned)" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="Server fingerprint (SHA-256, printed on server startup)"
+        android:textStyle="bold" />
+
+    <EditText
+        android:id="@+id/editFingerprint"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:inputType="textNoSuggestions"
+        android:hint="paste fingerprint on first connect; blank = trust-on-first-use" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:text="Clips"
+        android:textStyle="bold" />
+
+    <ListView
+        android:id="@+id/listClips"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:layout_marginTop="4dp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:text="Log"
+        android:textStyle="bold" />
+
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="150dp"
+        android:layout_marginTop="4dp"
+        android:background="#EEEEEE">
+
+        <TextView
+            android:id="@+id/textLog"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:padding="8dp"
+            android:textSize="11sp"
+            android:fontFamily="monospace" />
+    </ScrollView>
+
+</LinearLayout>

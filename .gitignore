@@ -22,6 +22,8 @@ output-videos/
 scratch_boxes.txt
 scratch/
 tier2_export/
+tier2_export_root/
+tier1_link_device_id.txt
 
 # Models (large binaries — store separately)
 models/
@@ -30,6 +32,15 @@ models/
 # IDE
 .vscode/
 .idea/
+
+# Android
+android/*/local.properties
+android/*/.gradle/
+android/*/*/build/
+android/*/build/
+android/*/.cxx/
+android/*/*.iml
+android/*/captures/
 
 # OS
 .DS_Store
