@@ -32,6 +32,15 @@ models/
 .vscode/
 .idea/
 
+# Android
+android/*/local.properties
+android/*/.gradle/
+android/*/*/build/
+android/*/build/
+android/*/.cxx/
+android/*/*.iml
+android/*/captures/
+
 # OS
 .DS_Store
 Thumbs.db
