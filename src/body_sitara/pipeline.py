@@ -2,6 +2,7 @@ import cv2
 import time
 import os
 import csv
+import json
 import urllib.request
 import numpy as np
 import mediapipe as mp
@@ -71,16 +72,35 @@ def process_video(
     movement_adaptive = False,
     csv_out           = None,
     anonymizer        = "convexhull",   # "convexhull" | "selfie_seg0" | "selfie_seg1" | "mobilesam" | "yoloseg"
+    export_dir         = None,   # dense per-person export mode (opt-in, additive -- see export_tracking.py)
+    dense_export        = False,
+    export_people        = 3,
+    export_diagnostics  = False,
 ):
     if benchmark:
         save_video = False
         headless   = True
+
+    # Dense export needs literal every-frame accuracy (no skip-frame
+    # optical-flow propagation) and a consistent segmentation backend to
+    # populate mask.mp4/raw_seg_mask.mp4/gate_region.mp4. Both are forced
+    # only when export_dir is actually set, so default (export_dir=None)
+    # calls are entirely unaffected.
+    export_enabled = export_dir is not None
+    if export_enabled:
+        dense_export = True
+        os.makedirs(export_dir, exist_ok=True)
+        if not anonymizer.startswith("selfie_seg"):
+            print(f"  NOTE: export mode forces anonymizer='selfie_seg1' (was '{anonymizer}')")
+            anonymizer = "selfie_seg1"
 
     SKIP_N = SKIP_N_DEFAULTS.copy()
     if not movement_adaptive:
         SKIP_N["slow"]   = skip_n
         SKIP_N["medium"] = skip_n
         SKIP_N["fast"]   = skip_n
+    if dense_export:
+        SKIP_N = {"slow": 1, "medium": 1, "fast": 1}
 
     draw_enabled = DEBUG_DRAW and not benchmark
 
@@ -223,6 +243,49 @@ def process_video(
         if not out.isOpened():
             print("  Warning: Could not open VideoWriter -- video will not be saved.")
             out = None
+
+    # --- Dense per-person export setup (opt-in; no-op when export_dir is None) ---
+    EXPORT_FACE_SIZE = 512
+    slot_tracker              = None
+    export_kp_rows            = None
+    export_bbox_rows          = None
+    export_last_face_crop     = None
+    export_face_writers       = None
+    export_rtm_writer         = None
+    export_mask_writer        = None
+    export_raw_mask_writer    = None
+    export_gate_writer        = None
+    export_bbox_overlay_writer = None
+
+    if export_enabled:
+        from .export_tracking import ExportSlotTracker
+        slot_tracker          = ExportSlotTracker(export_people, width, height)
+        export_kp_rows        = [[] for _ in range(export_people)]
+        export_bbox_rows      = [[] for _ in range(export_people)]
+        export_last_face_crop = [None] * export_people
+
+        _exp_fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        export_face_writers = [
+            cv2.VideoWriter(os.path.join(export_dir, f"face_crops_p{i}.mp4"),
+                             _exp_fourcc, fps_input, (EXPORT_FACE_SIZE, EXPORT_FACE_SIZE))
+            for i in range(export_people)
+        ]
+        export_rtm_writer  = cv2.VideoWriter(os.path.join(export_dir, "output_rtm.mp4"),
+                                              _exp_fourcc, fps_input, (width, height))
+        export_mask_writer = cv2.VideoWriter(os.path.join(export_dir, "mask.mp4"),
+                                              _exp_fourcc, fps_input, (width, height), isColor=False)
+        if export_diagnostics:
+            export_raw_mask_writer = cv2.VideoWriter(
+                os.path.join(export_dir, "raw_seg_mask.mp4"),
+                _exp_fourcc, fps_input, (width, height), isColor=False)
+            export_gate_writer = cv2.VideoWriter(
+                os.path.join(export_dir, "gate_region.mp4"),
+                _exp_fourcc, fps_input, (width, height), isColor=False)
+            export_bbox_overlay_writer = cv2.VideoWriter(
+                os.path.join(export_dir, "bbox_overlay.mp4"),
+                _exp_fourcc, fps_input, (width, height))
+        print(f"\n  Dense export enabled -> {export_dir}  "
+              f"(slots={export_people}, diagnostics={export_diagnostics})")
 
     frame_idx        = 0
     full_frame_count = 0
@@ -441,6 +504,65 @@ def process_video(
                     if movement_adaptive:
                         current_N = SKIP_N[movement_tier]
 
+            if export_enabled:
+                # Stable left-to-right slots are a separate concept from
+                # person_states above: person_states is keyed by raw
+                # detection index (reused/reshuffled on identity churn),
+                # while export needs a fixed small set of identities that
+                # keep referring to the same physical person for the whole
+                # clip. Detections beyond export_people, or too low-
+                # confidence to derive any bbox, simply aren't exported --
+                # they're still blurred normally via the existing mask path.
+                detections = []
+                det_bboxes = {}
+                if keypoints is not None and len(keypoints) > 0:
+                    for i in range(len(keypoints)):
+                        db = bboxes_from_keypoints(
+                            [keypoints[i]], [scores[i]], height, width, padding=40
+                        )
+                        if db:
+                            x1, y1, x2, y2 = db[0]
+                            detections.append((i, ((x1 + x2) / 2.0, (y1 + y2) / 2.0)))
+                            det_bboxes[i] = [float(x1), float(y1), float(x2), float(y2)]
+
+                slot_matches = slot_tracker.assign(detections)
+
+                for s in range(export_people):
+                    if s in slot_matches:
+                        di = slot_matches[s]
+                        kpts_s, scrs_s = keypoints[di], scores[di]
+                        export_kp_rows[s].append(
+                            np.concatenate(
+                                [kpts_s[:, :2], scrs_s[:, None]], axis=1
+                            ).astype(np.float32)
+                        )
+                        export_bbox_rows[s].append([det_bboxes[di]])
+
+                        crop_s, _, _, _, _ = derive_face_crop(frame, kpts_s, scrs_s)
+                        if crop_s is not None:
+                            export_last_face_crop[s] = crop_s
+                    else:
+                        export_kp_rows[s].append(np.zeros((17, 3), dtype=np.float32))
+                        export_bbox_rows[s].append([])
+
+                    if export_last_face_crop[s] is not None:
+                        face_frame = cv2.resize(
+                            export_last_face_crop[s], (EXPORT_FACE_SIZE, EXPORT_FACE_SIZE)
+                        )
+                    else:
+                        face_frame = np.zeros(
+                            (EXPORT_FACE_SIZE, EXPORT_FACE_SIZE, 3), dtype=np.uint8
+                        )
+                    export_face_writers[s].write(face_frame)
+
+                if export_diagnostics:
+                    overlay = frame.copy()
+                    if last_scaled_bboxes:
+                        for bbox in last_scaled_bboxes:
+                            x1, y1, x2, y2 = [int(v) for v in bbox]
+                            cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                    export_bbox_overlay_writer.write(overlay)
+
             # Update seg_mask_keypoints now that keypoints are known (yolo_seg ran before det)
             if yolo_seg is not None and blur_bodies:
                 seg_mask_keypoints = keypoints.copy() if keypoints is not None and len(keypoints) > 0 else None
@@ -509,8 +631,15 @@ def process_video(
                     # coarser silhouette beats leaving a real person unmasked.
                     if fresh_gate and last_seg_mask.sum() < 0.02 * region.sum():
                         last_seg_mask = bbox_region_mask(gate_bboxes, height, width, padding=0)
+
+                    if export_enabled and export_diagnostics:
+                        export_raw_mask_writer.write((raw_seg_mask.astype(np.uint8)) * 255)
+                        export_gate_writer.write((region.astype(np.uint8)) * 255)
                 else:
                     last_seg_mask = None
+                    if export_enabled and export_diagnostics:
+                        export_raw_mask_writer.write(np.zeros((height, width), dtype=np.uint8))
+                        export_gate_writer.write(np.zeros((height, width), dtype=np.uint8))
 
             prev_gray = curr_gray.copy()
 
@@ -626,6 +755,16 @@ def process_video(
                 annotated = blur_all_persons(annotated, keypoints, scores, all_face_mesh_pts)
         t_blur_total += time.time() - tb0
 
+        if export_enabled:
+            # Clean (debug-overlay-free) anonymized frame + final mask, for
+            # a downstream machine consumer rather than a human viewer --
+            # written here, before the skeleton/bbox debug drawing below.
+            export_rtm_writer.write(annotated)
+            if last_seg_mask is not None:
+                export_mask_writer.write((last_seg_mask.astype(np.uint8)) * 255)
+            else:
+                export_mask_writer.write(np.zeros((height, width), dtype=np.uint8))
+
         td0 = time.time()
         if draw_enabled and keypoints is not None and len(keypoints) > 0:
             annotated = draw_skeleton(annotated, keypoints, scores, kpt_thr=0.3)
@@ -706,6 +845,24 @@ def process_video(
     cap.release()
     if out is not None:
         out.release()
+
+    if export_enabled:
+        for i in range(export_people):
+            kp_arr = (np.stack(export_kp_rows[i], axis=0) if export_kp_rows[i]
+                      else np.zeros((0, 17, 3), dtype=np.float32))
+            np.save(os.path.join(export_dir, f"keypoints_p{i}.npy"), kp_arr)
+            with open(os.path.join(export_dir, f"bboxes_p{i}.json"), "w") as f:
+                json.dump(export_bbox_rows[i], f)
+            export_face_writers[i].release()
+        export_rtm_writer.release()
+        export_mask_writer.release()
+        if export_diagnostics:
+            export_raw_mask_writer.release()
+            export_gate_writer.release()
+            export_bbox_overlay_writer.release()
+        print(f"\n  Dense export written -> {export_dir}  "
+              f"({kp_arr.shape[0]} frames x {export_people} slots)")
+
     if not headless:
         cv2.destroyAllWindows()
     face_mesh.close()
