@@ -73,7 +73,7 @@ def process_video(
     skip_n            = 5,
     movement_adaptive = False,
     csv_out           = None,
-    anonymizer        = "convexhull",   # "convexhull" | "selfie_seg0" | "selfie_seg1" | "mobilesam" | "yoloseg" | "yoloseg11"
+    anonymizer        = "convexhull",   # "convexhull" | "selfie_seg0" | "selfie_seg1" | "mobilesam" | "yoloseg" | "yoloseg11" | "yoloseg11int8"
     export_dir         = None,   # dense per-person export mode (opt-in, additive -- see export_tracking.py)
     dense_export        = False,
     export_people        = 3,
@@ -212,6 +212,11 @@ def process_video(
         print(f"\n[3b] Loading YOLO11n-seg ONNX (instance segmentation)...")
         yolo_seg = YOLOSegBlur(model_name=_y11_ckpt, infer_size=320, conf=0.4)
         print(f"     Anonymizer: yoloseg11")
+    elif anonymizer == "yoloseg11int8":
+        _y11_int8_ckpt = os.path.join(os.path.dirname(__file__), "..", "..", "models", "yolo11n-seg-int8.onnx")
+        print(f"\n[3b] Loading YOLO11n-seg ONNX INT8 (instance segmentation)...")
+        yolo_seg = YOLOSegBlur(model_name=_y11_int8_ckpt, infer_size=320, conf=0.4)
+        print(f"     Anonymizer: yoloseg11int8")
     else:
         print(f"\n[3b] Anonymizer: convexhull")
 

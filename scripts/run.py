@@ -30,10 +30,11 @@ if __name__ == "__main__":
     parser.add_argument("--no-blur", action="store_true",
                         help="Disable anonymization.")
     parser.add_argument("--anonymizer", type=str, default="convexhull",
-                        choices=["convexhull", "selfie_seg0", "selfie_seg1", "mobilesam", "yoloseg", "yoloseg11"],
+                        choices=["convexhull", "selfie_seg0", "selfie_seg1", "mobilesam", "yoloseg", "yoloseg11", "yoloseg11int8"],
                         help="Anonymization backend: convexhull (default), "
                              "selfie_seg0 (MediaPipe general), selfie_seg1 (MediaPipe landscape), "
-                             "mobilesam (MobileSAM ViT-Tiny), yoloseg (YOLOv8n-seg), yoloseg11 (YOLO11n-seg).")
+                             "mobilesam (MobileSAM ViT-Tiny), yoloseg (YOLOv8n-seg ONNX), "
+                             "yoloseg11 (YOLO11n-seg ONNX FP32), yoloseg11int8 (YOLO11n-seg ONNX INT8, dynamic quant).")
     parser.add_argument("--export-dir", type=str, default=None,
                         help="Dense per-person export mode: write per-frame keypoints/bboxes/"
                              "face-crops/masks into this directory (opt-in, additive).")

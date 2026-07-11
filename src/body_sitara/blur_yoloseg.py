@@ -31,14 +31,30 @@ class YOLOSegBlur:
         # auto-downloads .pt from its GitHub releases); if the requested .onnx
         # is missing but the matching .pt is present or downloadable, export it
         # once so first-run on a fresh machine (e.g. the Pi) doesn't hard-fail.
+        is_int8 = model_name.endswith("-int8.onnx")
         if model_name.endswith(".onnx") and not os.path.exists(model_name):
-            pt_name = model_name[:-len(".onnx")] + ".pt"
-            print(f"  [YOLOSeg] {model_name} not found -- exporting from {pt_name} ...")
-            pt_model = YOLO(pt_name)  # auto-downloads .pt if missing
-            exported_path = pt_model.export(format="onnx", imgsz=infer_size, simplify=True)
-            if os.path.abspath(exported_path) != os.path.abspath(model_name):
-                os.replace(exported_path, model_name)
-            print(f"  [YOLOSeg] Exported -> {model_name}")
+            base_onnx = model_name[:-len("-int8.onnx")] + ".onnx" if is_int8 else model_name
+            pt_name = base_onnx[:-len(".onnx")] + ".pt"
+
+            if not os.path.exists(base_onnx):
+                print(f"  [YOLOSeg] {base_onnx} not found -- exporting from {pt_name} ...")
+                pt_model = YOLO(pt_name)  # auto-downloads .pt if missing
+                exported_path = pt_model.export(format="onnx", imgsz=infer_size, simplify=True)
+                if os.path.abspath(exported_path) != os.path.abspath(base_onnx):
+                    os.replace(exported_path, base_onnx)
+                print(f"  [YOLOSeg] Exported -> {base_onnx}")
+
+            if is_int8:
+                # Dynamic weight-only INT8 quantization. Measured slower than
+                # FP32 ONNX on x86 (dequant/requant overhead outweighs
+                # bandwidth savings without static activation calibration),
+                # but ARM's INT8 SIMD path (NEON dot-product on ARMv8.2+,
+                # e.g. Pi 5's Cortex-A76) can behave very differently --
+                # worth measuring per-platform, not assuming from x86 results.
+                from onnxruntime.quantization import quantize_dynamic, QuantType
+                print(f"  [YOLOSeg] Quantizing {base_onnx} -> {model_name} (INT8, dynamic)...")
+                quantize_dynamic(base_onnx, model_name, weight_type=QuantType.QUInt8)
+                print(f"  [YOLOSeg] Quantized -> {model_name}")
 
         self._model      = YOLO(model_name)
         self._infer_size = infer_size
