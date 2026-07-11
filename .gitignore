@@ -22,6 +22,7 @@ output-videos/
 scratch_boxes.txt
 scratch/
 tier2_export/
+tier2_export_root/
 
 # Models (large binaries — store separately)
 models/

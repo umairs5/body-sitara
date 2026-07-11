@@ -49,10 +49,16 @@ def main():
     ap.add_argument("--max-frames", type=int, default=300)
     ap.add_argument("--out", default="scratch/yolo_precision_compare.mp4")
     ap.add_argument("--skip-n", type=int, default=1)
+    ap.add_argument("--model-b", default="yolo11n-seg.onnx",
+                     help="Second model to compare against PT ground truth, "
+                          "e.g. yolo11n-seg.onnx (FP32) or yolo11n-seg-int8.onnx (INT8).")
+    ap.add_argument("--label-b", default=None,
+                     help="Panel label for model-b; defaults to the filename.")
     args = ap.parse_args()
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     models_dir = os.path.join(os.path.dirname(__file__), "..", "models")
+    label_b = args.label_b or args.model_b
 
     print("Loading RTMPose (drives skip-frame mask warp)...")
     apply_detector_patch()
@@ -68,8 +74,8 @@ def main():
     print("Loading YOLO11n-seg PyTorch (.pt)...")
     yolo_pt = YOLOSegBlur(model_name=os.path.join(models_dir, "yolo11n-seg.pt"), infer_size=320, conf=0.4)
 
-    print("Loading YOLO11n-seg ONNX (FP32)...")
-    yolo_onnx = YOLOSegBlur(model_name=os.path.join(models_dir, "yolo11n-seg.onnx"), infer_size=320, conf=0.4)
+    print(f"Loading {label_b}...")
+    yolo_onnx = YOLOSegBlur(model_name=os.path.join(models_dir, args.model_b), infer_size=320, conf=0.4)
 
     cap = cv2.VideoCapture(args.video)
     if not cap.isOpened():
@@ -141,12 +147,12 @@ def main():
         grid = np.hstack([
             label(orig_p, "ORIGINAL"),
             label(pt_p, f"PT {t_pt:.0f}ms{tag}"),
-            label(onnx_p, f"ONNX {t_onnx:.0f}ms{tag}  diff={diff_pct:.2f}%"),
+            label(onnx_p, f"{label_b} {t_onnx:.0f}ms{tag}  diff={diff_pct:.2f}%"),
         ])
         writer.write(grid)
 
         if frame_idx % 30 == 0:
-            print(f"[F {frame_idx:4d}]{tag} PT={t_pt:6.1f}ms  ONNX={t_onnx:6.1f}ms  mask_diff={diff_pct:5.2f}%")
+            print(f"[F {frame_idx:4d}]{tag} PT={t_pt:6.1f}ms  {label_b}={t_onnx:6.1f}ms  mask_diff={diff_pct:5.2f}%")
         frame_idx += 1
 
     cap.release()
@@ -154,8 +160,8 @@ def main():
 
     print(f"\nWrote comparison video -> {args.out}  ({frame_idx} frames, skip-n={args.skip_n})")
     print("\n=== Summary ===")
-    print(f"PT   : mean full-frame {np.mean(t_pt_list):.1f}ms   mean coverage {np.mean(cov_pt_list):.2f}%")
-    print(f"ONNX : mean full-frame {np.mean(t_onnx_list):.1f}ms   mean coverage {np.mean(cov_onnx_list):.2f}%")
+    print(f"PT{'':<{len(label_b)-1}} : mean full-frame {np.mean(t_pt_list):.1f}ms   mean coverage {np.mean(cov_pt_list):.2f}%")
+    print(f"{label_b} : mean full-frame {np.mean(t_onnx_list):.1f}ms   mean coverage {np.mean(cov_onnx_list):.2f}%")
     print(f"Speedup: {np.mean(t_pt_list) / np.mean(t_onnx_list):.2f}x")
     print(f"Mean mask disagreement (all frames incl. warped): {np.mean(diff_pct_list):.3f}% of pixels")
     print(f"Max mask disagreement: {np.max(diff_pct_list):.3f}% of pixels")
