@@ -3,6 +3,7 @@ import time
 import os
 import csv
 import json
+import uuid
 import urllib.request
 import numpy as np
 import mediapipe as mp
@@ -23,6 +24,7 @@ from .blur_seg import SelfieSegBlur, bbox_region_mask
 from .blur_mobilesam import MobileSAMBlur, bboxes_from_keypoints
 from .blur_yoloseg import YOLOSegBlur
 from .face_canonical import FaceCanonicalizer, CANONICAL_SIZE
+from .face_canonical_v2 import FaceCanonicalizerV2, P_SMILE
 from .tracking import PersonState, propagate_bboxes
 from .encryption import generate_ttp_keypair
 from .embedding import EmbeddingExtractor, EDGEFACE_ONNX_PATH
@@ -249,32 +251,49 @@ def process_video(
     slot_tracker              = None
     export_kp_rows            = None
     export_bbox_rows          = None
-    export_last_face_crop     = None
-    export_face_writers       = None
+    export_face_param_rows    = None   # parametric, identity-free signal -- the safe-to-transmit face export
+    export_valid_smiles       = None   # smile scalar from genuinely-detected (non-held-over) frames only, for the clip baseline
+    export_last_face_crop     = None   # transient only: feeds extract_params() + optional diagnostic write, never itself "the" export
+    export_last_face_params   = None   # last-good parametric scalars, held across brief absences (mirrors the old face-crop hold-over)
+    export_slot_stream_id     = None
+    export_face_canon         = None
+    export_face_writers       = None   # diagnostics-only now (see export_diagnostics gating below)
     export_rtm_writer         = None
     export_mask_writer        = None
     export_raw_mask_writer    = None
     export_gate_writer        = None
     export_bbox_overlay_writer = None
+    export_clip_id            = None
 
     if export_enabled:
         from .export_tracking import ExportSlotTracker
-        slot_tracker          = ExportSlotTracker(export_people, width, height)
-        export_kp_rows        = [[] for _ in range(export_people)]
-        export_bbox_rows      = [[] for _ in range(export_people)]
-        export_last_face_crop = [None] * export_people
+        slot_tracker            = ExportSlotTracker(export_people, width, height)
+        export_kp_rows          = [[] for _ in range(export_people)]
+        export_bbox_rows        = [[] for _ in range(export_people)]
+        export_face_param_rows  = [[] for _ in range(export_people)]
+        export_valid_smiles     = [[] for _ in range(export_people)]
+        export_last_face_crop   = [None] * export_people
+        export_last_face_params = [None] * export_people
+        export_slot_stream_id   = [str(uuid.uuid4()) for _ in range(export_people)]
+        export_face_canon       = FaceCanonicalizerV2(model_path='face_landmarker.task')
+        export_clip_id          = str(uuid.uuid4())
 
         _exp_fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        export_face_writers = [
-            cv2.VideoWriter(os.path.join(export_dir, f"face_crops_p{i}.mp4"),
-                             _exp_fourcc, fps_input, (EXPORT_FACE_SIZE, EXPORT_FACE_SIZE))
-            for i in range(export_people)
-        ]
         export_rtm_writer  = cv2.VideoWriter(os.path.join(export_dir, "output_rtm.mp4"),
                                               _exp_fourcc, fps_input, (width, height))
         export_mask_writer = cv2.VideoWriter(os.path.join(export_dir, "mask.mp4"),
                                               _exp_fourcc, fps_input, (width, height), isColor=False)
         if export_diagnostics:
+            # face_crops_p{i}.mp4 is a RAW, unblurred face crop -- useful for local
+            # debugging (visually checking what face_params_p{i}.npy was derived
+            # from) but it must never be treated as part of the safe-to-transmit
+            # bundle. Gated behind export_diagnostics for exactly that reason,
+            # same as the other raw/debug-only outputs below.
+            export_face_writers = [
+                cv2.VideoWriter(os.path.join(export_dir, f"face_crops_p{i}.mp4"),
+                                 _exp_fourcc, fps_input, (EXPORT_FACE_SIZE, EXPORT_FACE_SIZE))
+                for i in range(export_people)
+            ]
             export_raw_mask_writer = cv2.VideoWriter(
                 os.path.join(export_dir, "raw_seg_mask.mp4"),
                 _exp_fourcc, fps_input, (width, height), isColor=False)
@@ -528,6 +547,7 @@ def process_video(
                 slot_matches = slot_tracker.assign(detections)
 
                 for s in range(export_people):
+                    crop_s = None
                     if s in slot_matches:
                         di = slot_matches[s]
                         kpts_s, scrs_s = keypoints[di], scores[di]
@@ -541,19 +561,33 @@ def process_video(
                         crop_s, _, _, _, _ = derive_face_crop(frame, kpts_s, scrs_s)
                         if crop_s is not None:
                             export_last_face_crop[s] = crop_s
+                            params_s = export_face_canon.extract_params(crop_s)
+                            if params_s is not None:
+                                export_last_face_params[s] = params_s
+                                export_valid_smiles[s].append(float(params_s[P_SMILE]))
                     else:
                         export_kp_rows[s].append(np.zeros((17, 3), dtype=np.float32))
                         export_bbox_rows[s].append([])
 
-                    if export_last_face_crop[s] is not None:
-                        face_frame = cv2.resize(
-                            export_last_face_crop[s], (EXPORT_FACE_SIZE, EXPORT_FACE_SIZE)
-                        )
+                    # face_params_p{i}.npy is the safe-to-transmit identity-free
+                    # signal -- last-good scalars held across brief absences, same
+                    # hold-over behaviour the old raw-crop export used, just now
+                    # applied to 12 numbers instead of a face image.
+                    if export_last_face_params[s] is not None:
+                        export_face_param_rows[s].append(export_last_face_params[s].copy())
                     else:
-                        face_frame = np.zeros(
-                            (EXPORT_FACE_SIZE, EXPORT_FACE_SIZE, 3), dtype=np.uint8
-                        )
-                    export_face_writers[s].write(face_frame)
+                        export_face_param_rows[s].append(np.zeros(12, dtype=np.float32))
+
+                    if export_diagnostics:
+                        if export_last_face_crop[s] is not None:
+                            face_frame = cv2.resize(
+                                export_last_face_crop[s], (EXPORT_FACE_SIZE, EXPORT_FACE_SIZE)
+                            )
+                        else:
+                            face_frame = np.zeros(
+                                (EXPORT_FACE_SIZE, EXPORT_FACE_SIZE, 3), dtype=np.uint8
+                            )
+                        export_face_writers[s].write(face_frame)
 
                 if export_diagnostics:
                     overlay = frame.copy()
@@ -847,15 +881,49 @@ def process_video(
         out.release()
 
     if export_enabled:
+        manifest_slots = []
         for i in range(export_people):
             kp_arr = (np.stack(export_kp_rows[i], axis=0) if export_kp_rows[i]
                       else np.zeros((0, 17, 3), dtype=np.float32))
             np.save(os.path.join(export_dir, f"keypoints_p{i}.npy"), kp_arr)
             with open(os.path.join(export_dir, f"bboxes_p{i}.json"), "w") as f:
                 json.dump(export_bbox_rows[i], f)
-            export_face_writers[i].release()
+
+            fp_arr = (np.stack(export_face_param_rows[i], axis=0) if export_face_param_rows[i]
+                      else np.zeros((0, 12), dtype=np.float32))
+            np.save(os.path.join(export_dir, f"face_params_p{i}.npy"), fp_arr)
+
+            # Smile baseline uses only genuinely-detected frames (export_valid_smiles),
+            # never the held-over values in export_face_param_rows -- matches the
+            # two-pass approach in scripts/test_face_canon_v2.py. Downstream
+            # rendering applies this correction itself (FaceCanonicalizerV2.
+            # set_smile_baseline() + render()) -- exported params are raw/uncorrected.
+            smile_baseline = (float(np.median(export_valid_smiles[i]))
+                               if export_valid_smiles[i] else 0.0)
+            manifest_slots.append({
+                "slot": i,
+                "stream_id": export_slot_stream_id[i],
+                "face_smile_baseline": smile_baseline,
+                "frames_with_face": len(export_valid_smiles[i]),
+            })
+
+            if export_diagnostics:
+                export_face_writers[i].release()
+
+        with open(os.path.join(export_dir, "manifest.json"), "w") as f:
+            json.dump({
+                "clip_id": export_clip_id,
+                "fps": fps_input,
+                "width": width,
+                "height": height,
+                "num_slots": export_people,
+                "total_frames": kp_arr.shape[0],
+                "slots": manifest_slots,
+            }, f, indent=2)
+
         export_rtm_writer.release()
         export_mask_writer.release()
+        export_face_canon.close()
         if export_diagnostics:
             export_raw_mask_writer.release()
             export_gate_writer.release()

@@ -7,7 +7,14 @@ from cryptography.hazmat.primitives import hashes, serialization
 
 
 def generate_ttp_keypair():
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    # RSA-4096, matching the original SITARA paper (Section IV.A), not the
+    # RSA-2048 this codebase used previously. The Pi-side cost of this
+    # change is negligible -- RSA-OAEP public-key encrypt of a 16-byte AES
+    # key, once per person-stream per clip, not per-frame -- while the
+    # expensive private-key decrypt only ever runs on the TTP server, which
+    # isn't resource-constrained. This keeps benchmark numbers directly
+    # comparable to the paper's published tables.
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
     return private_key, private_key.public_key()
 
 
