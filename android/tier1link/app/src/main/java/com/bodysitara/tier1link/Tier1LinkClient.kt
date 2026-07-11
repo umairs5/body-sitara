@@ -8,7 +8,10 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.security.MessageDigest
+import java.security.SecureRandom
 import java.util.concurrent.TimeUnit
+import javax.net.ssl.SSLContext
+import javax.net.ssl.X509TrustManager
 
 data class ClipSummary(
     val clipId: String,
@@ -23,19 +26,55 @@ data class FileEntry(
     val sha256: String,
 )
 
+sealed class TlsMode {
+    /** Plain HTTP, no TLS at all -- dev/back-compat path. baseUrl must use "http://". */
+    object PlainHttp : TlsMode()
+
+    /** HTTPS with a pinned fingerprint the user already has (normal, post-pairing case). */
+    data class Pinned(val fingerprint: String) : TlsMode()
+
+    /**
+     * HTTPS, first-pairing-only: accepts whatever cert the server presents
+     * and reports its fingerprint via [onCapture] so the caller can display
+     * it for the user to save as the pin going forward. Must only be used
+     * for one explicit, user-initiated pairing action -- never as a
+     * standing fallback.
+     */
+    data class Capture(val onCapture: (String) -> Unit) : TlsMode()
+}
+
 /**
  * Kotlin port of scripts/test_tier1_link_client.py's protocol calls, against
- * src/tier1_link/server.py's four endpoints. Plain HTTP + explicit base URL
- * for now -- no mDNS discovery or TLS pinning yet (see plan section 2.1,
- * phased: plain IP first, then TOFU-pinned HTTPS + mDNS once this baseline
- * flow is proven).
+ * src/tier1_link/server.py's four endpoints. See [TlsMode] for the three
+ * connection modes this supports.
  */
-class Tier1LinkClient(private val baseUrl: String) {
+class Tier1LinkClient(private val baseUrl: String, tlsMode: TlsMode = TlsMode.PlainHttp) {
 
-    private val http = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .build()
+    private val http: OkHttpClient = run {
+        val builder = OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+
+        val trustManager = when (tlsMode) {
+            is TlsMode.PlainHttp -> null
+            is TlsMode.Pinned -> TofuTrustManager(tlsMode.fingerprint)
+            is TlsMode.Capture -> TofuTrustManager(null, tlsMode.onCapture)
+        }
+
+        if (trustManager != null) {
+            val sslContext = SSLContext.getInstance("TLS")
+            sslContext.init(null, arrayOf<X509TrustManager>(trustManager), SecureRandom())
+            builder.sslSocketFactory(sslContext.socketFactory, trustManager)
+            // Fingerprint pinning is the real trust boundary here, not
+            // hostname matching -- the server's self-signed cert only
+            // claims "localhost" as its SAN regardless of which IP the
+            // phone actually dials, so normal hostname verification would
+            // always fail even against the correct, pinned server.
+            builder.hostnameVerifier { _, _ -> true }
+        }
+
+        builder.build()
+    }
 
     fun listClips(): List<ClipSummary> {
         val req = Request.Builder().url("$baseUrl/clips").build()

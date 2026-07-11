@@ -2,9 +2,10 @@
 Tier 1 -> Tier 2 local link server (Pi/phone Phase 1, plan section 2.1).
 
 Serves de-identified dense-export clip bundles (see pipeline.py's
---export-dir output) to the phone over local WiFi. Plain HTTP + known IP
-for this development stage -- TOFU-pinned HTTPS + mDNS advertisement are
-a later hardening pass (same endpoint contract), not implemented here.
+--export-dir output) to the phone over local WiFi, via TOFU-pinned HTTPS
+by default (see cert.py) -- pass --http to fall back to plain HTTP for
+quick local testing. mDNS advertisement is a separate later pass (same
+endpoint contract either way).
 
 Directory layout expected under --root:
     <root>/<clip_id>/manifest.json
@@ -21,7 +22,8 @@ Endpoints:
                                            later decision, kept explicit)
 
 Usage:
-    python -m tier1_link.server --root tier2_export_root --port 8000
+    python -m tier1_link.server --root tier2_export_root --port 8443
+    python -m tier1_link.server --root tier2_export_root --port 8000 --http
 """
 import argparse
 import hashlib
@@ -31,6 +33,8 @@ import os
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
+
+from .cert import DEFAULT_CERT_PATH, DEFAULT_KEY_PATH, ensure_cert
 
 app = FastAPI(title="bodySITARA Tier1 Link Server")
 
@@ -123,12 +127,28 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", required=True, help="Directory containing <clip_id>/ subfolders")
     ap.add_argument("--host", default="0.0.0.0")
-    ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--port", type=int, default=8443)
+    ap.add_argument("--http", action="store_true",
+                     help="Serve plain HTTP instead of TOFU-pinned HTTPS (dev/back-compat only).")
+    ap.add_argument("--cert", default=DEFAULT_CERT_PATH)
+    ap.add_argument("--key", default=DEFAULT_KEY_PATH)
     args = ap.parse_args()
 
     EXPORT_ROOT = os.path.abspath(args.root)
     print(f"Serving clip exports from: {EXPORT_ROOT}")
-    uvicorn.run(app, host=args.host, port=args.port)
+
+    if args.http:
+        print("  WARNING: --http requested, serving PLAIN HTTP (no transport security).")
+        uvicorn.run(app, host=args.host, port=args.port)
+    else:
+        fingerprint = ensure_cert(args.cert, args.key)
+        print("=" * 60)
+        print("  TOFU pairing fingerprint (SHA-256):")
+        print(f"  {fingerprint}")
+        print("  Enter this exact value in the phone app on first connect.")
+        print("=" * 60)
+        uvicorn.run(app, host=args.host, port=args.port,
+                     ssl_certfile=args.cert, ssl_keyfile=args.key)
 
 
 if __name__ == "__main__":

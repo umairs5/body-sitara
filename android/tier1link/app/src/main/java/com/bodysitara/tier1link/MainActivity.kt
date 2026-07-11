@@ -24,10 +24,7 @@ class MainActivity : AppCompatActivity() {
         binding.btnRefresh.setOnClickListener { refreshClips() }
     }
 
-    private fun baseUrl(): String {
-        val hostPort = binding.editHostPort.text.toString().trim()
-        return "http://$hostPort"
-    }
+    private fun hostPort(): String = binding.editHostPort.text.toString().trim()
 
     private fun log(msg: String) {
         runOnUiThread {
@@ -35,17 +32,51 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Builds a client for the current UI settings. If HTTPS is checked and
+     * no fingerprint is pinned yet, this does a one-time capture-mode
+     * connection first (accepting whatever cert the server presents),
+     * shows the fingerprint for the user to verify out-of-band, saves it
+     * into the field, and returns a properly pinned client for actual use.
+     * Every subsequent call reuses the now-nonblank field, so capture mode
+     * only ever fires once per pairing, not on every request.
+     */
+    private suspend fun buildClient(): Tier1LinkClient {
+        val useHttps = binding.checkUseHttps.isChecked
+        if (!useHttps) {
+            return Tier1LinkClient("http://${hostPort()}", TlsMode.PlainHttp)
+        }
+
+        val existingFingerprint = binding.editFingerprint.text.toString().trim()
+        if (existingFingerprint.isNotEmpty()) {
+            return Tier1LinkClient("https://${hostPort()}", TlsMode.Pinned(existingFingerprint))
+        }
+
+        log("No fingerprint pinned yet -- capturing from server on this connection.")
+        log("VERIFY this matches the fingerprint printed in the server's console before trusting it.")
+        var captured: String? = null
+        val captureClient = Tier1LinkClient(
+            "https://${hostPort()}",
+            TlsMode.Capture { fp -> captured = fp }
+        )
+        withContext(Dispatchers.IO) { captureClient.listClips() }  // triggers the handshake
+        val fp = captured ?: throw IllegalStateException("Capture mode ran but no fingerprint was recorded")
+        log("Captured fingerprint: $fp")
+        runOnUiThread { binding.editFingerprint.setText(fp) }
+        return Tier1LinkClient("https://${hostPort()}", TlsMode.Pinned(fp))
+    }
+
     private fun refreshClips() {
-        val client = Tier1LinkClient(baseUrl())
-        log("Listing clips from ${baseUrl()} ...")
+        log("Listing clips from ${hostPort()} ...")
         lifecycleScope.launch {
             try {
+                val client = buildClient()
                 val result = withContext(Dispatchers.IO) { client.listClips() }
                 clips = result
                 log("Found ${result.size} clip(s)")
                 renderClipList(client)
             } catch (e: Exception) {
-                log("ERROR: ${e.message}")
+                log("ERROR: ${e::class.simpleName}: ${e.message}")
             }
         }
     }
