@@ -1,7 +1,9 @@
 package com.bodysitara.tier1link
 
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -85,9 +87,10 @@ class Tier1LinkClient(private val baseUrl: String) {
     }
 
     fun ackClip(clipId: String): Boolean {
+        val emptyBody = ByteArray(0).toRequestBody("application/octet-stream".toMediaType())
         val req = Request.Builder()
             .url("$baseUrl/clips/$clipId/ack")
-            .post(okhttp3.RequestBody.create(null, ByteArray(0)))
+            .post(emptyBody)
             .build()
         http.newCall(req).execute().use { resp -> return resp.isSuccessful }
     }

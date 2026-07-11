@@ -14,6 +14,7 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private var clips: List<ClipSummary> = emptyList()
+    private var pullInProgress = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -59,6 +60,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun pullClip(client: Tier1LinkClient, clip: ClipSummary) {
+        if (pullInProgress) {
+            log("A pull is already in progress -- ignoring tap.")
+            return
+        }
+        pullInProgress = true
         log("\n=== Pulling ${clip.clipId} ===")
         lifecycleScope.launch {
             try {
@@ -75,13 +81,15 @@ class MainActivity : AppCompatActivity() {
 
                 if (allOk) {
                     val acked = withContext(Dispatchers.IO) { client.ackClip(clip.clipId) }
-                    log(if (acked) "Acked -> ${clip.clipId}" else "Ack failed")
+                    log(if (acked) "Acked -> ${clip.clipId}" else "Ack failed (server returned non-2xx)")
                 } else {
                     log("NOT acking -- one or more files failed verification")
                 }
                 log("Saved under: ${destDir.absolutePath}")
             } catch (e: Exception) {
-                log("ERROR: ${e.message}")
+                log("ERROR: ${e::class.simpleName}: ${e.message}")
+            } finally {
+                pullInProgress = false
             }
         }
     }
