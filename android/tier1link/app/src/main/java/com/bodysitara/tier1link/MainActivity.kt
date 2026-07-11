@@ -16,12 +16,38 @@ class MainActivity : AppCompatActivity() {
     private var clips: List<ClipSummary> = emptyList()
     private var pullInProgress = false
 
+    private val discovery by lazy { Tier1Discovery(applicationContext) }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
         binding.btnRefresh.setOnClickListener { refreshClips() }
+        binding.btnDiscover.setOnClickListener { discoverServer() }
+    }
+
+    private fun discoverServer() {
+        log("Searching for _bodysitara._tcp on the local network (mDNS)...")
+        lifecycleScope.launch {
+            try {
+                val found = withContext(Dispatchers.IO) { discovery.discoverFirst() }
+                if (found == null) {
+                    log("No server found within timeout. Falling back to manual host:port entry.")
+                    return@launch
+                }
+                log("Found: ${found.host}:${found.port} (scheme=${found.scheme}, device_id=${found.deviceId})")
+                binding.editHostPort.setText("${found.host}:${found.port}")
+                binding.checkUseHttps.isChecked = (found.scheme == "https")
+                // A newly-discovered host may be a different physical device than
+                // whatever fingerprint (if any) is currently pinned in the field --
+                // clear it so buildClient() re-enters capture mode and the user
+                // re-verifies, rather than silently reusing a stale/unrelated pin.
+                binding.editFingerprint.setText("")
+            } catch (e: Exception) {
+                log("Discovery ERROR: ${e::class.simpleName}: ${e.message}")
+            }
+        }
     }
 
     private fun hostPort(): String = binding.editHostPort.text.toString().trim()

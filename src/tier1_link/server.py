@@ -29,12 +29,14 @@ import argparse
 import hashlib
 import json
 import os
+import uuid
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 
 from .cert import DEFAULT_CERT_PATH, DEFAULT_KEY_PATH, ensure_cert
+from .discovery import Advertiser
 
 app = FastAPI(title="bodySITARA Tier1 Link Server")
 
@@ -122,6 +124,15 @@ def ack_clip(clip_id: str):
     return JSONResponse({"clip_id": clip_id, "status": "acknowledged"})
 
 
+def _ensure_device_id(path: str = "tier1_link_device_id.txt") -> str:
+    if os.path.exists(path):
+        return open(path).read().strip()
+    device_id = str(uuid.uuid4())
+    with open(path, "w") as f:
+        f.write(device_id)
+    return device_id
+
+
 def main():
     global EXPORT_ROOT
     ap = argparse.ArgumentParser()
@@ -132,23 +143,37 @@ def main():
                      help="Serve plain HTTP instead of TOFU-pinned HTTPS (dev/back-compat only).")
     ap.add_argument("--cert", default=DEFAULT_CERT_PATH)
     ap.add_argument("--key", default=DEFAULT_KEY_PATH)
+    ap.add_argument("--no-mdns", action="store_true", help="Disable mDNS advertisement.")
+    ap.add_argument("--mdns-name", default="bodysitara-tier1",
+                     help="mDNS instance name, e.g. bodysitara-tier1.local.")
     args = ap.parse_args()
 
     EXPORT_ROOT = os.path.abspath(args.root)
     print(f"Serving clip exports from: {EXPORT_ROOT}")
 
-    if args.http:
-        print("  WARNING: --http requested, serving PLAIN HTTP (no transport security).")
-        uvicorn.run(app, host=args.host, port=args.port)
-    else:
-        fingerprint = ensure_cert(args.cert, args.key)
-        print("=" * 60)
-        print("  TOFU pairing fingerprint (SHA-256):")
-        print(f"  {fingerprint}")
-        print("  Enter this exact value in the phone app on first connect.")
-        print("=" * 60)
-        uvicorn.run(app, host=args.host, port=args.port,
-                     ssl_certfile=args.cert, ssl_keyfile=args.key)
+    device_id = _ensure_device_id()
+
+    advertiser = None
+    if not args.no_mdns:
+        advertiser = Advertiser(args.mdns_name, args.port, device_id, uses_https=not args.http)
+        advertiser.start()
+
+    try:
+        if args.http:
+            print("  WARNING: --http requested, serving PLAIN HTTP (no transport security).")
+            uvicorn.run(app, host=args.host, port=args.port)
+        else:
+            fingerprint = ensure_cert(args.cert, args.key)
+            print("=" * 60)
+            print("  TOFU pairing fingerprint (SHA-256):")
+            print(f"  {fingerprint}")
+            print("  Enter this exact value in the phone app on first connect.")
+            print("=" * 60)
+            uvicorn.run(app, host=args.host, port=args.port,
+                         ssl_certfile=args.cert, ssl_keyfile=args.key)
+    finally:
+        if advertiser is not None:
+            advertiser.stop()
 
 
 if __name__ == "__main__":

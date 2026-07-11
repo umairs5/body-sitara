@@ -23,6 +23,7 @@ scratch_boxes.txt
 scratch/
 tier2_export/
 tier2_export_root/
+tier1_link_device_id.txt
 
 # Models (large binaries — store separately)
 models/
