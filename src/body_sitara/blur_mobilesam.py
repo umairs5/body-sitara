@@ -1,6 +1,5 @@
 import numpy as np
 import cv2
-import torch
 import urllib.request
 import os
 
@@ -25,6 +24,7 @@ class MobileSAMBlur:
     """
 
     def __init__(self, checkpoint_path: str = MOBILESAM_DEFAULT_PATH, device: str = "cpu"):
+        import torch
         from mobile_sam import sam_model_registry, SamPredictor
 
         if not os.path.exists(checkpoint_path):
