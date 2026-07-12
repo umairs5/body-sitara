@@ -109,18 +109,56 @@ class Tier1LinkClient(private val baseUrl: String, tlsMode: TlsMode = TlsMode.Pl
 
     /** Downloads one file to [destDir]/[name], verifying sha256+size. Returns true on success. */
     fun downloadAndVerify(clipId: String, entry: FileEntry, destDir: File): Boolean {
+        return downloadAndVerify(clipId, entry, destDir, onProgress = null)
+    }
+
+    /**
+     * Same as [downloadAndVerify] but streams to disk (doesn't hold the whole
+     * file in memory) and reports progress via [onProgress] (bytesRead,
+     * totalBytes), called from whatever thread this function runs on --
+     * callers on Android should already be off the main thread (this does
+     * blocking IO) and should hop back to the main thread themselves for UI
+     * updates.
+     */
+    fun downloadAndVerify(
+        clipId: String,
+        entry: FileEntry,
+        destDir: File,
+        onProgress: ((bytesRead: Long, totalBytes: Long) -> Unit)?,
+    ): Boolean {
         val req = Request.Builder().url("$baseUrl/clips/$clipId/files/${entry.name}").build()
         http.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) return false
-            val bytes = resp.body!!.bytes()
-            if (bytes.size.toLong() != entry.size) return false
-
-            val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
-            val actualSha = digest.joinToString("") { "%02x".format(it) }
-            if (actualSha != entry.sha256) return false
+            val body = resp.body ?: return false
 
             destDir.mkdirs()
-            File(destDir, entry.name).writeBytes(bytes)
+            val outFile = File(destDir, entry.name)
+            val digest = MessageDigest.getInstance("SHA-256")
+            var bytesRead = 0L
+            val buffer = ByteArray(64 * 1024)
+
+            outFile.outputStream().use { out ->
+                body.byteStream().use { input ->
+                    while (true) {
+                        val n = input.read(buffer)
+                        if (n == -1) break
+                        out.write(buffer, 0, n)
+                        digest.update(buffer, 0, n)
+                        bytesRead += n
+                        onProgress?.invoke(bytesRead, entry.size)
+                    }
+                }
+            }
+
+            if (bytesRead != entry.size) {
+                outFile.delete()
+                return false
+            }
+            val actualSha = digest.digest().joinToString("") { "%02x".format(it) }
+            if (actualSha != entry.sha256) {
+                outFile.delete()
+                return false
+            }
             return true
         }
     }

@@ -1,3 +1,5 @@
 <resources>
-    <style name="Theme.Tier1Link" parent="Theme.MaterialComponents.DayNight.NoActionBar" />
+    <!-- Splash/launch theme only. Compose's MaterialTheme (ui/theme/Theme.kt) does the
+         real theming once the Activity's content is set. -->
+    <style name="Theme.Tier1Link" parent="Theme.Material3.DayNight.NoActionBar" />
 </resources>
