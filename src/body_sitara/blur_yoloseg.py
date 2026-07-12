@@ -66,6 +66,25 @@ class YOLOSegBlur:
         infer_size arg accepted for API compatibility but ignored.
         Returns None if no persons detected.
         """
+        mask, _ = self.get_mask_and_boxes(frame)
+        return mask
+
+    def get_mask_and_boxes(self, frame: np.ndarray):
+        """
+        Same inference as get_mask(), but also returns the detector boxes
+        YOLO-seg found internally (its own detect head runs before the mask
+        head regardless -- this just surfaces that result instead of
+        discarding it). Lets a caller reuse this one detection pass for
+        pose estimation too, instead of running a second, separate detector
+        (e.g. rtmlib's YOLOX-Nano) purely to get boxes RTMPose-T needs --
+        confirmed via direct timing this was pure duplicated detection cost
+        (YOLOX-Nano ~18ms + YOLO-seg's own internal detect+mask ~33ms, when
+        one detection pass is all that's actually needed).
+
+        Returns (mask_or_None, boxes) where boxes is an (N,4) float array
+        [x1,y1,x2,y2] in full-frame pixel space, or an empty array if none
+        detected.
+        """
         h, w = frame.shape[:2]
         results = self._model(
             frame,
@@ -75,14 +94,18 @@ class YOLOSegBlur:
             verbose=False,
         )
         combined = np.zeros((h, w), dtype=bool)
+        boxes = np.empty((0, 4), dtype=float)
         for r in results:
+            if r.boxes is not None and len(r.boxes) > 0:
+                boxes = r.boxes.xyxy.cpu().numpy()
             if r.masks is None:
                 continue
             for mask_tensor in r.masks.data:
                 m = mask_tensor.cpu().numpy()
                 m_up = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST).astype(bool)
                 combined |= m_up
-        return combined if combined.any() else None
+        mask = combined if combined.any() else None
+        return mask, boxes
 
     def apply_mask(self, frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
         out = frame.copy()
