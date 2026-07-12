@@ -153,10 +153,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 if (allOk) {
                     withContext(Dispatchers.IO) { client.ackClip(clipId) }
                     val videoPath = File(destDir, "output_rtm.mp4").takeIf { it.exists() }?.absolutePath
+                    val maskPath = File(destDir, "mask.mp4").takeIf { it.exists() }?.absolutePath
                     updateClip(clipId) {
                         it.copy(
                             pull = StageState(status = StageStatus.DONE, progressPercent = 100),
                             incomingVideoPath = videoPath,
+                            maskVideoPath = maskPath,
+                            // Real backend exists now (LaMa-Dilated on-device) -- flip from
+                            // NOT_CONNECTED to PENDING so the UI offers a "Fill background" action.
+                            backgroundFill = StageState(status = StageStatus.PENDING),
                         )
                     }
                     log("Pull complete: $clipId")
@@ -170,7 +175,86 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // No real implementation exists yet for these two -- see model/ClipPipeline.kt's
-    // doc comment. Left as explicit no-ops (not wired to any button) rather than
-    // faked, so the UI's "not connected" state is honest about current capability.
+    private var lamaFiller: LamaDilatedFiller? = null
+
+    /**
+     * Runs the real Tier 2B-1 background fill: LaMa-Dilated ONNX inference,
+     * on-device, per-frame across the whole clip. Downloads the model on
+     * first use (170MB, from the public qualcomm/LaMa-Dilated release --
+     * see LamaDilatedFiller's docstring for why this variant and not the
+     * higher-quality big-lama, which is confirmed NOT exportable to ONNX
+     * or ExecuTorch).
+     */
+    fun runBackgroundFill(clipId: String) {
+        viewModelScope.launch {
+            val clip = _uiState.value.clips.firstOrNull { it.clipId == clipId }
+            val videoPath = clip?.incomingVideoPath
+            val maskPath = clip?.maskVideoPath
+            if (videoPath == null || maskPath == null) {
+                log("Cannot run background fill for $clipId: clip not pulled yet")
+                return@launch
+            }
+
+            updateClip(clipId) { it.copy(backgroundFill = StageState(status = StageStatus.IN_PROGRESS, progressPercent = 0, message = "Preparing model...")) }
+            try {
+                val filler = withContext(Dispatchers.IO) {
+                    lamaFiller ?: run {
+                        val modelDir = File(getApplication<Application>().filesDir, "models/lama_dilated")
+                        log("Ensuring LaMa-Dilated model is available (downloads ~170MB on first use)...")
+                        val modelPath = LamaDilatedFiller.ensureModel(modelDir) { read, total ->
+                            if (total > 0) {
+                                val pct = ((read * 100) / total).toInt()
+                                updateClip(clipId) {
+                                    it.copy(backgroundFill = it.backgroundFill.copy(
+                                        progressPercent = pct, message = "Downloading model: $pct%"
+                                    ))
+                                }
+                            }
+                        }
+                        LamaDilatedFiller(modelPath).also { lamaFiller = it }
+                    }
+                }
+
+                log("Model ready. Running background fill on $clipId...")
+                val outDir = File(getApplication<Application>().getExternalFilesDir(null), "filled_clips/$clipId")
+                outDir.mkdirs()
+                val outputPath = File(outDir, "filled.mp4").absolutePath
+
+                val processor = BackgroundFillProcessor(filler)
+                withContext(Dispatchers.IO) {
+                    processor.processVideo(videoPath, maskPath, outputPath) { done, total ->
+                        val pct = ((done * 100) / total.coerceAtLeast(1)).coerceIn(0, 100)
+                        updateClip(clipId) {
+                            it.copy(backgroundFill = it.backgroundFill.copy(
+                                progressPercent = pct, message = "Filling frame $done/$total"
+                            ))
+                        }
+                    }
+                }
+
+                updateClip(clipId) {
+                    it.copy(
+                        backgroundFill = StageState(status = StageStatus.DONE, progressPercent = 100),
+                        filledVideoPath = outputPath,
+                    )
+                }
+                log("Background fill complete: $clipId -> $outputPath")
+            } catch (e: Exception) {
+                log("Background fill ERROR for $clipId: ${e::class.simpleName}: ${e.message}")
+                updateClip(clipId) {
+                    it.copy(backgroundFill = it.backgroundFill.copy(status = StageStatus.FAILED, message = e.message))
+                }
+            }
+        }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        lamaFiller?.close()
+    }
+
+    // cloudGenerate/composite have no real implementation yet -- see
+    // model/ClipPipeline.kt's doc comment. Left as explicit no-ops (not
+    // wired to any button) rather than faked, so the UI's "not connected"
+    // state is honest about current capability.
 }

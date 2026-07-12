@@ -41,6 +41,7 @@ fun ClipDetailScreen(
     clip: ClipPipelineState,
     onBack: () -> Unit,
     onPull: () -> Unit,
+    onRunBackgroundFill: () -> Unit,
 ) {
     Scaffold(
         topBar = {
@@ -89,12 +90,20 @@ fun ClipDetailScreen(
             Row(modifier = Modifier.fillMaxWidth()) {
                 StageCard(
                     title = "2a. Background fill",
-                    subtitle = "On-phone: LaMa inpaints the person-shaped hole.",
+                    subtitle = "On-phone: LaMa-Dilated (ONNX) inpaints the person-shaped hole.",
                     state = clip.backgroundFill,
                     modifier = Modifier.weight(1f),
                 ) {
-                    if (clip.backgroundFill.status == StageStatus.NOT_CONNECTED) {
-                        NotConnectedNote("On-device LaMa fill isn't implemented yet (Phase 3).")
+                    if (clip.backgroundFill.status == StageStatus.PENDING || clip.backgroundFill.status == StageStatus.FAILED) {
+                        Button(onClick = onRunBackgroundFill) {
+                            Text(if (clip.backgroundFill.status == StageStatus.FAILED) "Retry fill" else "Fill background")
+                        }
+                    }
+                    if (clip.filledVideoPath != null) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text("Filled background video:", style = MaterialTheme.typography.labelMedium)
+                        Spacer(modifier = Modifier.height(4.dp))
+                        VideoPlayer(filePath = clip.filledVideoPath)
                     }
                 }
                 Spacer(modifier = Modifier.width(8.dp))
@@ -192,7 +201,9 @@ private fun StageCard(
             }
             state.message?.let {
                 Spacer(modifier = Modifier.height(4.dp))
-                Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                val messageColor = if (state.status == StageStatus.FAILED)
+                    MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
+                Text(it, style = MaterialTheme.typography.bodySmall, color = messageColor)
             }
             Spacer(modifier = Modifier.height(8.dp))
             content()

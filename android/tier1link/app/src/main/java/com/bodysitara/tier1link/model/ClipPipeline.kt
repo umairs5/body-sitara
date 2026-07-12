@@ -53,6 +53,14 @@ data class ClipPipelineState(
     /** Local file path to the pulled output_rtm.mp4, once PULL completes. */
     val incomingVideoPath: String? = null,
 
+    /** Local file path to the local mask.mp4, once PULL completes -- needed
+     * as backgroundFill's second input. */
+    val maskVideoPath: String? = null,
+
+    /** Local file path to the background-filled video, once backgroundFill
+     * completes. Real (LaMa-Dilated on-device inference), not a placeholder. */
+    val filledVideoPath: String? = null,
+
     /** Local file path to the final composited video, once COMPOSITE completes. Always
      * null today -- nothing produces this yet. */
     val finalVideoPath: String? = null,

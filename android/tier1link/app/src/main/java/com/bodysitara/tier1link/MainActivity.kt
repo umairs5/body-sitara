@@ -49,6 +49,7 @@ class MainActivity : ComponentActivity() {
                                 clip = clip,
                                 onBack = { navController.popBackStack() },
                                 onPull = { viewModel.pullClip(clipId) },
+                                onRunBackgroundFill = { viewModel.runBackgroundFill(clipId) },
                             )
                         }
                     }
