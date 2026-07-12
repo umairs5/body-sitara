@@ -371,17 +371,35 @@ def process_video(
         curr_gray     = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         is_full_frame = (frame_idx % current_N == 0)
 
+        # yolo_seg runs every frame, decoupled from the det/pose skip-n cadence
+        # below -- segmentation quality degrades under skip-n's affine-mask-warp
+        # (breaks down for non-rigid motion, compounds error across the skip
+        # window), while det/pose/face-canon tolerate LK-optical-flow tracking
+        # fine. Running yolo_seg fresh every frame trades most of skip-n's FPS
+        # gain (segmentation is the single biggest per-frame cost) for mask
+        # quality that no longer depends on the warp assumption at all. Also
+        # BEFORE det+pose so ONNX Runtime CPU threads are idle -- PyTorch and
+        # OnnxRuntime both use all CPU threads; running concurrently (or even
+        # back-to-back while ORT threads linger) causes severe slowdown.
+        #
+        # Its internal detect head already finds person boxes as part of
+        # get_mask_and_boxes() -- confirmed via direct timing that running
+        # rtmlib's separate YOLOX-Nano det_model() on top of that was pure
+        # duplicated detection work (two independent detectors disagreeing
+        # near their own confidence thresholds, ~18ms wasted per full frame
+        # for no accuracy benefit). So when yolo_seg is on, det_model() is
+        # skipped on full frames and yolo_seg's own boxes drive RTMPose-T's
+        # pose_model() instead.
+        yolo_boxes_full_space = None
+        if yolo_seg is not None and blur_bodies:
+            _t_yolo0 = time.time()
+            last_seg_mask, yolo_boxes_full_space = yolo_seg.get_mask_and_boxes(frame)
+            t_seg_total += time.time() - _t_yolo0
+            seg_mask_keypoints = None  # fresh mask this frame -- no warp needed/valid
+
         if is_full_frame or prev_gray is None:
             full_frame_count += 1
             infer_frame = cv2.resize(frame, (INFER_SIZE, INFER_SIZE))
-
-            # yolo_seg runs BEFORE det+pose so ONNX Runtime CPU threads are idle.
-            # PyTorch and OnnxRuntime both use all CPU threads; running concurrently
-            # (or even back-to-back while ORT threads linger) causes severe slowdown.
-            if yolo_seg is not None and blur_bodies:
-                _t_yolo0 = time.time()
-                last_seg_mask = yolo_seg.get_mask(frame)
-                t_seg_total += time.time() - _t_yolo0
 
             # selfie_seg: thread pool (TFLite releases GIL → true parallel with det+pose)
             if selfie_seg is not None and blur_bodies:
@@ -390,9 +408,20 @@ def process_video(
                 _future_seg = None
             _t_seg0 = time.time()
 
-            t0     = time.time()
-            bboxes = body.det_model(infer_frame)
-            t_det_total += time.time() - t0
+            if yolo_seg is not None and blur_bodies:
+                # Reuse yolo_seg's own boxes (full-frame space) -> infer_frame space.
+                if yolo_boxes_full_space is not None and len(yolo_boxes_full_space) > 0:
+                    bboxes = yolo_boxes_full_space.copy().astype(float)
+                    bboxes[:, 0] /= kp_scale_x; bboxes[:, 2] /= kp_scale_x
+                    bboxes[:, 1] /= kp_scale_y; bboxes[:, 3] /= kp_scale_y
+                else:
+                    # pose_model expects an ndarray (possibly empty), not None --
+                    # matches body.det_model()'s own "nothing detected" convention.
+                    bboxes = np.empty((0, 4), dtype=float)
+            else:
+                t0     = time.time()
+                bboxes = body.det_model(infer_frame)
+                t_det_total += time.time() - t0
 
             # Reject boxes too small relative to the frame's largest detection
             # to plausibly be the video's subject -- e.g. distant background
@@ -608,10 +637,6 @@ def process_video(
                             x1, y1, x2, y2 = [int(v) for v in bbox]
                             cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 255), 2)
                     export_bbox_overlay_writer.write(overlay)
-
-            # Update seg_mask_keypoints now that keypoints are known (yolo_seg ran before det)
-            if yolo_seg is not None and blur_bodies:
-                seg_mask_keypoints = keypoints.copy() if keypoints is not None and len(keypoints) > 0 else None
 
             # Collect selfie-seg result (may already be done; blocks only if det+pose faster)
             if _future_seg is not None:
