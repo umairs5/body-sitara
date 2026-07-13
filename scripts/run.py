@@ -45,6 +45,17 @@ if __name__ == "__main__":
                         help="Number of stable per-person export slots (default 3).")
     parser.add_argument("--export-diagnostics", action="store_true",
                         help="Also export raw_seg_mask.mp4, gate_region.mp4, bbox_overlay.mp4.")
+    parser.add_argument("--seg-infer-size", type=int, default=320,
+                        help="Network input size (px) for yoloseg* anonymizers. Lower = "
+                             "faster (roughly quadratic), coarser mask boundaries. Ignored "
+                             "for non-yoloseg anonymizers. Default 320 (unchanged behavior).")
+    parser.add_argument("--segskip-n", type=int, default=1,
+                        help="Run yoloseg* segmentation every N frames, independent of "
+                             "--skip-n (which governs det/pose/face-canon). Skip frames "
+                             "warp the last mask via affine-from-keypoint-motion (same "
+                             "mechanism as --skip-n's own skip frames). 1 = segmentation "
+                             "every frame (default, unchanged behavior). Ignored for "
+                             "non-yoloseg anonymizers.")
 
     args = parser.parse_args()
 
@@ -64,4 +75,6 @@ if __name__ == "__main__":
         dense_export        = args.dense_export,
         export_people        = args.export_people,
         export_diagnostics  = args.export_diagnostics,
+        seg_infer_size      = args.seg_infer_size,
+        seg_skip_n          = args.segskip_n,
     )

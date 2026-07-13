@@ -78,6 +78,8 @@ def process_video(
     dense_export        = False,
     export_people        = 3,
     export_diagnostics  = False,
+    seg_infer_size      = 320,   # yoloseg* network input size (px); lower = faster, coarser masks
+    seg_skip_n          = 1,     # yoloseg* segmentation cadence, independent of skip_n (1 = every frame)
 ):
     if benchmark:
         save_video = False
@@ -205,18 +207,18 @@ def process_video(
         print(f"     Anonymizer: mobilesam")
     elif anonymizer == "yoloseg":
         _y8_ckpt = os.path.join(os.path.dirname(__file__), "..", "..", "models", "yolov8n-seg.onnx")
-        print(f"\n[3b] Loading YOLOv8-seg-nano ONNX (instance segmentation)...")
-        yolo_seg = YOLOSegBlur(model_name=_y8_ckpt, infer_size=320, conf=0.4)
+        print(f"\n[3b] Loading YOLOv8-seg-nano ONNX (instance segmentation, infer_size={seg_infer_size})...")
+        yolo_seg = YOLOSegBlur(model_name=_y8_ckpt, infer_size=seg_infer_size, conf=0.4)
         print(f"     Anonymizer: yoloseg")
     elif anonymizer == "yoloseg11":
         _y11_ckpt = os.path.join(os.path.dirname(__file__), "..", "..", "models", "yolo11n-seg.onnx")
-        print(f"\n[3b] Loading YOLO11n-seg ONNX (instance segmentation)...")
-        yolo_seg = YOLOSegBlur(model_name=_y11_ckpt, infer_size=320, conf=0.4)
+        print(f"\n[3b] Loading YOLO11n-seg ONNX (instance segmentation, infer_size={seg_infer_size})...")
+        yolo_seg = YOLOSegBlur(model_name=_y11_ckpt, infer_size=seg_infer_size, conf=0.4)
         print(f"     Anonymizer: yoloseg11")
     elif anonymizer == "yoloseg11int8":
         _y11_int8_ckpt = os.path.join(os.path.dirname(__file__), "..", "..", "models", "yolo11n-seg-int8.onnx")
-        print(f"\n[3b] Loading YOLO11n-seg ONNX INT8 (instance segmentation)...")
-        yolo_seg = YOLOSegBlur(model_name=_y11_int8_ckpt, infer_size=320, conf=0.4)
+        print(f"\n[3b] Loading YOLO11n-seg ONNX INT8 (instance segmentation, infer_size={seg_infer_size})...")
+        yolo_seg = YOLOSegBlur(model_name=_y11_int8_ckpt, infer_size=seg_infer_size, conf=0.4)
         print(f"     Anonymizer: yoloseg11int8")
     else:
         print(f"\n[3b] Anonymizer: convexhull")
@@ -335,6 +337,7 @@ def process_video(
     gate_region_stale_for = 0      # consecutive full frames since last_gate_region was refreshed
     last_mesh_cache       = {}
     last_canonical_face   = None   # last canonical expression image (CANONICAL_SIZE×CANONICAL_SIZE)
+    last_yolo_boxes_full_space = None  # yolo_seg's own boxes, held over its skip frames
     prev_gray        = None
 
     prev_time   = time.time()
@@ -362,6 +365,25 @@ def process_video(
     streams_flushed = 0
     loop_start      = time.time()
 
+    # Cross-frame pipelining of yolo_seg (running yolo_seg(N+1) in a
+    # background thread while pose/draw/write for frame N happen) was tried
+    # and measured WORSE on the real pipeline (4.29 FPS vs 5.32 FPS serial),
+    # despite a +19% win in an isolated spike (scripts/seg_pipeline_spike.py,
+    # which only had yolo_seg + pose_model in flight together). Root cause:
+    # ONNX Runtime's default intra_op_num_threads=0 means every ORT session
+    # in the process (yolo_seg's, RTMPose-T's det/pose) independently claims
+    # the whole physical-core pool for itself -- running two ORT sessions
+    # "concurrently" via Python threads doesn't split cores between them, it
+    # oversubscribes them, causing contention. The full pipeline also runs
+    # MediaPipe's FaceLandmarker (its own thread-hungry backend) on the main
+    # thread at the same time, which the isolated spike didn't have, making
+    # the real contention worse than the spike predicted. A real fix would
+    # need to cap yolo_seg's ORT session to fewer threads, but ultralytics.
+    # YOLO()'s plain-.onnx load path takes no SessionOptions param at all
+    # (confirmed: AutoBackend calls onnxruntime.InferenceSession(w,
+    # providers=providers) with no options arg) -- doing that cleanly means
+    # bypassing ultralytics' ONNX loading entirely, out of scope for this
+    # change. Kept serial for now.
     while cap.isOpened():
         success, frame = cap.read()
         if not success:
@@ -371,13 +393,18 @@ def process_video(
         curr_gray     = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         is_full_frame = (frame_idx % current_N == 0)
 
-        # yolo_seg runs every frame, decoupled from the det/pose skip-n cadence
-        # below -- segmentation quality degrades under skip-n's affine-mask-warp
-        # (breaks down for non-rigid motion, compounds error across the skip
-        # window), while det/pose/face-canon tolerate LK-optical-flow tracking
-        # fine. Running yolo_seg fresh every frame trades most of skip-n's FPS
-        # gain (segmentation is the single biggest per-frame cost) for mask
-        # quality that no longer depends on the warp assumption at all. Also
+        # yolo_seg has its OWN cadence (seg_skip_n), independent of skip_n
+        # (which governs det/pose/face-canon) -- default seg_skip_n=1 means
+        # every frame, matching the original behavior/reasoning below. This
+        # exists as a separate knob because det/pose/face-canon tolerate
+        # LK-optical-flow tracking fine, but segmentation mask quality
+        # degrades under skip-n's affine-mask-warp (breaks down for non-rigid
+        # motion, compounds error across the skip window) -- seg_skip_n=1
+        # avoids that entirely at full per-frame cost; seg_skip_n>1 trades
+        # some of that quality back for FPS, using the SAME affine-warp
+        # mechanism skip_n already uses for pose (see the mask-apply block
+        # below), just on its own cadence.
+        #
         # BEFORE det+pose so ONNX Runtime CPU threads are idle -- PyTorch and
         # OnnxRuntime both use all CPU threads; running concurrently (or even
         # back-to-back while ORT threads linger) causes severe slowdown.
@@ -389,13 +416,42 @@ def process_video(
         # near their own confidence thresholds, ~18ms wasted per full frame
         # for no accuracy benefit). So when yolo_seg is on, det_model() is
         # skipped on full frames and yolo_seg's own boxes drive RTMPose-T's
-        # pose_model() instead.
+        # pose_model() instead -- EXCEPT on a frame where segmentation itself
+        # is being skipped (seg_skip_n>1): there yolo_seg produces no fresh
+        # boxes, so pose falls back to keypoint-derived boxes instead (same
+        # bboxes_from_keypoints() pattern MobileSAM already uses for its own
+        # skip frames) rather than forcing a seg run seg_skip_n was meant to
+        # avoid.
+        is_seg_full_frame = (frame_idx % seg_skip_n == 0)
         yolo_boxes_full_space = None
         if yolo_seg is not None and blur_bodies:
-            _t_yolo0 = time.time()
-            last_seg_mask, yolo_boxes_full_space = yolo_seg.get_mask_and_boxes(frame)
-            t_seg_total += time.time() - _t_yolo0
-            seg_mask_keypoints = None  # fresh mask this frame -- no warp needed/valid
+            if is_seg_full_frame or prev_gray is None:
+                _t_yolo0 = time.time()
+                last_seg_mask, yolo_boxes_full_space = yolo_seg.get_mask_and_boxes(frame)
+                t_seg_total += time.time() - _t_yolo0
+                last_yolo_boxes_full_space = yolo_boxes_full_space
+                seg_mask_keypoints = None  # fresh mask this frame -- no warp needed/valid
+            else:
+                # Seg-skip frame: warp the last real mask forward, same
+                # affine-from-keypoint-motion mechanism as skip_n's own skip
+                # frames (see the mask-apply block below) -- just triggered
+                # on seg_skip_n's cadence instead of skip_n's.
+                if last_seg_mask is not None and seg_mask_keypoints is not None \
+                        and last_keypoints is not None and len(last_keypoints) > 0:
+                    old_pts = seg_mask_keypoints[:, :, :2].reshape(-1, 2).astype(np.float32)
+                    new_pts = last_keypoints[:, :, :2].reshape(-1, 2).astype(np.float32)
+                    if len(old_pts) == len(new_pts) and len(old_pts) >= 3:
+                        M, _ = cv2.estimateAffinePartial2D(old_pts, new_pts, method=cv2.RANSAC)
+                        if M is not None:
+                            last_seg_mask = cv2.warpAffine(
+                                last_seg_mask.astype(np.uint8), M, (width, height),
+                                flags=cv2.INTER_NEAREST
+                            ).astype(bool)
+                seg_mask_keypoints = last_keypoints.copy() if last_keypoints is not None and len(last_keypoints) > 0 else None
+                # No fresh boxes this frame -- fall back to keypoint-derived
+                # boxes for pose (only matters if this also happens to be a
+                # det/pose full frame; see the is_full_frame block below).
+                yolo_boxes_full_space = None
 
         if is_full_frame or prev_gray is None:
             full_frame_count += 1
@@ -409,11 +465,25 @@ def process_video(
             _t_seg0 = time.time()
 
             if yolo_seg is not None and blur_bodies:
-                # Reuse yolo_seg's own boxes (full-frame space) -> infer_frame space.
                 if yolo_boxes_full_space is not None and len(yolo_boxes_full_space) > 0:
+                    # Reuse yolo_seg's own boxes (full-frame space) -> infer_frame space.
                     bboxes = yolo_boxes_full_space.copy().astype(float)
                     bboxes[:, 0] /= kp_scale_x; bboxes[:, 2] /= kp_scale_x
                     bboxes[:, 1] /= kp_scale_y; bboxes[:, 3] /= kp_scale_y
+                elif not is_seg_full_frame and last_keypoints is not None and len(last_keypoints) > 0:
+                    # This det/pose full frame landed on a seg-skip frame --
+                    # yolo_seg produced no fresh boxes here (seg_skip_n > 1).
+                    # Fall back to keypoint-derived boxes (same pattern
+                    # MobileSAM already uses for its own skip frames) instead
+                    # of forcing a seg run seg_skip_n was meant to avoid.
+                    kb = bboxes_from_keypoints(last_keypoints, last_scores, height, width, padding=40)
+                    if kb:
+                        kb_arr = np.array(kb, dtype=float)
+                        bboxes = kb_arr.copy()
+                        bboxes[:, 0] /= kp_scale_x; bboxes[:, 2] /= kp_scale_x
+                        bboxes[:, 1] /= kp_scale_y; bboxes[:, 3] /= kp_scale_y
+                    else:
+                        bboxes = np.empty((0, 4), dtype=float)
                 else:
                     # pose_model expects an ndarray (possibly empty), not None --
                     # matches body.det_model()'s own "nothing detected" convention.
