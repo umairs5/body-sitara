@@ -73,7 +73,7 @@ def process_video(
     skip_n            = 5,
     movement_adaptive = False,
     csv_out           = None,
-    anonymizer        = "convexhull",   # "convexhull" | "selfie_seg0" | "selfie_seg1" | "mobilesam" | "yoloseg" | "yoloseg11" | "yoloseg11int8"
+    anonymizer        = "convexhull",   # "convexhull" | "selfie_seg0" | "selfie_seg1" | "mobilesam" | "yoloseg" | "yoloseg11" | "yoloseg11int8" | "yoloseg11ncnn"
     export_dir         = None,   # dense per-person export mode (opt-in, additive -- see export_tracking.py)
     dense_export        = False,
     export_people        = 3,
@@ -220,6 +220,38 @@ def process_video(
         print(f"\n[3b] Loading YOLO11n-seg ONNX INT8 (instance segmentation, infer_size={seg_infer_size})...")
         yolo_seg = YOLOSegBlur(model_name=_y11_int8_ckpt, infer_size=seg_infer_size, conf=0.4)
         print(f"     Anonymizer: yoloseg11int8")
+    elif anonymizer == "yoloseg11ncnn":
+        # NCNN backend, same yolo11n-seg weights, different execution graph --
+        # measured ~1.96x faster than ONNX INT8 on real Pi 5 hardware (31.0ms
+        # vs 60.8ms/frame segmentation-only, verified via scripts/ncnn_bench.py
+        # with explicit mask-found and frame-read correctness checks). On the
+        # dev machine (x86) the two backends are roughly at parity -- this
+        # gap is ARM-specific (NCNN's hand-tuned NEON/dot-product kernels vs
+        # ONNX Runtime's more general MLAS dispatch), consistent with prior
+        # per-platform INT8 findings in this file. FP16 export tested
+        # pixel-near-identical to FP32 (IoU 0.9998) but no faster on Pi (both
+        # ~31ms) -- FP32 used here since there's no speed reason to prefer
+        # FP16, and FP32 has zero precision-loss risk.
+        #
+        # YOLOSegBlur works completely unmodified here: an NCNN model is a
+        # directory (models/ncnn_fp32/yolo11n-seg_ncnn_model), not a .onnx
+        # file, so its ONNX-specific auto-export/quantize block is a no-op
+        # and ultralytics.YOLO() auto-detects the NCNN format from the
+        # *_ncnn_model path suffix.
+        #
+        # NOTE: unlike ONNX (static input shape baked in at export -- a
+        # mismatched imgsz raises a clear shape error), passing a
+        # seg_infer_size other than the 320 this NCNN model was exported at
+        # does NOT error -- it was observed to silently still run (not yet
+        # confirmed whether NCNN actually resizes internally to serve a
+        # different size correctly, or just ignores the mismatched request
+        # and always infers at 320 regardless). Treat seg_infer_size as
+        # UNVERIFIED for this anonymizer until checked directly -- don't
+        # assume it's honored the way it is for yoloseg11int8.
+        _y11_ncnn_dir = os.path.join(os.path.dirname(__file__), "..", "..", "models", "ncnn_fp32", "yolo11n-seg_ncnn_model")
+        print(f"\n[3b] Loading YOLO11n-seg NCNN (instance segmentation, infer_size={seg_infer_size})...")
+        yolo_seg = YOLOSegBlur(model_name=_y11_ncnn_dir, infer_size=seg_infer_size, conf=0.4)
+        print(f"     Anonymizer: yoloseg11ncnn")
     else:
         print(f"\n[3b] Anonymizer: convexhull")
 
