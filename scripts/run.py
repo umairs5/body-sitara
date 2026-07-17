@@ -57,6 +57,16 @@ if __name__ == "__main__":
                              "mechanism as --skip-n's own skip frames). 1 = segmentation "
                              "every frame (default, unchanged behavior). Ignored for "
                              "non-yoloseg anonymizers.")
+    parser.add_argument("--no-draw", action="store_true",
+                        help="Suppress the skeleton/facemesh debug overlay drawn on the "
+                             "annotated/original panel (anonymization itself is unaffected).")
+    parser.add_argument("--no-facemesh-draw", action="store_true",
+                        help="Suppress only the 468-pt facemesh overlay; RTMPose body "
+                             "skeleton keypoints are still drawn. Ignored if --no-draw is set.")
+    parser.add_argument("--no-hud", action="store_true",
+                        help="Suppress only the FPS/Frame/People/Movement/Skip-N corner "
+                             "text; skeleton/facemesh overlays are unaffected. Ignored if "
+                             "--no-draw is set.")
 
     args = parser.parse_args()
 
@@ -78,4 +88,7 @@ if __name__ == "__main__":
         export_diagnostics  = args.export_diagnostics,
         seg_infer_size      = args.seg_infer_size,
         seg_skip_n          = args.segskip_n,
+        no_draw             = args.no_draw,
+        no_facemesh_draw    = args.no_facemesh_draw,
+        no_hud              = args.no_hud,
     )

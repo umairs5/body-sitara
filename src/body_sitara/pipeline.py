@@ -80,6 +80,9 @@ def process_video(
     export_diagnostics  = False,
     seg_infer_size      = 320,   # yoloseg* network input size (px); lower = faster, coarser masks
     seg_skip_n          = 1,     # yoloseg* segmentation cadence, independent of skip_n (1 = every frame)
+    no_draw             = False, # suppress skeleton/facemesh debug overlay (and HUD text) entirely
+    no_facemesh_draw    = False, # suppress only the 468-pt facemesh overlay; skeleton still drawn
+    no_hud              = False, # suppress only the FPS/Frame/People/Movement/Skip-N corner text
 ):
     if benchmark:
         save_video = False
@@ -107,7 +110,7 @@ def process_video(
     if dense_export:
         SKIP_N = {"slow": 1, "medium": 1, "fast": 1}
 
-    draw_enabled = DEBUG_DRAW and not benchmark
+    draw_enabled = DEBUG_DRAW and not benchmark and not no_draw
 
     print("=" * 60)
     print("  RTMPose Pipeline (Optical Flow + EdgeFace + Encryption)")
@@ -941,9 +944,10 @@ def process_video(
         td0 = time.time()
         if draw_enabled and keypoints is not None and len(keypoints) > 0:
             annotated = draw_skeleton(annotated, keypoints, scores, kpt_thr=0.3)
-            for i in range(len(keypoints)):
-                if i in person_states and person_states[i].face_mesh_pts:
-                    draw_face_mesh_pts(annotated, person_states[i].face_mesh_pts)
+            if not no_facemesh_draw:
+                for i in range(len(keypoints)):
+                    if i in person_states and person_states[i].face_mesh_pts:
+                        draw_face_mesh_pts(annotated, person_states[i].face_mesh_pts)
         if draw_enabled and last_scaled_bboxes:
             for bbox in last_scaled_bboxes:
                 x1, y1, x2, y2 = [int(v) for v in bbox]
@@ -959,17 +963,18 @@ def process_video(
                 fps_history.pop(0)
             fps_display = sum(fps_history) / len(fps_history)
 
-            n_detected = len(keypoints) if keypoints is not None else 0
-            frame_type = "SKIP(LK)" if not is_full_frame else "FULL"
-            for j, line in enumerate([
-                f"FPS: {fps_display:.1f}",
-                f"Frame: {frame_type}",
-                f"People: {n_detected}",
-                f"Movement: {movement_tier}",
-                f"Skip-N: {current_N}",
-            ]):
-                cv2.putText(annotated, line, (10, 35 + j * 28),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 0, 255), 2)
+            if not no_draw and not no_hud:
+                n_detected = len(keypoints) if keypoints is not None else 0
+                frame_type = "SKIP(LK)" if not is_full_frame else "FULL"
+                for j, line in enumerate([
+                    f"FPS: {fps_display:.1f}",
+                    f"Frame: {frame_type}",
+                    f"People: {n_detected}",
+                    f"Movement: {movement_tier}",
+                    f"Skip-N: {current_N}",
+                ]):
+                    cv2.putText(annotated, line, (10, 35 + j * 28),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 0, 255), 2)
 
         tw0 = time.time()
         if out is not None:
