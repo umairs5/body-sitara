@@ -67,6 +67,13 @@ if __name__ == "__main__":
                         help="Suppress only the FPS/Frame/People/Movement/Skip-N corner "
                              "text; skeleton/facemesh overlays are unaffected. Ignored if "
                              "--no-draw is set.")
+    parser.add_argument("--ttp-server", type=str, default=None,
+                        help="Tier 3 TTP base URL, e.g. https://localhost:8843 -- required "
+                             "unless --benchmark is set. Tier 1 fetches the TTP's public key "
+                             "from this server rather than generating its own keypair.")
+    parser.add_argument("--ttp-http", action="store_true",
+                        help="Don't verify the Tier 3 server's TLS cert (matches its own "
+                             "--http/self-signed-TOFU story for local testing).")
 
     args = parser.parse_args()
 
@@ -91,4 +98,6 @@ if __name__ == "__main__":
         no_draw             = args.no_draw,
         no_facemesh_draw    = args.no_facemesh_draw,
         no_hud              = args.no_hud,
+        ttp_server          = args.ttp_server,
+        ttp_verify_tls      = not args.ttp_http,
     )

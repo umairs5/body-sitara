@@ -57,19 +57,44 @@ def derive_face_crop(frame, kpts, scores, kpt_thr=0.3):
     return crop, x1, y1, (x2 - x1, y2 - y1), inter_eye_px
 
 
-def derive_body_crop(frame, kpts, scores, kpt_thr=0.3):
+def derive_body_crop(frame, kpts, scores, kpt_thr=0.3, detector_bbox=None):
+    """detector_bbox, if given, is (x1, y1, x2, y2) in frame coordinates --
+    the person-detector's own box for this same person this frame (YOLOX-Nano
+    det_model(), or yolo_seg's own detect head when a yoloseg* anonymizer is
+    active -- see pipeline.py's last_scaled_bboxes, which is populated from
+    whichever detector actually ran that frame). COCO-17 keypoints have no
+    point above eye/nose level, so a keypoint-only box's top edge sits at
+    eyebrow height -- confirmed on real restored-video output as a grey
+    silhouette left over the head/hair, since that region was never captured
+    at all. The detector's box DOES extend to the top of the head (a person
+    detector has to box the whole visible person to detect one), so it's
+    used outright in place of the keypoint-derived box when available --
+    not unioned. This only affects the encrypted archive's crop quality
+    (never the actual blur/anonymization region, which is driven separately
+    by the segmentation mask/convex hull), so an occasional smaller crop
+    from a partial/low-confidence detector box on some frame is an
+    acceptable, low-stakes tradeoff for simpler logic."""
     h, w = frame.shape[:2]
-    visible_pts = []
-    for idx in BODY_KPT_INDICES:
-        if scores[idx] > kpt_thr:
-            visible_pts.append([kpts[idx][0], kpts[idx][1]])
-    if len(visible_pts) < 2:
-        return None, 0, 0, 0, 0
-    pts = np.array(visible_pts)
-    x1 = max(int(pts[:, 0].min()) - BODY_CROP_PADDING, 0)
-    y1 = max(int(pts[:, 1].min()) - BODY_CROP_PADDING, 0)
-    x2 = min(int(pts[:, 0].max()) + BODY_CROP_PADDING, w)
-    y2 = min(int(pts[:, 1].max()) + BODY_CROP_PADDING, h)
+
+    if detector_bbox is not None:
+        x1, y1, x2, y2 = (int(v) for v in detector_bbox)
+    else:
+        visible_pts = []
+        for idx in BODY_KPT_INDICES:
+            if scores[idx] > kpt_thr:
+                visible_pts.append([kpts[idx][0], kpts[idx][1]])
+        if len(visible_pts) < 2:
+            return None, 0, 0, 0, 0
+        pts = np.array(visible_pts)
+        x1 = int(pts[:, 0].min()) - BODY_CROP_PADDING
+        y1 = int(pts[:, 1].min()) - BODY_CROP_PADDING
+        x2 = int(pts[:, 0].max()) + BODY_CROP_PADDING
+        y2 = int(pts[:, 1].max()) + BODY_CROP_PADDING
+
+    x1 = max(x1, 0)
+    y1 = max(y1, 0)
+    x2 = min(x2, w)
+    y2 = min(y2, h)
     crop = frame[y1:y2, x1:x2]
     if crop.size == 0:
         return None, 0, 0, 0, 0
