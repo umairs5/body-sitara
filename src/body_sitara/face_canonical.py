@@ -51,6 +51,28 @@ def _px(landmarks, size=CANONICAL_SIZE):
                      for lm in landmarks], dtype=np.int32)
 
 
+def yaw_from_transform(matrix: np.ndarray) -> float:
+    """Head yaw in degrees from a FaceLandmarker facial_transformation_matrix
+    (needs output_facial_transformation_matrixes=True on the options).
+    0 = facing camera, +-90 = full profile. FaceLandmarker's mesh output has
+    no usable per-detection confidence score (NormalizedLandmark.presence is
+    unset for this model, confirmed by direct inspection) -- yaw from the
+    real head-pose rotation is used instead, as a face-quality proxy for
+    PersonState.update_best()'s "best crop" ranking: a confidently-tracked
+    body pose with the face turned away is a bad embedding source, and raw
+    keypoint confidence alone can't tell the two apart (see tracking.py)."""
+    r = matrix[:3, :3]
+    return float(np.degrees(np.arctan2(-r[2, 0], np.sqrt(r[2, 1] ** 2 + r[2, 2] ** 2))))
+
+
+def face_quality_from_yaw(yaw_deg: float) -> float:
+    """1.0 at frontal, ->0 approaching a 90-degree profile. Simple cosine
+    falloff -- not claimed to be a precise perceptual model, just enough to
+    stop a confidently-tracked profile/turned-away frame from winning the
+    "best embedding source" ranking purely on body-pose confidence."""
+    return max(0.0, float(np.cos(np.radians(yaw_deg))))
+
+
 def _eye_center_and_height(px_all, indices):
     pts = px_all[indices]
     cx  = int(pts[:, 0].mean())
@@ -120,19 +142,27 @@ class FaceCanonicalizer:
             running_mode=vision.RunningMode.IMAGE,
             min_face_detection_confidence=min_detection_conf,
             min_face_presence_confidence=min_presence_conf,
+            output_facial_transformation_matrixes=True,
         )
         self._landmarker = vision.FaceLandmarker.create_from_options(options)
         self._infer_size = infer_size
 
     def get_canonical_face(self, face_crop: np.ndarray) -> np.ndarray | None:
+        canonical, _yaw = self.get_canonical_face_and_yaw(face_crop)
+        return canonical
+
+    def get_canonical_face_and_yaw(self, face_crop: np.ndarray) -> tuple[np.ndarray | None, float | None]:
         small  = cv2.resize(face_crop, (self._infer_size, self._infer_size))
         rgb    = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
         result = self._landmarker.detect(
             mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         )
         if not result.face_landmarks:
-            return None
-        return _render_canonical(_px(result.face_landmarks[0]))
+            return None, None
+        canonical = _render_canonical(_px(result.face_landmarks[0]))
+        yaw = (yaw_from_transform(result.facial_transformation_matrixes[0])
+               if result.facial_transformation_matrixes else None)
+        return canonical, yaw
 
     def close(self):
         self._landmarker.close()

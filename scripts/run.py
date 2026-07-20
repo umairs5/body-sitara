@@ -30,11 +30,12 @@ if __name__ == "__main__":
     parser.add_argument("--no-blur", action="store_true",
                         help="Disable anonymization.")
     parser.add_argument("--anonymizer", type=str, default="convexhull",
-                        choices=["convexhull", "selfie_seg0", "selfie_seg1", "mobilesam", "yoloseg", "yoloseg11", "yoloseg11int8"],
+                        choices=["convexhull", "selfie_seg0", "selfie_seg1", "mobilesam", "yoloseg", "yoloseg11", "yoloseg11int8", "yoloseg11ncnn"],
                         help="Anonymization backend: convexhull (default), "
                              "selfie_seg0 (MediaPipe general), selfie_seg1 (MediaPipe landscape), "
                              "mobilesam (MobileSAM ViT-Tiny), yoloseg (YOLOv8n-seg ONNX), "
-                             "yoloseg11 (YOLO11n-seg ONNX FP32), yoloseg11int8 (YOLO11n-seg ONNX INT8, dynamic quant).")
+                             "yoloseg11 (YOLO11n-seg ONNX FP32), yoloseg11int8 (YOLO11n-seg ONNX INT8, dynamic quant), "
+                             "yoloseg11ncnn (YOLO11n-seg NCNN FP32 -- ~1.96x faster than yoloseg11int8 on Pi 5).")
     parser.add_argument("--export-dir", type=str, default=None,
                         help="Dense per-person export mode: write per-frame keypoints/bboxes/"
                              "face-crops/masks into this directory (opt-in, additive).")
@@ -45,6 +46,34 @@ if __name__ == "__main__":
                         help="Number of stable per-person export slots (default 3).")
     parser.add_argument("--export-diagnostics", action="store_true",
                         help="Also export raw_seg_mask.mp4, gate_region.mp4, bbox_overlay.mp4.")
+    parser.add_argument("--seg-infer-size", type=int, default=320,
+                        help="Network input size (px) for yoloseg* anonymizers. Lower = "
+                             "faster (roughly quadratic), coarser mask boundaries. Ignored "
+                             "for non-yoloseg anonymizers. Default 320 (unchanged behavior).")
+    parser.add_argument("--segskip-n", type=int, default=1,
+                        help="Run yoloseg* segmentation every N frames, independent of "
+                             "--skip-n (which governs det/pose/face-canon). Skip frames "
+                             "warp the last mask via affine-from-keypoint-motion (same "
+                             "mechanism as --skip-n's own skip frames). 1 = segmentation "
+                             "every frame (default, unchanged behavior). Ignored for "
+                             "non-yoloseg anonymizers.")
+    parser.add_argument("--no-draw", action="store_true",
+                        help="Suppress the skeleton/facemesh debug overlay drawn on the "
+                             "annotated/original panel (anonymization itself is unaffected).")
+    parser.add_argument("--no-facemesh-draw", action="store_true",
+                        help="Suppress only the 468-pt facemesh overlay; RTMPose body "
+                             "skeleton keypoints are still drawn. Ignored if --no-draw is set.")
+    parser.add_argument("--no-hud", action="store_true",
+                        help="Suppress only the FPS/Frame/People/Movement/Skip-N corner "
+                             "text; skeleton/facemesh overlays are unaffected. Ignored if "
+                             "--no-draw is set.")
+    parser.add_argument("--ttp-server", type=str, default=None,
+                        help="Tier 3 TTP base URL, e.g. https://localhost:8843 -- required "
+                             "unless --benchmark is set. Tier 1 fetches the TTP's public key "
+                             "from this server rather than generating its own keypair.")
+    parser.add_argument("--ttp-http", action="store_true",
+                        help="Don't verify the Tier 3 server's TLS cert (matches its own "
+                             "--http/self-signed-TOFU story for local testing).")
 
     args = parser.parse_args()
 
@@ -64,4 +93,11 @@ if __name__ == "__main__":
         dense_export        = args.dense_export,
         export_people        = args.export_people,
         export_diagnostics  = args.export_diagnostics,
+        seg_infer_size      = args.seg_infer_size,
+        seg_skip_n          = args.segskip_n,
+        no_draw             = args.no_draw,
+        no_facemesh_draw    = args.no_facemesh_draw,
+        no_hud              = args.no_hud,
+        ttp_server          = args.ttp_server,
+        ttp_verify_tls      = not args.ttp_http,
     )

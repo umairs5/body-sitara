@@ -1,4 +1,4 @@
-# bodySITARA — Project Handoff (as of 2026-07-12)
+# bodySITARA — Project Handoff (as of 2026-07-12, updated 2026-07-17 — see §11 for what changed)
 
 This document exists so you (and your Claude Code instance) can get up to speed on this
 project without re-deriving everything from scratch. It explains what the project is,
@@ -220,10 +220,13 @@ the paper's threat-model claims, just a demo-polish nicety.
 
 ## 6. What's NOT built yet
 
-- **Tier 2A/2B-1/2C real implementation** — the Android app that exists (`android/tier1link/`)
-  only proves the *transport* protocol works. It does not yet render pose/face signal videos,
-  do mask blockification, compute the lighting plate, run LaMa background inpainting, upload
-  to RunPod, or composite the final result. This is real, substantial work still ahead.
+**UPDATE 2026-07-17: Tier 2B-1 (background fill) is now real, see §11 — this section is
+partially stale, kept for historical context.**
+
+- **Tier 2A/2C real implementation** — the Android app (`android/tier1link/`) proves the
+  *transport* protocol works and (as of §11) does real on-device background fill. It still does
+  not render pose/face signal videos, do mask blockification, compute the lighting plate,
+  upload to RunPod, or composite the final result. Real work still ahead, just less than before.
 - **Tier 3 (TTP server)** — doesn't exist at all yet. Not urgent; fully decoupled from Tier 2
   work per the roadmap.
 - **Pi-as-WiFi-AP setup** (hostapd config) — not done; currently everything's tested over
@@ -309,6 +312,12 @@ input source. Concretely:
    backend auto-builds itself on first use (auto-exports ONNX from the auto-downloaded `.pt`
    checkpoint, then auto-quantizes to INT8) — see `src/body_sitara/blur_yoloseg.py` if you want
    the details, you don't need to pre-stage any model files yourself.
+   **Note (added 2026-07-17, see §11):** a newer `yoloseg11ncnn` backend also exists, measured
+   ~1.96x faster than `yoloseg11int8` — but ONLY on real ARM (Pi) hardware, and it needs a
+   committed model directory (`models/ncnn_fp32/`) that's gitignored, so it won't exist on a
+   fresh clone. Stick with `yoloseg11int8` for this RunPod replication step — it's x86, so
+   NCNN's ARM-specific speed win doesn't apply here anyway, and `yoloseg11int8` needs zero model
+   staging.
 2. Feed the real files this produces (`keypoints_p{i}.npy`, `face_params_p{i}.npy`, `mask.mp4`,
    `output_rtm.mp4`) into your ComfyUI setup as the actual source data, in place of whatever
    ComfyUI's own simulation nodes would have derived from a raw test video.
@@ -431,6 +440,55 @@ python -m src.tier1_link.server --root tier2_export_root --port 8443
 # See the segmentation-backend comparison tooling/data from this session
 python scripts/compare_segmentation.py <clip.mp4> --skip-n 5 --out scratch/compare.mp4
 ```
+
+---
+
+## 11. What's changed since this doc was written (2026-07-12 → 2026-07-17)
+
+`git pull` before you start — five real commits landed since the snapshot above. In order:
+
+1. **Android UI rewrite to Jetpack Compose + Material 3** (`579c610`) — the bare test-harness
+   UI (log box, flat clip list) is gone. Now: a Home screen showing each clip's pipeline stage,
+   a Detail screen with a stage stepper (Pull → [BackgroundFill ‖ CloudGenerate, run
+   concurrently per §7's corrected scheduling] → Composite → Done), plus in-app video playback
+   (media3/ExoPlayer). New `ClipPipelineState` model explicitly tracks each stage as
+   `NOT_CONNECTED` when there's no real backend yet — the UI is honest about what's real vs.
+   designed-but-unbuilt, doesn't fake data for unimplemented stages.
+2. **Background fill (Tier 2B-1) validated + wired for real** (`e2b97c9`, `cd98a0f`, `bcb1cd4`)
+   — this is the biggest change. §6 above ("Tier 2A/2B-1/2C real implementation... does not yet
+   ... run LaMa background inpainting") is now **partially wrong**: real on-device LaMa
+   background fill is wired into the Android app. Detail: big-lama (the higher-quality
+   FFC/FFT-based model) was validated extensively but **confirmed NOT exportable** to either
+   ONNX (`aten::fft_rfftn` has no ONNX opset support at any available version) or ExecuTorch —
+   real, tested dead ends, not assumptions (see `scripts/lama_onnx_export.py`,
+   `lama_executorch_export.py`). The variant that actually ships on-device today is
+   **LaMa-Dilated** (`qualcomm/LaMa-Dilated`, dilated convolutions instead of FFT, real ONNX
+   export Qualcomm AI Hub publishes) — at a real, measured quality cost on hard scenes
+   (`scripts/lama_dilated_test.py` shows visible artifacts on dense-foliage frames big-lama
+   handles well). This is an explicit, informed tradeoff, not an oversight — know about it before
+   you build on top of the composited output's visual quality.
+3. **Dedup yoloseg detector + `--segskip-n`** (`a74b4f0`, `7751eae`) — `YOLOSegBlur`'s internal
+   detect head already finds person boxes as part of `get_mask()`; running rtmlib's separate
+   YOLOX-Nano `det_model()` on top of it was pure duplicated detection work (measured ~18ms
+   wasted per full frame, plus ONNX Runtime CPU thread contention between the two). Now deduped.
+   Also new: `--segskip-n`, an *independent* skip cadence for segmentation specifically —
+   segmentation mask quality degrades under skip-n's affine-mask-warp for non-rigid motion
+   faster than det/pose/face-canon (which tolerate LK-optical-flow tracking fine), so they no
+   longer have to share one skip cadence. Doesn't change anything about your replication step
+   (§8 still says `--skip-n 1`, i.e. no skipping at all, which makes `--segskip-n` moot for you)
+   — mentioned for completeness.
+4. **New `yoloseg11ncnn` anonymizer** (`a5af69f`) — YOLO11n-seg via an NCNN backend instead of
+   ONNX Runtime. Measured ~1.96x faster than `yoloseg11int8` **on real Pi 5 hardware specifically**
+   (31.0ms vs 60.8ms/frame segmentation-only) — confirmed ARM-specific (NCNN's hand-tuned
+   NEON/dot-product kernels vs ONNX Runtime's more general MLAS dispatch), roughly at parity on
+   x86. **Doesn't change your recommended anonymizer for the RunPod replication step** — see the
+   updated note in §8 above (stick with `yoloseg11int8`, it needs zero model staging and NCNN's
+   speed edge doesn't apply on an x86 pod anyway).
+
+None of this changes your actual task or its priority order (§8's suggested build order still
+stands) — the one thing worth internalizing is that **Tier 2B-1 is further along than this doc
+originally told you**, so when you get to Phase 2 step 4 (phone-side signal-rendering + gateway
+wiring), background-fill integration is partially done already, not fully greenfield.
 
 ---
 
