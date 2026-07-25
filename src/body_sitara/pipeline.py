@@ -11,7 +11,6 @@ from concurrent.futures import ThreadPoolExecutor
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 from rtmlib import Body, draw_skeleton
-from cryptography.hazmat.primitives import serialization
 
 from .pose import (
     euclidean, get_face_size_tier, get_movement_tier,
@@ -23,10 +22,11 @@ from .blur import blur_all_persons
 from .blur_seg import SelfieSegBlur, bbox_region_mask
 from .blur_mobilesam import MobileSAMBlur, bboxes_from_keypoints
 from .blur_yoloseg import YOLOSegBlur
-from .face_canonical import FaceCanonicalizer, CANONICAL_SIZE
+from .face_canonical import FaceCanonicalizer, CANONICAL_SIZE, yaw_from_transform, face_quality_from_yaw
 from .face_canonical_v2 import FaceCanonicalizerV2, P_SMILE
 from .tracking import PersonState, propagate_bboxes
-from .encryption import generate_ttp_keypair
+from .export_tracking import PersonIdentityTracker
+from .encryption import fetch_ttp_public_key
 from .embedding import EmbeddingExtractor, EDGEFACE_ONNX_PATH
 from .detector_patch import apply_detector_patch
 
@@ -73,11 +73,18 @@ def process_video(
     skip_n            = 5,
     movement_adaptive = False,
     csv_out           = None,
-    anonymizer        = "convexhull",   # "convexhull" | "selfie_seg0" | "selfie_seg1" | "mobilesam" | "yoloseg" | "yoloseg11" | "yoloseg11int8"
+    ttp_server        = None,   # Tier 3 TTP base URL, e.g. "https://localhost:8843" -- required unless benchmark=True
+    ttp_verify_tls    = True,   # False for --ttp-http / TOFU-unverified local testing
+    anonymizer        = "convexhull",   # "convexhull" | "selfie_seg0" | "selfie_seg1" | "mobilesam" | "yoloseg" | "yoloseg11" | "yoloseg11int8" | "yoloseg11ncnn"
     export_dir         = None,   # dense per-person export mode (opt-in, additive -- see export_tracking.py)
     dense_export        = False,
     export_people        = 3,
     export_diagnostics  = False,
+    seg_infer_size      = 320,   # yoloseg* network input size (px); lower = faster, coarser masks
+    seg_skip_n          = 1,     # yoloseg* segmentation cadence, independent of skip_n (1 = every frame)
+    no_draw             = False, # suppress skeleton/facemesh debug overlay (and HUD text) entirely
+    no_facemesh_draw    = False, # suppress only the 468-pt facemesh overlay; skeleton still drawn
+    no_hud              = False, # suppress only the FPS/Frame/People/Movement/Skip-N corner text
 ):
     if benchmark:
         save_video = False
@@ -105,7 +112,7 @@ def process_video(
     if dense_export:
         SKIP_N = {"slow": 1, "medium": 1, "fast": 1}
 
-    draw_enabled = DEBUG_DRAW and not benchmark
+    draw_enabled = DEBUG_DRAW and not benchmark and not no_draw
 
     print("=" * 60)
     print("  RTMPose Pipeline (Optical Flow + EdgeFace + Encryption)")
@@ -121,21 +128,25 @@ def process_video(
 
     os.makedirs(enc_output_dir, exist_ok=True)
 
-    # [0] TTP RSA-2048 keypair
+    # [0] TTP RSA-4096 public key (Tier 3). Tier 1 never generates or holds a
+    # keypair itself -- see encryption.py's fetch_ttp_public_key() docstring.
+    # A real, reachable Tier 3 server is required for any non-benchmark run:
+    # this is a hard error, not a silent local-keypair fallback, because
+    # that fallback is exactly the bug this fixes (Tier 1 previously held
+    # both the encrypted data AND the key to decrypt it).
     if not benchmark:
-        print("\n[0/4] Generating TTP RSA-2048 keypair (simulated)...")
-        ttp_private_key, ttp_public_key = generate_ttp_keypair()
-        priv_path = os.path.join(enc_output_dir, "ttp_private.pem")
-        with open(priv_path, 'wb') as f:
-            f.write(ttp_private_key.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.TraditionalOpenSSL,
-                encryption_algorithm=serialization.NoEncryption(),
-            ))
-        print(f"    TTP private key saved to: {priv_path}")
+        if not ttp_server:
+            raise ValueError(
+                "ttp_server is required (e.g. 'https://localhost:8843') unless "
+                "benchmark=True -- Tier 1 must fetch the real Tier 3 TTP's public "
+                "key, it cannot generate its own keypair."
+            )
+        print(f"\n[0/4] Fetching TTP public key from {ttp_server} ...")
+        ttp_public_key = fetch_ttp_public_key(ttp_server, verify_tls=ttp_verify_tls)
+        print(f"    TTP public key fetched ({ttp_public_key.key_size}-bit RSA)")
     else:
-        print("\n[0/4] Benchmark mode -- skipping RSA keypair generation")
-        ttp_private_key, ttp_public_key = None, None
+        print("\n[0/4] Benchmark mode -- skipping TTP public key fetch")
+        ttp_public_key = None
 
     # [1] RTMPose
     print("\n[1/4] Loading RTMPose (YOLOX-Nano + RTMPose-T)...")
@@ -166,6 +177,7 @@ def process_video(
             running_mode=vision.RunningMode.IMAGE,
             min_face_detection_confidence=FACE_MESH_MIN_CONF,
             min_face_presence_confidence=FACE_MESH_MIN_CONF,
+            output_facial_transformation_matrixes=True,
         )
     )
 
@@ -205,19 +217,51 @@ def process_video(
         print(f"     Anonymizer: mobilesam")
     elif anonymizer == "yoloseg":
         _y8_ckpt = os.path.join(os.path.dirname(__file__), "..", "..", "models", "yolov8n-seg.onnx")
-        print(f"\n[3b] Loading YOLOv8-seg-nano ONNX (instance segmentation)...")
-        yolo_seg = YOLOSegBlur(model_name=_y8_ckpt, infer_size=320, conf=0.4)
+        print(f"\n[3b] Loading YOLOv8-seg-nano ONNX (instance segmentation, infer_size={seg_infer_size})...")
+        yolo_seg = YOLOSegBlur(model_name=_y8_ckpt, infer_size=seg_infer_size, conf=0.4)
         print(f"     Anonymizer: yoloseg")
     elif anonymizer == "yoloseg11":
         _y11_ckpt = os.path.join(os.path.dirname(__file__), "..", "..", "models", "yolo11n-seg.onnx")
-        print(f"\n[3b] Loading YOLO11n-seg ONNX (instance segmentation)...")
-        yolo_seg = YOLOSegBlur(model_name=_y11_ckpt, infer_size=320, conf=0.4)
+        print(f"\n[3b] Loading YOLO11n-seg ONNX (instance segmentation, infer_size={seg_infer_size})...")
+        yolo_seg = YOLOSegBlur(model_name=_y11_ckpt, infer_size=seg_infer_size, conf=0.4)
         print(f"     Anonymizer: yoloseg11")
     elif anonymizer == "yoloseg11int8":
         _y11_int8_ckpt = os.path.join(os.path.dirname(__file__), "..", "..", "models", "yolo11n-seg-int8.onnx")
-        print(f"\n[3b] Loading YOLO11n-seg ONNX INT8 (instance segmentation)...")
-        yolo_seg = YOLOSegBlur(model_name=_y11_int8_ckpt, infer_size=320, conf=0.4)
+        print(f"\n[3b] Loading YOLO11n-seg ONNX INT8 (instance segmentation, infer_size={seg_infer_size})...")
+        yolo_seg = YOLOSegBlur(model_name=_y11_int8_ckpt, infer_size=seg_infer_size, conf=0.4)
         print(f"     Anonymizer: yoloseg11int8")
+    elif anonymizer == "yoloseg11ncnn":
+        # NCNN backend, same yolo11n-seg weights, different execution graph --
+        # measured ~1.96x faster than ONNX INT8 on real Pi 5 hardware (31.0ms
+        # vs 60.8ms/frame segmentation-only, verified via scripts/ncnn_bench.py
+        # with explicit mask-found and frame-read correctness checks). On the
+        # dev machine (x86) the two backends are roughly at parity -- this
+        # gap is ARM-specific (NCNN's hand-tuned NEON/dot-product kernels vs
+        # ONNX Runtime's more general MLAS dispatch), consistent with prior
+        # per-platform INT8 findings in this file. FP16 export tested
+        # pixel-near-identical to FP32 (IoU 0.9998) but no faster on Pi (both
+        # ~31ms) -- FP32 used here since there's no speed reason to prefer
+        # FP16, and FP32 has zero precision-loss risk.
+        #
+        # YOLOSegBlur works completely unmodified here: an NCNN model is a
+        # directory (models/ncnn_fp32/yolo11n-seg_ncnn_model), not a .onnx
+        # file, so its ONNX-specific auto-export/quantize block is a no-op
+        # and ultralytics.YOLO() auto-detects the NCNN format from the
+        # *_ncnn_model path suffix.
+        #
+        # NOTE: unlike ONNX (static input shape baked in at export -- a
+        # mismatched imgsz raises a clear shape error), passing a
+        # seg_infer_size other than the 320 this NCNN model was exported at
+        # does NOT error -- it was observed to silently still run (not yet
+        # confirmed whether NCNN actually resizes internally to serve a
+        # different size correctly, or just ignores the mismatched request
+        # and always infers at 320 regardless). Treat seg_infer_size as
+        # UNVERIFIED for this anonymizer until checked directly -- don't
+        # assume it's honored the way it is for yoloseg11int8.
+        _y11_ncnn_dir = os.path.join(os.path.dirname(__file__), "..", "..", "models", "ncnn_fp32", "yolo11n-seg_ncnn_model")
+        print(f"\n[3b] Loading YOLO11n-seg NCNN (instance segmentation, infer_size={seg_infer_size})...")
+        yolo_seg = YOLOSegBlur(model_name=_y11_ncnn_dir, infer_size=seg_infer_size, conf=0.4)
+        print(f"     Anonymizer: yoloseg11ncnn")
     else:
         print(f"\n[3b] Anonymizer: convexhull")
 
@@ -276,6 +320,7 @@ def process_video(
     export_gate_writer        = None
     export_bbox_overlay_writer = None
     export_clip_id            = None
+    export_crypto_dir         = None
 
     if export_enabled:
         from .export_tracking import ExportSlotTracker
@@ -286,9 +331,23 @@ def process_video(
         export_valid_smiles     = [[] for _ in range(export_people)]
         export_last_face_crop   = [None] * export_people
         export_last_face_params = [None] * export_people
-        export_slot_stream_id   = [str(uuid.uuid4()) for _ in range(export_people)]
+        # Filled in per-frame from the real PersonState.stream_id occupying
+        # each slot (see the slot_matches loop below) -- NOT a fresh uuid4
+        # minted here. Export slots and PersonState streams are otherwise
+        # two unrelated id spaces (slots are stable left-to-right identities
+        # for the whole clip; PersonState streams churn on identity loss),
+        # so this is the one place they get tied together, letting the
+        # phone locate the right .packet/.key crypto files for a given slot.
+        export_slot_stream_id   = [None] * export_people
         export_face_canon       = FaceCanonicalizerV2(model_path='face_landmarker.task')
         export_clip_id          = str(uuid.uuid4())
+        # PersonState's crypto output (.packet/.key, see tracking.py) is
+        # redirected here instead of enc_output_dir, so it lands inside the
+        # same directory tree tier1_link/server.py already serves to the
+        # phone -- that server just walks every file under a clip dir, no
+        # server-side change needed for it to pick these up.
+        export_crypto_dir       = os.path.join(export_dir, "crypto")
+        os.makedirs(export_crypto_dir, exist_ok=True)
 
         _exp_fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         export_rtm_writer  = cv2.VideoWriter(os.path.join(export_dir, "output_rtm.mp4"),
@@ -321,12 +380,27 @@ def process_video(
     frame_idx        = 0
     full_frame_count = 0
     skip_frame_count = 0
-    person_states    = {}
-    active_indices   = set()
+    person_states    = {}   # identity_id (PersonIdentityTracker's, stable across frames) -> PersonState
+    # Nearest-centroid identity tracking for person_states -- fixes a real
+    # bug where raw per-frame detection index was treated as a stable
+    # identity (it isn't: rtmlib's det/pose order can reshuffle frame to
+    # frame). Confirmed causing two different encrypted streams in a
+    # 3-person clip to both end up with their best-confidence face crop
+    # pulled from the SAME middle physical person -- whichever raw index
+    # they happened to occupy on their own best-confidence frame. See
+    # export_tracking.py's PersonIdentityTracker docstring.
+    identity_tracker = PersonIdentityTracker(width, height)
     current_N        = SKIP_N["medium"]
     movement_tier    = "medium"
     last_keypoints        = None
     last_scores           = None
+    last_det_idx_to_identity = {}  # det_idx (as of last full frame) -> identity_id,
+                                    # held over skip frames the same way last_keypoints
+                                    # is -- convexhull mode's skip-frame face-mesh LK
+                                    # path (below) looks up person_states by the raw
+                                    # index it tracked last full frame, which is only
+                                    # meaningful via this mapping now that person_states
+                                    # is keyed by stable identity_id, not raw index.
     last_bboxes           = None
     last_scaled_bboxes    = None   # YOLOX bboxes scaled to frame resolution for MobileSAM
     last_seg_mask         = None   # last selfie-seg mask (bool H×W), propagated on skip frames
@@ -335,6 +409,7 @@ def process_video(
     gate_region_stale_for = 0      # consecutive full frames since last_gate_region was refreshed
     last_mesh_cache       = {}
     last_canonical_face   = None   # last canonical expression image (CANONICAL_SIZE×CANONICAL_SIZE)
+    last_yolo_boxes_full_space = None  # yolo_seg's own boxes, held over its skip frames
     prev_gray        = None
 
     prev_time   = time.time()
@@ -362,6 +437,25 @@ def process_video(
     streams_flushed = 0
     loop_start      = time.time()
 
+    # Cross-frame pipelining of yolo_seg (running yolo_seg(N+1) in a
+    # background thread while pose/draw/write for frame N happen) was tried
+    # and measured WORSE on the real pipeline (4.29 FPS vs 5.32 FPS serial),
+    # despite a +19% win in an isolated spike (scripts/seg_pipeline_spike.py,
+    # which only had yolo_seg + pose_model in flight together). Root cause:
+    # ONNX Runtime's default intra_op_num_threads=0 means every ORT session
+    # in the process (yolo_seg's, RTMPose-T's det/pose) independently claims
+    # the whole physical-core pool for itself -- running two ORT sessions
+    # "concurrently" via Python threads doesn't split cores between them, it
+    # oversubscribes them, causing contention. The full pipeline also runs
+    # MediaPipe's FaceLandmarker (its own thread-hungry backend) on the main
+    # thread at the same time, which the isolated spike didn't have, making
+    # the real contention worse than the spike predicted. A real fix would
+    # need to cap yolo_seg's ORT session to fewer threads, but ultralytics.
+    # YOLO()'s plain-.onnx load path takes no SessionOptions param at all
+    # (confirmed: AutoBackend calls onnxruntime.InferenceSession(w,
+    # providers=providers) with no options arg) -- doing that cleanly means
+    # bypassing ultralytics' ONNX loading entirely, out of scope for this
+    # change. Kept serial for now.
     while cap.isOpened():
         success, frame = cap.read()
         if not success:
@@ -371,13 +465,18 @@ def process_video(
         curr_gray     = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         is_full_frame = (frame_idx % current_N == 0)
 
-        # yolo_seg runs every frame, decoupled from the det/pose skip-n cadence
-        # below -- segmentation quality degrades under skip-n's affine-mask-warp
-        # (breaks down for non-rigid motion, compounds error across the skip
-        # window), while det/pose/face-canon tolerate LK-optical-flow tracking
-        # fine. Running yolo_seg fresh every frame trades most of skip-n's FPS
-        # gain (segmentation is the single biggest per-frame cost) for mask
-        # quality that no longer depends on the warp assumption at all. Also
+        # yolo_seg has its OWN cadence (seg_skip_n), independent of skip_n
+        # (which governs det/pose/face-canon) -- default seg_skip_n=1 means
+        # every frame, matching the original behavior/reasoning below. This
+        # exists as a separate knob because det/pose/face-canon tolerate
+        # LK-optical-flow tracking fine, but segmentation mask quality
+        # degrades under skip-n's affine-mask-warp (breaks down for non-rigid
+        # motion, compounds error across the skip window) -- seg_skip_n=1
+        # avoids that entirely at full per-frame cost; seg_skip_n>1 trades
+        # some of that quality back for FPS, using the SAME affine-warp
+        # mechanism skip_n already uses for pose (see the mask-apply block
+        # below), just on its own cadence.
+        #
         # BEFORE det+pose so ONNX Runtime CPU threads are idle -- PyTorch and
         # OnnxRuntime both use all CPU threads; running concurrently (or even
         # back-to-back while ORT threads linger) causes severe slowdown.
@@ -389,13 +488,42 @@ def process_video(
         # near their own confidence thresholds, ~18ms wasted per full frame
         # for no accuracy benefit). So when yolo_seg is on, det_model() is
         # skipped on full frames and yolo_seg's own boxes drive RTMPose-T's
-        # pose_model() instead.
+        # pose_model() instead -- EXCEPT on a frame where segmentation itself
+        # is being skipped (seg_skip_n>1): there yolo_seg produces no fresh
+        # boxes, so pose falls back to keypoint-derived boxes instead (same
+        # bboxes_from_keypoints() pattern MobileSAM already uses for its own
+        # skip frames) rather than forcing a seg run seg_skip_n was meant to
+        # avoid.
+        is_seg_full_frame = (frame_idx % seg_skip_n == 0)
         yolo_boxes_full_space = None
         if yolo_seg is not None and blur_bodies:
-            _t_yolo0 = time.time()
-            last_seg_mask, yolo_boxes_full_space = yolo_seg.get_mask_and_boxes(frame)
-            t_seg_total += time.time() - _t_yolo0
-            seg_mask_keypoints = None  # fresh mask this frame -- no warp needed/valid
+            if is_seg_full_frame or prev_gray is None:
+                _t_yolo0 = time.time()
+                last_seg_mask, yolo_boxes_full_space = yolo_seg.get_mask_and_boxes(frame)
+                t_seg_total += time.time() - _t_yolo0
+                last_yolo_boxes_full_space = yolo_boxes_full_space
+                seg_mask_keypoints = None  # fresh mask this frame -- no warp needed/valid
+            else:
+                # Seg-skip frame: warp the last real mask forward, same
+                # affine-from-keypoint-motion mechanism as skip_n's own skip
+                # frames (see the mask-apply block below) -- just triggered
+                # on seg_skip_n's cadence instead of skip_n's.
+                if last_seg_mask is not None and seg_mask_keypoints is not None \
+                        and last_keypoints is not None and len(last_keypoints) > 0:
+                    old_pts = seg_mask_keypoints[:, :, :2].reshape(-1, 2).astype(np.float32)
+                    new_pts = last_keypoints[:, :, :2].reshape(-1, 2).astype(np.float32)
+                    if len(old_pts) == len(new_pts) and len(old_pts) >= 3:
+                        M, _ = cv2.estimateAffinePartial2D(old_pts, new_pts, method=cv2.RANSAC)
+                        if M is not None:
+                            last_seg_mask = cv2.warpAffine(
+                                last_seg_mask.astype(np.uint8), M, (width, height),
+                                flags=cv2.INTER_NEAREST
+                            ).astype(bool)
+                seg_mask_keypoints = last_keypoints.copy() if last_keypoints is not None and len(last_keypoints) > 0 else None
+                # No fresh boxes this frame -- fall back to keypoint-derived
+                # boxes for pose (only matters if this also happens to be a
+                # det/pose full frame; see the is_full_frame block below).
+                yolo_boxes_full_space = None
 
         if is_full_frame or prev_gray is None:
             full_frame_count += 1
@@ -409,11 +537,25 @@ def process_video(
             _t_seg0 = time.time()
 
             if yolo_seg is not None and blur_bodies:
-                # Reuse yolo_seg's own boxes (full-frame space) -> infer_frame space.
                 if yolo_boxes_full_space is not None and len(yolo_boxes_full_space) > 0:
+                    # Reuse yolo_seg's own boxes (full-frame space) -> infer_frame space.
                     bboxes = yolo_boxes_full_space.copy().astype(float)
                     bboxes[:, 0] /= kp_scale_x; bboxes[:, 2] /= kp_scale_x
                     bboxes[:, 1] /= kp_scale_y; bboxes[:, 3] /= kp_scale_y
+                elif not is_seg_full_frame and last_keypoints is not None and len(last_keypoints) > 0:
+                    # This det/pose full frame landed on a seg-skip frame --
+                    # yolo_seg produced no fresh boxes here (seg_skip_n > 1).
+                    # Fall back to keypoint-derived boxes (same pattern
+                    # MobileSAM already uses for its own skip frames) instead
+                    # of forcing a seg run seg_skip_n was meant to avoid.
+                    kb = bboxes_from_keypoints(last_keypoints, last_scores, height, width, padding=40)
+                    if kb:
+                        kb_arr = np.array(kb, dtype=float)
+                        bboxes = kb_arr.copy()
+                        bboxes[:, 0] /= kp_scale_x; bboxes[:, 2] /= kp_scale_x
+                        bboxes[:, 1] /= kp_scale_y; bboxes[:, 3] /= kp_scale_y
+                    else:
+                        bboxes = np.empty((0, 4), dtype=float)
                 else:
                     # pose_model expects an ndarray (possibly empty), not None --
                     # matches body.det_model()'s own "nothing detected" convention.
@@ -458,41 +600,63 @@ def process_video(
             last_scores     = scores
             last_mesh_cache = {}
 
-            current_indices = (
-                set(range(len(keypoints)))
-                if keypoints is not None and len(keypoints) > 0
-                else set()
-            )
-            departed = active_indices - current_indices
-            for dep_idx in departed:
-                if dep_idx in person_states:
-                    enc_t, emb_t = person_states[dep_idx].flush_to_disk()
+            # Nearest-centroid identity matching -- see identity_tracker's
+            # construction comment / PersonIdentityTracker's docstring for
+            # why this replaced raw-index-based tracking. det_bboxes_this_frame
+            # is reused below by the export block instead of recomputing the
+            # same bboxes_from_keypoints() call a second time.
+            id_detections = []
+            det_bboxes_this_frame = {}
+            if keypoints is not None and len(keypoints) > 0:
+                for i in range(len(keypoints)):
+                    db = bboxes_from_keypoints(
+                        [keypoints[i]], [scores[i]], height, width, padding=40
+                    )
+                    if db:
+                        x1, y1, x2, y2 = db[0]
+                        id_detections.append((i, ((x1 + x2) / 2.0, (y1 + y2) / 2.0)))
+                        det_bboxes_this_frame[i] = [float(x1), float(y1), float(x2), float(y2)]
+
+            identity_matches, departed = identity_tracker.assign(id_detections)
+            # identity_matches: {identity_id: det_idx} -- who's present this
+            # frame and which raw detection index they currently occupy.
+            # Reverse map (det_idx -> identity_id) is what the export block
+            # below needs, since it independently discovers a raw det_idx
+            # via its own slot_tracker and must resolve it back to the
+            # SAME identity_id person_states uses -- not a fresh index of
+            # its own, which would silently be wrong again.
+            det_idx_to_identity = {di: iid for iid, di in identity_matches.items()}
+            last_det_idx_to_identity = det_idx_to_identity
+
+            for dep_id in departed:
+                if dep_id in person_states:
+                    enc_t, emb_t = person_states[dep_id].flush_to_disk()
                     t_encrypt_total += enc_t
                     t_embed_total   += emb_t
                     streams_flushed += 1
-                    sid = person_states[dep_idx].stream_id[:8]
-                    print(f"  [STREAM] Person {dep_idx} departed -> "
+                    sid = person_states[dep_id].stream_id[:8]
+                    print(f"  [STREAM] Person {dep_id} departed -> "
                           f"stream {sid}... flushed "
                           f"(enc={enc_t*1000:.1f}ms emb={emb_t*1000:.1f}ms)")
-                    del person_states[dep_idx]
-            active_indices = current_indices
+                    del person_states[dep_id]
 
             if keypoints is not None and len(keypoints) > 0:
-                for i in range(len(keypoints)):
-                    if i not in person_states:
-                        person_states[i] = PersonState(
-                            ttp_public_key, enc_output_dir,
+                for identity_id in identity_matches:
+                    if identity_id not in person_states:
+                        person_states[identity_id] = PersonState(
+                            ttp_public_key,
+                            export_crypto_dir if export_enabled else enc_output_dir,
                             embedder, benchmark=benchmark
                         )
-                        print(f"  [STREAM] Person {i} appeared -> "
-                              f"stream {person_states[i].stream_id[:8]}... created")
+                        print(f"  [STREAM] Person {identity_id} appeared -> "
+                              f"stream {person_states[identity_id].stream_id[:8]}... created")
 
                 per_person_movement = []
 
-                for i in range(len(keypoints)):
+                for identity_id, i in identity_matches.items():
                     kpts  = keypoints[i]
                     scrs  = scores[i]
-                    state = person_states[i]
+                    state = person_states[identity_id]
 
                     nose_xy = kpts[COCO_NOSE]
                     disp    = euclidean(nose_xy, state.prev_nose) if state.prev_nose else 0.0
@@ -511,6 +675,7 @@ def process_video(
                     t_fm0               = time.time()
                     face_crop_for_state = None
                     face_bbox_for_state = None
+                    face_yaw_deg        = None  # None -> face_quality_from_yaw() not applied (see below)
 
                     if state.face_size_tier != "far":
                         crop, x_off, y_off, crop_dims, _ = derive_face_crop(frame, kpts, scrs)
@@ -521,14 +686,25 @@ def process_video(
                                 x_off + crop_dims[0], y_off + crop_dims[1],
                             )
                             if face_canonicalizer is not None:
-                                # selfie_seg mode: canonicalizer handles face detection
-                                # (only run on person 0 — primary subject)
-                                if i == 0:
-                                    tc0 = time.time()
-                                    cf = face_canonicalizer.get_canonical_face(crop)
-                                    t_canonical_total += time.time() - tc0
+                                # selfie_seg mode: canonicalizer handles face detection.
+                                # Canonical-face RENDERING stays person-0-only (expensive,
+                                # and only person 0's expression is exported downstream --
+                                # see CLAUDE.md), but yaw is cheap to also read for every
+                                # tracked person here, since update_best()'s "best embedding
+                                # source" ranking needs it for all of them, not just person 0.
+                                # "Person 0" means identity_id == 0 -- the first identity
+                                # PersonIdentityTracker ever assigned (stable across frames,
+                                # unlike the old raw det_idx == 0 this used to check, which
+                                # could silently refer to a different physical person from
+                                # one frame to the next).
+                                tc0 = time.time()
+                                if identity_id == 0:
+                                    cf, face_yaw_deg = face_canonicalizer.get_canonical_face_and_yaw(crop)
                                     if cf is not None:
                                         last_canonical_face = cf
+                                else:
+                                    _, face_yaw_deg = face_canonicalizer.get_canonical_face_and_yaw(crop)
+                                t_canonical_total += time.time() - tc0
                             else:
                                 crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
                                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=crop_rgb)
@@ -540,22 +716,54 @@ def process_video(
                                     )
                                     state.face_mesh_pts = pts
                                     last_mesh_cache[i]  = pts
+                                    if result.facial_transformation_matrixes:
+                                        face_yaw_deg = yaw_from_transform(
+                                            result.facial_transformation_matrixes[0]
+                                        )
                     else:
                         state.face_mesh_pts = None
                     t_facemesh_total += time.time() - t_fm0
 
-                    body_crop, bx1, by1, bx2, by2 = derive_body_crop(frame, kpts, scrs)
+                    # last_scaled_bboxes[i] is this same person's detector box
+                    # this frame (whichever detector actually ran -- YOLOX-Nano
+                    # or yolo_seg's own detect head, see the is_full_frame block
+                    # above) -- used by derive_body_crop in place of its
+                    # keypoint-only box, since no COCO-17 keypoint reaches the
+                    # head/hair. Index-matched to keypoints/scores since both
+                    # come from the same bboxes array passed into
+                    # body.pose_model(). Guarded since last_scaled_bboxes can be
+                    # shorter than keypoints in rare detector/pose-count
+                    # mismatches -- falls back to the keypoint-only box via
+                    # derive_body_crop's detector_bbox=None in that case.
+                    detector_bbox = (
+                        last_scaled_bboxes[i]
+                        if last_scaled_bboxes is not None and i < len(last_scaled_bboxes)
+                        else None
+                    )
+                    body_crop, bx1, by1, bx2, by2 = derive_body_crop(
+                        frame, kpts, scrs, detector_bbox=detector_bbox
+                    )
                     body_bbox  = (bx1, by1, bx2, by2) if body_crop is not None else None
                     confidence = compute_frame_confidence(scrs)
+                    face_quality = (face_quality_from_yaw(face_yaw_deg)
+                                    if face_yaw_deg is not None else 1.0)
 
                     state.update_best(
-                        frame_idx  = frame_idx,
-                        confidence = confidence,
-                        face_crop  = face_crop_for_state,
-                        face_bbox  = face_bbox_for_state,
-                        body_crop  = body_crop,
-                        body_bbox  = body_bbox,
+                        frame_idx    = frame_idx,
+                        confidence   = confidence,
+                        face_crop    = face_crop_for_state,
+                        face_bbox    = face_bbox_for_state,
+                        body_crop    = body_crop,
+                        body_bbox    = body_bbox,
+                        face_quality = face_quality,
                     )
+                    # Independent of update_best()'s single "best frame"
+                    # selection -- restoring the real video on Tier 3
+                    # approval needs EVERY frame's body crop, not just the
+                    # one best-confidence frame used for the embedding. See
+                    # tracking.py's append_frame() / flush_to_disk()'s
+                    # extended .packet format.
+                    state.append_frame(frame_idx, body_crop, body_bbox)
 
                 if per_person_movement:
                     movement_tier = get_movement_tier(
@@ -566,24 +774,20 @@ def process_video(
 
             if export_enabled:
                 # Stable left-to-right slots are a separate concept from
-                # person_states above: person_states is keyed by raw
-                # detection index (reused/reshuffled on identity churn),
-                # while export needs a fixed small set of identities that
-                # keep referring to the same physical person for the whole
-                # clip. Detections beyond export_people, or too low-
-                # confidence to derive any bbox, simply aren't exported --
-                # they're still blurred normally via the existing mask path.
-                detections = []
-                det_bboxes = {}
-                if keypoints is not None and len(keypoints) > 0:
-                    for i in range(len(keypoints)):
-                        db = bboxes_from_keypoints(
-                            [keypoints[i]], [scores[i]], height, width, padding=40
-                        )
-                        if db:
-                            x1, y1, x2, y2 = db[0]
-                            detections.append((i, ((x1 + x2) / 2.0, (y1 + y2) / 2.0)))
-                            det_bboxes[i] = [float(x1), float(y1), float(x2), float(y2)]
+                # person_states above: export needs a small FIXED set of
+                # identities (slot 0/1/2), while person_states is an
+                # unbounded set that grows/shrinks with however many people
+                # actually appear (see PersonIdentityTracker). Detections
+                # beyond export_people, or too low-confidence to derive any
+                # bbox, simply aren't exported -- they're still blurred
+                # normally via the existing mask path.
+                #
+                # Reuses id_detections/det_bboxes_this_frame computed above
+                # (same bboxes_from_keypoints() call over the same keypoints/
+                # scores this frame) instead of recomputing an identical
+                # detections list a second time.
+                detections = id_detections
+                det_bboxes = det_bboxes_this_frame
 
                 slot_matches = slot_tracker.assign(detections)
 
@@ -591,6 +795,27 @@ def process_video(
                     crop_s = None
                     if s in slot_matches:
                         di = slot_matches[s]
+                        # Bridge: this slot's occupant this frame is whoever
+                        # person_states tracks under the SAME stable identity
+                        # this raw det_idx resolves to this frame (see
+                        # det_idx_to_identity, built from the identity_tracker
+                        # above -- NOT di itself, which is only this frame's
+                        # raw detection index and was the actual source of a
+                        # real bug: two different encrypted streams ended up
+                        # both recording the same middle person's face in a
+                        # 3-person clip, because di was being used directly
+                        # as if it were a stable person_states key). Record
+                        # its REAL crypto stream_id (see tracking.py's
+                        # PersonState) so the manifest can point the phone
+                        # at that stream's .packet/.key files. Overwritten
+                        # each frame the slot is occupied; in practice a
+                        # slot's occupant is stable for the clip (see
+                        # ExportSlotTracker), so this converges to one real
+                        # stream_id per slot, just derived live rather than
+                        # invented at export start.
+                        identity_id_for_slot = det_idx_to_identity.get(di)
+                        if identity_id_for_slot in person_states:
+                            export_slot_stream_id[s] = person_states[identity_id_for_slot].stream_id
                         kpts_s, scrs_s = keypoints[di], scores[di]
                         export_kp_rows[s].append(
                             np.concatenate(
@@ -746,9 +971,10 @@ def process_video(
                 face_mesh_inputs = {}
                 if face_canonicalizer is None:
                     for i in range(n_persons):
-                        if i in person_states and person_states[i].face_mesh_pts is not None:
+                        identity_id = last_det_idx_to_identity.get(i)
+                        if identity_id in person_states and person_states[identity_id].face_mesh_pts is not None:
                             face_mesh_inputs[i] = np.array(
-                                person_states[i].face_mesh_pts, dtype=np.float32
+                                person_states[identity_id].face_mesh_pts, dtype=np.float32
                             ).reshape(-1, 1, 2)
 
                 def _face_lk(i, old_face):
@@ -774,7 +1000,8 @@ def process_video(
                 t_face0 = time.time()
                 for i, fut in face_futures.items():
                     _, new_face = fut.result()
-                    person_states[i].face_mesh_pts = [
+                    identity_id = last_det_idx_to_identity[i]
+                    person_states[identity_id].face_mesh_pts = [
                         (int(pt[0][0]), int(pt[0][1])) for pt in new_face
                     ]
                 t_of_face_total += time.time() - t_face0
@@ -820,7 +1047,9 @@ def process_video(
                     annotated = applier.apply_mask(annotated, last_seg_mask)
             elif keypoints is not None and len(keypoints) > 0:
                 all_face_mesh_pts = [
-                    person_states[i].face_mesh_pts if i in person_states else None
+                    person_states[last_det_idx_to_identity[i]].face_mesh_pts
+                    if i in last_det_idx_to_identity and last_det_idx_to_identity[i] in person_states
+                    else None
                     for i in range(len(keypoints))
                 ]
                 annotated = blur_all_persons(annotated, keypoints, scores, all_face_mesh_pts)
@@ -839,9 +1068,11 @@ def process_video(
         td0 = time.time()
         if draw_enabled and keypoints is not None and len(keypoints) > 0:
             annotated = draw_skeleton(annotated, keypoints, scores, kpt_thr=0.3)
-            for i in range(len(keypoints)):
-                if i in person_states and person_states[i].face_mesh_pts:
-                    draw_face_mesh_pts(annotated, person_states[i].face_mesh_pts)
+            if not no_facemesh_draw:
+                for i in range(len(keypoints)):
+                    identity_id = last_det_idx_to_identity.get(i)
+                    if identity_id in person_states and person_states[identity_id].face_mesh_pts:
+                        draw_face_mesh_pts(annotated, person_states[identity_id].face_mesh_pts)
         if draw_enabled and last_scaled_bboxes:
             for bbox in last_scaled_bboxes:
                 x1, y1, x2, y2 = [int(v) for v in bbox]
@@ -857,17 +1088,18 @@ def process_video(
                 fps_history.pop(0)
             fps_display = sum(fps_history) / len(fps_history)
 
-            n_detected = len(keypoints) if keypoints is not None else 0
-            frame_type = "SKIP(LK)" if not is_full_frame else "FULL"
-            for j, line in enumerate([
-                f"FPS: {fps_display:.1f}",
-                f"Frame: {frame_type}",
-                f"People: {n_detected}",
-                f"Movement: {movement_tier}",
-                f"Skip-N: {current_N}",
-            ]):
-                cv2.putText(annotated, line, (10, 35 + j * 28),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 0, 255), 2)
+            if not no_draw and not no_hud:
+                n_detected = len(keypoints) if keypoints is not None else 0
+                frame_type = "SKIP(LK)" if not is_full_frame else "FULL"
+                for j, line in enumerate([
+                    f"FPS: {fps_display:.1f}",
+                    f"Frame: {frame_type}",
+                    f"People: {n_detected}",
+                    f"Movement: {movement_tier}",
+                    f"Skip-N: {current_N}",
+                ]):
+                    cv2.putText(annotated, line, (10, 35 + j * 28),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 0, 255), 2)
 
         tw0 = time.time()
         if out is not None:
@@ -937,11 +1169,33 @@ def process_video(
             # set_smile_baseline() + render()) -- exported params are raw/uncorrected.
             smile_baseline = (float(np.median(export_valid_smiles[i]))
                                if export_valid_smiles[i] else 0.0)
+
+            # packet_file/key_file: the real crypto bundle (see tracking.py's
+            # PersonState.flush_to_disk / __init__) for whichever stream this
+            # slot ended up bridged to (see the slot_matches loop above).
+            # null if this slot never had a real occupant, or its stream
+            # hadn't flushed by clip end (e.g. crypto disabled via
+            # benchmark=True) -- checked by real file existence, not assumed,
+            # since "a stream_id was recorded" doesn't guarantee the files
+            # were actually written (benchmark mode records stream_ids but
+            # PersonState.flush_to_disk() is a no-op in that mode).
+            packet_file, key_file = None, None
+            sid = export_slot_stream_id[i]
+            if sid is not None:
+                candidate_packet = os.path.join(export_crypto_dir, f"stream_{sid}.packet")
+                candidate_key    = os.path.join(export_crypto_dir, f"stream_{sid}.key")
+                if os.path.isfile(candidate_packet):
+                    packet_file = f"crypto/stream_{sid}.packet"
+                if os.path.isfile(candidate_key):
+                    key_file = f"crypto/stream_{sid}.key"
+
             manifest_slots.append({
                 "slot": i,
                 "stream_id": export_slot_stream_id[i],
                 "face_smile_baseline": smile_baseline,
                 "frames_with_face": len(export_valid_smiles[i]),
+                "packet_file": packet_file,
+                "key_file": key_file,
             })
 
             if export_diagnostics:

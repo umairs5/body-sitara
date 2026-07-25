@@ -7,6 +7,20 @@ HULL_COLOR = (127, 127, 127)
 _DEFAULT_PT   = "yolov8n-seg.pt"
 _DEFAULT_ONNX = "yolov8n-seg.onnx"
 
+_DEFAULT_INFER_SIZE = 320  # existing cached models (pre-dating per-size filenames) are this size
+
+
+def _size_suffixed_path(model_name: str, infer_size: int) -> str:
+    """
+    yolo11n-seg-int8.onnx @ 320 -> yolo11n-seg-int8.onnx (unchanged, matches
+    already-cached files from before this suffixing existed). Any other size
+    -> yolo11n-seg-int8_256.onnx, so different infer_size values never share
+    (and silently collide on) the same cache file.
+    """
+    if infer_size == _DEFAULT_INFER_SIZE or not model_name.endswith(".onnx"):
+        return model_name
+    return model_name[:-len(".onnx")] + f"_{infer_size}.onnx"
+
 
 class YOLOSegBlur:
     """
@@ -27,17 +41,33 @@ class YOLOSegBlur:
             model_name = _DEFAULT_ONNX
             print(f"  [YOLOSeg] Using ONNX model: {_DEFAULT_ONNX}")
 
+        # ONNX-exported YOLO-seg has a STATIC input shape baked in at export
+        # time (imgsz is not a runtime-adjustable param the way it is for the
+        # .pt checkpoint) -- confirmed directly: passing a different imgsz to
+        # a model exported at 320 raises InvalidArgument ("Got: 256 Expected:
+        # 320"), it does not silently resize. So a model file exported at one
+        # size cannot serve another; the requested infer_size is baked into
+        # the cache filename below, so different sizes never collide on (or
+        # silently reuse a stale) the same cache path.
+        #
+        # is_int8/pt_name are derived on the ORIGINAL (un-suffixed) name --
+        # the .pt checkpoint is size-independent (imgsz is just an export-time
+        # arg to it), so there's exactly one .pt per architecture regardless
+        # of how many differently-sized .onnx exports get cached from it.
+        is_int8 = model_name.endswith("-int8.onnx")
+        pt_name = (model_name[:-len("-int8.onnx")] if is_int8 else model_name[:-len(".onnx")]) + ".pt"
+        base_onnx = _size_suffixed_path(
+            model_name[:-len("-int8.onnx")] + ".onnx" if is_int8 else model_name, infer_size
+        )
+        model_name = _size_suffixed_path(model_name, infer_size)
+
         # ONNX files aren't fetchable by URL the way .pt weights are (ultralytics
         # auto-downloads .pt from its GitHub releases); if the requested .onnx
         # is missing but the matching .pt is present or downloadable, export it
         # once so first-run on a fresh machine (e.g. the Pi) doesn't hard-fail.
-        is_int8 = model_name.endswith("-int8.onnx")
         if model_name.endswith(".onnx") and not os.path.exists(model_name):
-            base_onnx = model_name[:-len("-int8.onnx")] + ".onnx" if is_int8 else model_name
-            pt_name = base_onnx[:-len(".onnx")] + ".pt"
-
             if not os.path.exists(base_onnx):
-                print(f"  [YOLOSeg] {base_onnx} not found -- exporting from {pt_name} ...")
+                print(f"  [YOLOSeg] {base_onnx} not found -- exporting from {pt_name} (imgsz={infer_size}) ...")
                 pt_model = YOLO(pt_name)  # auto-downloads .pt if missing
                 exported_path = pt_model.export(format="onnx", imgsz=infer_size, simplify=True)
                 if os.path.abspath(exported_path) != os.path.abspath(base_onnx):
