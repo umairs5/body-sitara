@@ -31,11 +31,25 @@ enum ComputePlanInspector {
     /// Loads the compiled model's MLComputePlan and tallies which compute
     /// device each operation was assigned to. Must be called on a
     /// compiled model URL (.mlmodelc), matching MLComputePlan's API.
+    ///
+    /// NOTE: the exact MLModelStructure/MLComputePlan Swift API surface
+    /// (enum case names, method names) could not be verified against
+    /// real Apple documentation before this was written (fetched pages
+    /// returned no usable content) -- corrected here from a first real
+    /// compiler error (2026-07-26 CI run: 'MLModelStructure' has no
+    /// member 'mlProgram', 'MLComputePlan' has no member 'computeDevice')
+    /// using the closest documented equivalent (coremltools' Python API
+    /// exposes compute_plan.model_structure.program and
+    /// get_compute_device_usage_for_mlprogram_operation(), so the Swift
+    /// names are assumed to be .program and computeDeviceUsage(for:)).
+    /// This is a best-effort correction, not confirmed correct -- next
+    /// CI run is the real verification, same iterative approach used for
+    /// every other fix in this file so far.
     static func inspect(compiledModelURL: URL, configuration: MLModelConfiguration) async throws -> UnitCounts {
         let plan = try await MLComputePlan.load(contentsOf: compiledModelURL, configuration: configuration)
         var counts = UnitCounts()
 
-        guard case let .mlProgram(program) = plan.modelStructure else {
+        guard case let .program(program) = plan.modelStructure else {
             // Non-mlprogram structure (e.g. neuralnetwork) -- compute plan
             // API surface differs; report unknown rather than guess.
             counts.unknown += 1
@@ -49,16 +63,16 @@ enum ComputePlanInspector {
 
         func walk(_ block: MLModelStructure.Program.Block) {
             for op in block.operations {
-                guard let deviceUsage = plan.computeDevice(for: op) else {
+                guard let deviceUsage = plan.computeDeviceUsage(for: op) else {
                     counts.unknown += 1
                     continue
                 }
                 switch deviceUsage {
-                case .cpu:
+                case .cpuOnly:
                     counts.cpu += 1
-                case .gpu:
+                case .cpuAndGPU:
                     counts.gpu += 1
-                case .neuralEngine:
+                case .cpuAndNeuralEngine:
                     counts.aneNeuralEngine += 1
                 @unknown default:
                     counts.unknown += 1

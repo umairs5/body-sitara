@@ -159,7 +159,7 @@ def convert_rife():
         outputs=[ct.TensorType(name="interpolated")],
         convert_to="mlprogram",
         compute_units=ct.ComputeUnit.ALL,
-        minimum_deployment_target=ct.target.iOS16,
+        minimum_deployment_target=ct.target.iOS17,
     )
     out_path = os.path.join(OUT_DIR, "RifeIFNet.mlpackage")
     mlmodel.save(out_path)
@@ -185,7 +185,7 @@ def convert_lama():
         outputs=[ct.TensorType(name="output")],
         convert_to="mlprogram",
         compute_units=ct.ComputeUnit.ALL,
-        minimum_deployment_target=ct.target.iOS16,
+        minimum_deployment_target=ct.target.iOS17,
     )
     out_path = os.path.join(OUT_DIR, "BigLama.mlpackage")
     mlmodel.save(out_path)
