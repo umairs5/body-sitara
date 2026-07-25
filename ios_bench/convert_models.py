@@ -46,6 +46,28 @@ import torch
 import coremltools as ct
 from onnx2torch import convert as onnx2torch_convert
 
+# onnx2torch's Resize converter (as of 1.5.15) is registered for opset
+# versions 10/11/13 only -- RIFE's ONNX export uses opset 18 (confirmed via
+# onnx.load(...).opset_import), which isn't registered, causing
+# NotImplementedError: Converter is not implemented (Resize, version=18)
+# during a real CI run (2026-07-26). The opset-13 converter's logic is
+# purely attribute-driven (mode/coordinate_transformation_mode/etc, all
+# read directly off the ONNX node) with no version-13-specific behavior --
+# opset 18's Resize update only added the 'antialias' attribute, which
+# that converter doesn't reference at all, so reusing it for opset 18 is
+# a safe, minimal patch rather than a real behavior change. Reuses the
+# EXACT SAME registered function object (not a reimplementation) by
+# looking it up in onnx2torch's own converter registry dict, so there is
+# no risk of the patch drifting out of sync with the real opset-13 logic.
+import onnx2torch.node_converters.resize  # noqa: F401 (populates the registry)
+from onnx2torch.node_converters.registry import _CONVERTER_REGISTRY, OperationDescription
+from onnx import defs as _onnx_defs
+
+_resize_v13_key = OperationDescription(domain=_onnx_defs.ONNX_DOMAIN, operation_type="Resize", version=13)
+_resize_v18_key = OperationDescription(domain=_onnx_defs.ONNX_DOMAIN, operation_type="Resize", version=18)
+if _resize_v18_key not in _CONVERTER_REGISTRY:
+    _CONVERTER_REGISTRY[_resize_v18_key] = _CONVERTER_REGISTRY[_resize_v13_key]
+
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 OUT_DIR = os.path.join(os.path.dirname(__file__), "Models")
 SCRATCH_DIR = os.path.join(os.path.dirname(__file__), "_scratch")
