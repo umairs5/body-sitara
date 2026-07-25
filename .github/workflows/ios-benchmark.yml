@@ -1,0 +1,81 @@
+name: iOS Benchmark Build
+
+# Builds the ios_bench/BodySitaraBench app on a GitHub-hosted macOS runner
+# (needed because CoreML conversion -- coremltools' .mlpackage writer --
+# and Xcode itself are both macOS-only; confirmed 2026-07-26 that
+# coremltools conversion fails outright on Windows with "No module named
+# coremltools.libcoremlpython", not just producing a warning).
+#
+# Produces an UNSIGNED .ipa as a workflow artifact. Signing for a real
+# device requires a provisioning profile tied to a specific device UDID
+# and Apple ID -- deliberately NOT done in CI (would require storing a
+# free Apple ID's session/cert as a repo secret, which expires every 7
+# days and is awkward to automate reliably). Instead: download the
+# artifact, then use Sideloadly (Windows) to sign + install using your own
+# free Apple ID directly -- see the project's iOS benchmark notes for that
+# step. This keeps Apple credentials out of CI entirely.
+#
+# Triggered manually (workflow_dispatch) rather than on every push, since
+# this is a slow, occasional benchmarking build, not part of normal CI.
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install model conversion dependencies
+        run: |
+          pip install coremltools torch onnx
+
+      - name: Convert RIFE + big-LaMa to CoreML
+        run: |
+          cd ios_bench
+          python3 convert_models.py
+
+      - name: Verify converted models exist
+        run: |
+          ls -la ios_bench/Models/
+          test -d ios_bench/Models/RifeIFNet.mlpackage
+          test -d ios_bench/Models/BigLama.mlpackage
+
+      - name: Select Xcode version
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app
+          xcodebuild -version
+
+      - name: Build (unsigned, for device)
+        run: |
+          cd ios_bench
+          xcodebuild -project BodySitaraBench.xcodeproj \
+            -scheme BodySitaraBench \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Package unsigned .app into .ipa-shaped zip
+        run: |
+          cd ios_bench/build/Build/Products/Release-iphoneos
+          mkdir -p Payload
+          cp -r BodySitaraBench.app Payload/
+          zip -r BodySitaraBench-unsigned.ipa Payload
+          ls -la
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BodySitaraBench-unsigned-ipa
+          path: ios_bench/build/Build/Products/Release-iphoneos/BodySitaraBench-unsigned.ipa
+          retention-days: 14
