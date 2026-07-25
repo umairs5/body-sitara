@@ -40,6 +40,7 @@ Usage (on the macOS runner):
   python3 convert_models.py
 """
 import os
+import shutil
 
 import torch
 import coremltools as ct
@@ -47,8 +48,10 @@ from onnx2torch import convert as onnx2torch_convert
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 OUT_DIR = os.path.join(os.path.dirname(__file__), "Models")
+SCRATCH_DIR = os.path.join(os.path.dirname(__file__), "_scratch")
 
 RIFE_ONNX = os.path.join(REPO_ROOT, "android", "tier1link", "app", "src", "main", "assets", "rife", "rife_ifnet.onnx")
+RIFE_ONNX_DATA = RIFE_ONNX + ".data"
 BIG_LAMA_PT = os.path.join(REPO_ROOT, "models", "big-lama.pt")
 
 BENCH_SIZE = 1280  # shared resolution for both models -- matches RifeInterpolator.kt's REQUIRED_SIZE
@@ -57,7 +60,20 @@ BENCH_SIZE = 1280  # shared resolution for both models -- matches RifeInterpolat
 def convert_rife():
     print(f"Converting RIFE ({RIFE_ONNX}) at {BENCH_SIZE}x{BENCH_SIZE}...")
     print("  Step 1/3: onnx2torch (ONNX -> torch.nn.Module)...")
-    torch_model = onnx2torch_convert(RIFE_ONNX)
+    # onnx2torch's safe_shape_inference writes a temp file in the SAME
+    # directory as the source .onnx (tempfile.NamedTemporaryFile(dir=...))
+    # rather than a real temp dir -- fails here because android/.../assets/
+    # is a source-tree directory the runner doesn't (and shouldn't) treat
+    # as writable scratch space. Fixed by copying the ONNX file (+ its
+    # external-data sidecar) into ios_bench/_scratch/ first, which we do
+    # have write access to, and converting from there instead.
+    os.makedirs(SCRATCH_DIR, exist_ok=True)
+    scratch_onnx = os.path.join(SCRATCH_DIR, "rife_ifnet.onnx")
+    shutil.copy(RIFE_ONNX, scratch_onnx)
+    if os.path.exists(RIFE_ONNX_DATA):
+        shutil.copy(RIFE_ONNX_DATA, os.path.join(SCRATCH_DIR, "rife_ifnet.onnx.data"))
+
+    torch_model = onnx2torch_convert(scratch_onnx)
     torch_model.eval()
 
     dummy_img0 = torch.rand(1, 3, BENCH_SIZE, BENCH_SIZE)

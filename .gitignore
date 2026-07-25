@@ -15,6 +15,7 @@ build/
 # Data & outputs
 data/output/
 data/dataset/
+data/tier3_bystanders.db
 output-videos/
 *.packet
 *.key
@@ -41,6 +42,11 @@ android/*/build/
 android/*/.cxx/
 android/*/*.iml
 android/*/captures/
+
+# iOS benchmark (CI-generated, macOS-only build artifacts)
+ios_bench/Models/
+ios_bench/_scratch/
+ios_bench/build/
 
 # OS
 .DS_Store
