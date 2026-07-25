@@ -68,6 +68,50 @@ _resize_v18_key = OperationDescription(domain=_onnx_defs.ONNX_DOMAIN, operation_
 if _resize_v18_key not in _CONVERTER_REGISTRY:
     _CONVERTER_REGISTRY[_resize_v18_key] = _CONVERTER_REGISTRY[_resize_v13_key]
 
+# onnx2torch 1.5.15 has NO GridSample converter at all (RIFE's IFNet uses
+# it for backward-warping frames by the estimated optical flow -- a
+# standard component of virtually every flow-based interpolation network,
+# not unusual). ONNX's GridSample op (opset 16, the version RIFE's export
+# uses) was explicitly designed to mirror torch.nn.functional.grid_sample
+# -- same attribute names (mode/padding_mode/align_corners), same
+# semantics (confirmed via the ONNX operator spec) -- so this is a direct,
+# low-risk 1:1 mapping, not a reimplementation of unclear behavior.
+from onnx2torch.node_converters.registry import add_converter as _add_converter
+from onnx2torch.utils.common import OnnxToTorchModule as _OnnxToTorchModule
+from onnx2torch.utils.common import OperationConverterResult as _OperationConverterResult
+from onnx2torch.utils.common import onnx_mapping_from_node as _onnx_mapping_from_node
+from torch import nn as _nn
+
+
+class _OnnxGridSample(_nn.Module, _OnnxToTorchModule):
+    def __init__(self, mode: str, padding_mode: str, align_corners: bool):
+        super().__init__()
+        self.mode = mode
+        self.padding_mode = padding_mode
+        self.align_corners = align_corners
+
+    def forward(self, input_tensor, grid):
+        return torch.nn.functional.grid_sample(
+            input_tensor,
+            grid,
+            mode=self.mode,
+            padding_mode=self.padding_mode,
+            align_corners=self.align_corners,
+        )
+
+
+@_add_converter(operation_type="GridSample", version=16)
+def _grid_sample_converter(node, graph):  # noqa: ARG001 (graph unused, matches onnx2torch's own converter signature)
+    attrs = node.attributes
+    mode = attrs.get("mode", "bilinear")
+    padding_mode = attrs.get("padding_mode", "zeros")
+    align_corners = bool(attrs.get("align_corners", 0))
+    return _OperationConverterResult(
+        torch_module=_OnnxGridSample(mode=mode, padding_mode=padding_mode, align_corners=align_corners),
+        onnx_mapping=_onnx_mapping_from_node(node),
+    )
+
+
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 OUT_DIR = os.path.join(os.path.dirname(__file__), "Models")
 SCRATCH_DIR = os.path.join(os.path.dirname(__file__), "_scratch")
