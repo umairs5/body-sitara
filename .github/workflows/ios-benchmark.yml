@@ -35,7 +35,7 @@ jobs:
 
       - name: Install model conversion dependencies
         run: |
-          pip install coremltools torch onnx
+          pip install coremltools torch onnx onnx2torch
 
       - name: Convert RIFE + big-LaMa to CoreML
         run: |
