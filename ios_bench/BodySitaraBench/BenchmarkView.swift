@@ -2,12 +2,13 @@ import SwiftUI
 import CoreML
 
 /// Benchmark harness UI: runs RIFE + big-LaMa inference N times each,
-/// reports per-stage timing (build/run/postprocess) and the ANE/GPU/CPU
-/// compute-unit breakdown from ComputePlanInspector -- so the reported
-/// latency number always comes with proof of which compute unit actually
-/// produced it, the same verification discipline the Android RIFE
-/// investigation needed (and initially lacked) to catch QNN's silent
-/// CPU-only fallback.
+/// reports per-stage timing (build/run/postprocess) and the requested/
+/// available compute-unit info from ComputePlanInspector. NOTE: this is a
+/// weaker check than true per-operation ANE attribution (see
+/// ComputePlanInspector.swift's docstring for why -- MLComputePlan's
+/// exact Swift API couldn't be pinned down without real Apple docs
+/// access) -- report benchmark numbers with that caveat explicit, not as
+/// confirmed ANE-only timing.
 struct BenchmarkView: View {
     @State private var log: [String] = []
     @State private var isRunning = false
@@ -69,9 +70,10 @@ struct BenchmarkView: View {
             appendLog("RifeIFNet.mlmodelc not found in bundle -- skipping")
             return
         }
-        let planCounts = try await ComputePlanInspector.inspect(compiledModelURL: modelURL, configuration: config)
-        appendLog("Compute plan: \(planCounts.summary)")
-        appendLog("Looks like real ANE usage: \(planCounts.looksLikeRealANEUsage)")
+        let inspectedModel = try MLModel(contentsOf: modelURL, configuration: config)
+        let planSummary = ComputePlanInspector.inspect(model: inspectedModel, configuration: config)
+        appendLog("Compute config: \(planSummary.summary)")
+        appendLog("NOTE: requested/available only -- per-op ANE placement not independently verified (see ComputePlanInspector.swift)")
 
         let runner = try RifeRunner(configuration: config)
         guard let frameA = TestFrameProvider.solidColorImage(size: RifeRunner.requiredSize, seed: 1),
@@ -102,9 +104,10 @@ struct BenchmarkView: View {
             appendLog("BigLama.mlmodelc not found in bundle -- skipping")
             return
         }
-        let planCounts = try await ComputePlanInspector.inspect(compiledModelURL: modelURL, configuration: config)
-        appendLog("Compute plan: \(planCounts.summary)")
-        appendLog("Looks like real ANE usage: \(planCounts.looksLikeRealANEUsage)")
+        let inspectedModel = try MLModel(contentsOf: modelURL, configuration: config)
+        let planSummary = ComputePlanInspector.inspect(model: inspectedModel, configuration: config)
+        appendLog("Compute config: \(planSummary.summary)")
+        appendLog("NOTE: requested/available only -- per-op ANE placement not independently verified (see ComputePlanInspector.swift)")
 
         let runner = try LamaRunner(configuration: config)
         guard let image = TestFrameProvider.solidColorImage(size: LamaRunner.inputSize, seed: 3),
