@@ -35,16 +35,16 @@ enum ComputePlanInspector {
     /// NOTE: the exact MLModelStructure/MLComputePlan Swift API surface
     /// (enum case names, method names) could not be verified against
     /// real Apple documentation before this was written (fetched pages
-    /// returned no usable content) -- corrected here from a first real
-    /// compiler error (2026-07-26 CI run: 'MLModelStructure' has no
-    /// member 'mlProgram', 'MLComputePlan' has no member 'computeDevice')
-    /// using the closest documented equivalent (coremltools' Python API
-    /// exposes compute_plan.model_structure.program and
-    /// get_compute_device_usage_for_mlprogram_operation(), so the Swift
-    /// names are assumed to be .program and computeDeviceUsage(for:)).
-    /// This is a best-effort correction, not confirmed correct -- next
-    /// CI run is the real verification, same iterative approach used for
-    /// every other fix in this file so far.
+    /// returned no usable content). Corrected TWICE from real compiler
+    /// errors (2026-07-26 CI runs): first 'mlProgram' -> '.program' and
+    /// 'computeDevice' -> attempted 'computeDeviceUsage' (still wrong);
+    /// this second correction uses get_compute_device_usage_for_mlprogram
+    /// _operation(), the confirmed real Python coremltools method name
+    /// (the Swift binding is very likely the same method with standard
+    /// Swift naming-convention transformation: drop get_, camelCase,
+    /// keep the descriptive suffix rather than a generic "for:" label,
+    /// since Apple's compute-plan API is method-name-explicit throughout).
+    /// Still a best-effort guess, not confirmed -- next CI run verifies.
     static func inspect(compiledModelURL: URL, configuration: MLModelConfiguration) async throws -> UnitCounts {
         let plan = try await MLComputePlan.load(contentsOf: compiledModelURL, configuration: configuration)
         var counts = UnitCounts()
@@ -63,7 +63,7 @@ enum ComputePlanInspector {
 
         func walk(_ block: MLModelStructure.Program.Block) {
             for op in block.operations {
-                guard let deviceUsage = plan.computeDeviceUsage(for: op) else {
+                guard let deviceUsage = plan.computeDeviceUsageForMLProgramOperation(op) else {
                     counts.unknown += 1
                     continue
                 }
