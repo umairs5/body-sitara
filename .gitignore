@@ -27,7 +27,12 @@ tier2_export_root/
 tier1_link_device_id.txt
 
 # Models (large binaries — store separately)
-models/
+# Exception: big-lama.pt is needed by the CI-built iOS benchmark
+# (ios_bench/convert_models.py), tracked via Git LFS specifically for that.
+# (Un-ignoring a file under an ignored directory requires un-ignoring the
+# directory itself first -- a bare "!models/big-lama.pt" does not work.)
+models/*
+!models/big-lama.pt
 *.task
 
 # IDE
