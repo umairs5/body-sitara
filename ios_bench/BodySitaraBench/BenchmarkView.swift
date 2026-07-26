@@ -106,7 +106,15 @@ struct BenchmarkView: View {
 
         for i in 1...Self.repetitions {
             appendLog("[diag] rep \(i): about to interpolateMidpoint...")
-            let (_, timing) = try runner.interpolateMidpoint(frameA: frameA, frameB: frameB)
+            // Same autoreleasepool fix as LamaRunner's loop -- RIFE's
+            // per-rep tensors are even larger (two 1280x1280x3 inputs +
+            // output), same risk of ARC not reclaiming CoreML buffers
+            // fast enough between back-to-back large inferences.
+            var timing: RifeRunner.StageTiming!
+            try autoreleasepool {
+                let result = try runner.interpolateMidpoint(frameA: frameA, frameB: frameB)
+                timing = result.1
+            }
             buildTimes.append(timing.buildMs)
             runTimes.append(timing.runMs)
             postTimes.append(timing.postprocessMs)
@@ -151,7 +159,20 @@ struct BenchmarkView: View {
 
         for i in 1...Self.repetitions {
             appendLog("[diag] rep \(i): about to fill...")
-            let (_, timing) = try runner.fill(image: image, mask: mask)
+            // Real on-device test (iPhone 15 Pro Max) crashed hard on rep 2
+            // (rep 1 succeeded: build=3.7ms run=1473.3ms post=8.1ms) --
+            // large 1280x1280 CoreML input/output MLMultiArrays are
+            // Objective-C-backed and can outlive their expected scope
+            // until the next autorelease-pool drain, so back-to-back large
+            // inferences can pile up memory faster than ARC alone
+            // reclaims it. autoreleasepool forces a drain after every
+            // single repetition -- the standard, well-documented fix for
+            // this exact "works once, crashes on repeat" CoreML pattern.
+            var timing: LamaRunner.StageTiming!
+            try autoreleasepool {
+                let result = try runner.fill(image: image, mask: mask)
+                timing = result.1
+            }
             buildTimes.append(timing.buildMs)
             runTimes.append(timing.runMs)
             postTimes.append(timing.postprocessMs)
