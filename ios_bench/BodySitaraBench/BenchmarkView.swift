@@ -48,16 +48,24 @@ struct BenchmarkView: View {
         let config = MLModelConfiguration()
         config.computeUnits = .all // let CoreML pick ANE/GPU/CPU; verified below, not assumed
 
-        do {
-            try await runRifeBenchmark(config: config)
-        } catch {
-            appendLog("RIFE benchmark FAILED: \(error)")
-        }
-
+        // LaMa runs FIRST here (diagnostic reorder, 2026-07-26): RIFE's
+        // MLModel(contentsOf:) load crashed hard on real device (iPhone 15
+        // Pro Max) with no caught Swift error -- running LaMa first
+        // isolates whether this is a RIFE-specific model problem (most
+        // likely: the custom onnx2torch GridSample/Resize converters
+        // producing a graph that passes Xcode's build-time .mlmodelc
+        // compile but fails a stricter runtime validation) or a general
+        // on-device CoreML loading issue that would affect both models.
         do {
             try await runLamaBenchmark(config: config)
         } catch {
             appendLog("big-LaMa benchmark FAILED: \(error)")
+        }
+
+        do {
+            try await runRifeBenchmark(config: config)
+        } catch {
+            appendLog("RIFE benchmark FAILED: \(error)")
         }
 
         isRunning = false
@@ -115,23 +123,34 @@ struct BenchmarkView: View {
             appendLog("BigLama.mlmodelc not found in bundle -- skipping")
             return
         }
+        appendLog("[diag] found BigLama.mlmodelc at \(modelURL.path)")
+
+        appendLog("[diag] about to MLModel(contentsOf:configuration:)...")
         let inspectedModel = try MLModel(contentsOf: modelURL, configuration: config)
+        appendLog("[diag] MLModel load succeeded")
+
+        appendLog("[diag] about to ComputePlanInspector.inspect...")
         let planSummary = ComputePlanInspector.inspect(model: inspectedModel, configuration: config)
         appendLog("Compute config: \(planSummary.summary)")
         appendLog("NOTE: requested/available only -- per-op ANE placement not independently verified (see ComputePlanInspector.swift)")
 
+        appendLog("[diag] about to LamaRunner(configuration:)...")
         let runner = try LamaRunner(configuration: config)
+        appendLog("[diag] LamaRunner init succeeded")
+
         guard let image = TestFrameProvider.solidColorImage(size: LamaRunner.inputSize, seed: 3),
               let mask = TestFrameProvider.solidColorImage(size: LamaRunner.inputSize, seed: 4, grayscale: true) else {
             appendLog("Failed to generate test image/mask")
             return
         }
+        appendLog("[diag] test image/mask generated")
 
         var buildTimes: [Double] = []
         var runTimes: [Double] = []
         var postTimes: [Double] = []
 
         for i in 1...Self.repetitions {
+            appendLog("[diag] rep \(i): about to fill...")
             let (_, timing) = try runner.fill(image: image, mask: mask)
             buildTimes.append(timing.buildMs)
             runTimes.append(timing.runMs)
