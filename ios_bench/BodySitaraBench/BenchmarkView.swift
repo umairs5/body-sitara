@@ -70,23 +70,34 @@ struct BenchmarkView: View {
             appendLog("RifeIFNet.mlmodelc not found in bundle -- skipping")
             return
         }
+        appendLog("[diag] found RifeIFNet.mlmodelc at \(modelURL.path)")
+
+        appendLog("[diag] about to MLModel(contentsOf:configuration:)...")
         let inspectedModel = try MLModel(contentsOf: modelURL, configuration: config)
+        appendLog("[diag] MLModel load succeeded")
+
+        appendLog("[diag] about to ComputePlanInspector.inspect...")
         let planSummary = ComputePlanInspector.inspect(model: inspectedModel, configuration: config)
         appendLog("Compute config: \(planSummary.summary)")
         appendLog("NOTE: requested/available only -- per-op ANE placement not independently verified (see ComputePlanInspector.swift)")
 
+        appendLog("[diag] about to RifeRunner(configuration:)...")
         let runner = try RifeRunner(configuration: config)
+        appendLog("[diag] RifeRunner init succeeded")
+
         guard let frameA = TestFrameProvider.solidColorImage(size: RifeRunner.requiredSize, seed: 1),
               let frameB = TestFrameProvider.solidColorImage(size: RifeRunner.requiredSize, seed: 2) else {
             appendLog("Failed to generate test frames")
             return
         }
+        appendLog("[diag] test frames generated")
 
         var buildTimes: [Double] = []
         var runTimes: [Double] = []
         var postTimes: [Double] = []
 
         for i in 1...Self.repetitions {
+            appendLog("[diag] rep \(i): about to interpolateMidpoint...")
             let (_, timing) = try runner.interpolateMidpoint(frameA: frameA, frameB: frameB)
             buildTimes.append(timing.buildMs)
             runTimes.append(timing.runMs)
