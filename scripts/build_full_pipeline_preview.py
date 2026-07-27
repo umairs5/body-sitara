@@ -108,11 +108,12 @@ def main():
     print("Step 2c: LaMa core-fill (once per clip)...")
     background_final = run_lama_fill(plate, never_revealed)
 
-    print("Building per-frame reconstructed-background video (real frames outside fill region)...")
+    print("Building per-frame reconstructed-background video (each frame uses its OWN mask for the fill region)...")
     reconstructed_bg_frames = []
     for i in range(n):
         frame_out = color_frames[i].copy()
-        frame_out[needs_reconstruction] = background_final[needs_reconstruction]
+        frame_mask = bool_masks[i]
+        frame_out[frame_mask] = background_final[frame_mask]
         reconstructed_bg_frames.append(frame_out)
     write_video(reconstructed_bg_frames, os.path.join(args.out_dir, "reconstructed_background.mp4"), args.fps)
     print(f"  wrote reconstructed_background.mp4 ({len(reconstructed_bg_frames)} frames)")

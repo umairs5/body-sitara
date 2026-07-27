@@ -156,20 +156,24 @@ struct BenchmarkView: View {
         appendLog("  Background Reconstruction TOTAL: \(String(format: "%.0f", bgReconTotalMs))ms (\(n) frames, \(maskedVideo.width)x\(maskedVideo.height))")
         addPreview("Background FINAL\n(after LaMa)", backgroundFinal.toCGImage())
 
-        // Real per-frame background VIDEO (not the single static plate
-        // repeated): outside the region that ever needed reconstruction,
-        // use each frame's OWN real pixels (real lighting/plant-motion
-        // shows through, exactly as it should); inside that region, paste
-        // in the reconstructed+LaMa-filled result (constant, since that's
-        // genuinely what the algorithm produces -- one plate). A single
-        // repeated still would have thrown away all real background
-        // motion outside the person-hole, which is wrong -- fixed per
-        // explicit correction (2026-07-27).
-        let needsReconstruction = maskBuffers[0].isPerson
+        // Real per-frame background VIDEO: for EACH frame i, the hole that
+        // needs filling is THAT FRAME's own mask (maskBuffers[i]), not
+        // frame 0's -- the person moves between frames, so the hole is a
+        // different shape/position every frame. Using frame 0's mask for
+        // all frames (an earlier version of this code did exactly that)
+        // is wrong two ways at once: it pastes a fake static patch onto
+        // real background the person has already moved away from, AND it
+        // fails to cover the person's ACTUAL current position in frames
+        // where they've moved elsewhere. Fixed per explicit correction
+        // (2026-07-27): each frame samples its OWN mask region from the
+        // aggregated backgroundFinal plate (which represents "what's
+        // really behind wherever the person was, aggregated across the
+        // whole clip"), everywhere else uses that frame's real pixels.
         var reconstructedBgFrames: [CGImage] = []
         for i in 0..<n {
             var outR = colorBuffers[i].r, outG = colorBuffers[i].g, outB = colorBuffers[i].b
-            for p in 0..<(backgroundFinal.width * backgroundFinal.height) where needsReconstruction[p] {
+            let frameMask = maskBuffers[i].isPerson
+            for p in 0..<(backgroundFinal.width * backgroundFinal.height) where frameMask[p] {
                 outR[p] = backgroundFinal.r[p]
                 outG[p] = backgroundFinal.g[p]
                 outB[p] = backgroundFinal.b[p]
@@ -177,7 +181,7 @@ struct BenchmarkView: View {
             let frameBuf = RGBBuffer(r: outR, g: outG, b: outB, width: backgroundFinal.width, height: backgroundFinal.height)
             if let cg = frameBuf.toCGImage() { reconstructedBgFrames.append(cg) }
         }
-        appendLog("  reconstructed-background video: \(reconstructedBgFrames.count) real frames (fill region constant, rest is real per-frame background)")
+        appendLog("  reconstructed-background video: \(reconstructedBgFrames.count) frames, each using its OWN mask for the fill region")
 
         appendLog("[diag] running Illumination Extraction (lightmap)...")
         let lightmapResult = LightmapExtractor.extract(from: backgroundFinal)
