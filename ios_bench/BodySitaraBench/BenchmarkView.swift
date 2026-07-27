@@ -161,11 +161,73 @@ struct BenchmarkView: View {
         appendLog("  Illumination Extraction: \(String(format: "%.1f", lightmapResult.totalMs))ms")
         addPreview("Lightmap", lightmapResult.lightmap.toCGImage())
 
-        appendLog("[diag] running Final Compositing (placeholder character, relight EXCLUDED per scope decision)...")
+        // Step 4: composite the ORIGINAL grey silhouette (per-frame, real
+        // clip content) onto the lightmap -- this is the actual
+        // outbound-to-server signal per the confirmed pipeline (2026-07-27):
+        // silhouette-over-lightmap is what gets sent, not the raw silhouette
+        // alone. Uses each frame's own person mask as alpha (person region
+        // opaque, background transparent -- only the silhouette shape
+        // itself needs to reach the server, not the reconstructed
+        // background around it).
+        appendLog("[diag] compositing original silhouette onto lightmap (outbound-to-server signal, all \(n) frames)...")
+        var silhouetteOnLightmapFrames: [CGImage] = []
+        for i in 0..<n {
+            let alpha = maskBuffers[i].isPerson.map { $0 ? Float(1) : Float(0) }
+            let result = Compositor.compositeOnly(background: lightmapResult.lightmap, character: colorBuffers[i], alpha: alpha)
+            if let cg = result.composited.toCGImage() { silhouetteOnLightmapFrames.append(cg) }
+        }
+        appendLog("  silhouette-on-lightmap: \(silhouetteOnLightmapFrames.count) frames composited")
+        if let mid = silhouetteOnLightmapFrames[safe: n / 2] {
+            addPreview("Silhouette-on-Lightmap\n(TO SERVER)", mid)
+        }
+
+        // Steps 5-6: the server call (WanAnimate) can't be made from this
+        // local benchmark -- per explicit scope decision, a PLACEHOLDER
+        // avatar stands in for the real synthetic-avatar-over-lightmap
+        // response. Step 6 composites that returned avatar onto the
+        // RECONSTRUCTED background (not the lightmap) to produce the
+        // final video.
+        appendLog("[diag] simulating server response (PLACEHOLDER avatar, no real WanAnimate call)...")
         let (placeholderChar, placeholderAlpha) = Compositor.placeholderCharacter(width: backgroundFinal.width, height: backgroundFinal.height)
+
+        appendLog("[diag] running Final Compositing: placeholder avatar onto reconstructed background (relight EXCLUDED per scope decision)...")
         let compositeOnlyResult = Compositor.compositeOnly(background: backgroundFinal, character: placeholderChar, alpha: placeholderAlpha)
         appendLog("  Final Compositing: composite=\(String(format: "%.1f", compositeOnlyResult.compositeMs))ms")
-        addPreview("Composited\n(FINAL, no relight)", compositeOnlyResult.composited.toCGImage())
+        addPreview("FINAL\n(avatar on reconstructed bg, no relight)", compositeOnlyResult.composited.toCGImage())
+
+        // Video export: save the real pipeline stages as .mp4 files so
+        // they can be viewed/scrubbed on-device via Photos, not just
+        // inspected as single still frames.
+        appendLog("\n[diag] encoding output videos...")
+        do {
+            let tmpDir = FileManager.default.temporaryDirectory
+            let fps: Int32 = 10 // matches the bundled clip's ~10fps sampling
+
+            if let bgImage = backgroundFinal.toCGImage() {
+                let bgFrames = [CGImage](repeating: bgImage, count: n) // one static plate, repeated to match clip length
+                let bgURL = tmpDir.appendingPathComponent("reconstructed_background.mp4")
+                try VideoEncoder.encode(frames: bgFrames, fps: fps, outputURL: bgURL)
+                try await VideoEncoder.saveToPhotoLibrary(url: bgURL)
+                appendLog("  Saved reconstructed_background.mp4 to Photos")
+            }
+
+            if !silhouetteOnLightmapFrames.isEmpty {
+                let silURL = tmpDir.appendingPathComponent("silhouette_on_lightmap.mp4")
+                try VideoEncoder.encode(frames: silhouetteOnLightmapFrames, fps: fps, outputURL: silURL)
+                try await VideoEncoder.saveToPhotoLibrary(url: silURL)
+                appendLog("  Saved silhouette_on_lightmap.mp4 to Photos")
+            }
+
+            if let finalImage = compositeOnlyResult.composited.toCGImage() {
+                let finalFrames = [CGImage](repeating: finalImage, count: n) // placeholder avatar is static; real WanAnimate output would vary per-frame
+                let finalURL = tmpDir.appendingPathComponent("final_output.mp4")
+                try VideoEncoder.encode(frames: finalFrames, fps: fps, outputURL: finalURL)
+                try await VideoEncoder.saveToPhotoLibrary(url: finalURL)
+                appendLog("  Saved final_output.mp4 to Photos")
+            }
+        } catch {
+            appendLog("  Video export/save FAILED: \(error)")
+        }
 
         appendLog("\n  SUMMARY (RIFE + relight excluded, per scope decision):")
         appendLog("    Background Reconstruction: \(String(format: "%.0f", bgReconTotalMs))ms")
@@ -304,4 +366,10 @@ struct BenchmarkView: View {
 
 private extension Array where Element == Double {
     var average: Double { isEmpty ? 0 : reduce(0, +) / Double(count) }
+}
+
+private extension Array {
+    subscript(safe index: Int) -> Element? {
+        indices.contains(index) ? self[index] : nil
+    }
 }
