@@ -15,6 +15,34 @@ enum Compositor {
         let relightMs: Double
     }
 
+    struct CompositeOnlyResult {
+        let composited: RGBBuffer
+        let compositeMs: Double
+    }
+
+    /// Alpha composite ONLY, no relight -- for the Tier2-mobile system-cost
+    /// benchmark, per explicit scope decision to exclude relight timing/
+    /// output from that report while its correctness is still being
+    /// verified independently of Background Reconstruction's alignment
+    /// bug (see BackgroundReconstructor.swift's warpTranslate fix note).
+    static func compositeOnly(background: RGBBuffer, character: RGBBuffer, alpha: [Float]) -> CompositeOnlyResult {
+        let w = background.width, h = background.height
+        precondition(character.width == w && character.height == h, "character must match background size")
+
+        let tStart = CFAbsoluteTimeGetCurrent()
+        var compR = [Float](repeating: 0, count: w * h)
+        var compG = [Float](repeating: 0, count: w * h)
+        var compB = [Float](repeating: 0, count: w * h)
+        for i in 0..<(w * h) {
+            let a = alpha[i]
+            compR[i] = character.r[i] * a + background.r[i] * (1 - a)
+            compG[i] = character.g[i] * a + background.g[i] * (1 - a)
+            compB[i] = character.b[i] * a + background.b[i] * (1 - a)
+        }
+        let compositeMs = (CFAbsoluteTimeGetCurrent() - tStart) * 1000
+        return CompositeOnlyResult(composited: RGBBuffer(r: compR, g: compG, b: compB, width: w, height: h), compositeMs: compositeMs)
+    }
+
     /// One-shot single-character alpha composite + relight over a
     /// reconstructed background. `character` and `alpha` (0-1, same size
     /// as background) represent the placeholder cutout; `lightmap` is

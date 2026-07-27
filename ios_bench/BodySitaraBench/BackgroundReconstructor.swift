@@ -239,9 +239,29 @@ enum BackgroundReconstructor {
         let alignMs = (CFAbsoluteTimeGetCurrent() - tAlignStart) * 1000
 
         let tTrimStart = CFAbsoluteTimeGetCurrent()
-        let (rPlate, neverRevealed) = trimmedMean(channelStack: alignedR, validStack: alignedValid, width: width, height: height)
-        let (gPlate, _) = trimmedMean(channelStack: alignedG, validStack: alignedValid, width: width, height: height)
-        let (bPlate, _) = trimmedMean(channelStack: alignedB, validStack: alignedValid, width: width, height: height)
+        var (rPlate, neverRevealed) = trimmedMean(channelStack: alignedR, validStack: alignedValid, width: width, height: height)
+        var (gPlate, _) = trimmedMean(channelStack: alignedG, validStack: alignedValid, width: width, height: height)
+        var (bPlate, _) = trimmedMean(channelStack: alignedB, validStack: alignedValid, width: width, height: height)
+
+        // Only pixels the REFERENCE frame's own mask actually covered need
+        // reconstruction at all -- everywhere else is already real,
+        // untouched background in frame 0. Restricting to this region
+        // (rather than reconstructing the whole frame) eliminates
+        // alignment-error risk everywhere outside the person's silhouette:
+        // an imperfect cross-frame warp can only ever blur pixels that
+        // genuinely needed filling, not perfectly good background that
+        // never needed touching in the first place. This was the root
+        // cause of the full-frame smearing seen on-device (2026-07-27) --
+        // confirmed by the same fix in the Python reference
+        // (reveal_and_fill_static.py) producing a clean, sharp result on
+        // the same clip once applied.
+        let needsReconstruction = masks[0].isPerson
+        for p in 0..<(width * height) where !needsReconstruction[p] {
+            rPlate[p] = colorFrames[0].r[p]
+            gPlate[p] = colorFrames[0].g[p]
+            bPlate[p] = colorFrames[0].b[p]
+            neverRevealed[p] = false
+        }
         let trimmedMeanMs = (CFAbsoluteTimeGetCurrent() - tTrimStart) * 1000
 
         let plate = RGBBuffer(r: rPlate, g: gPlate, b: bPlate, width: width, height: height)

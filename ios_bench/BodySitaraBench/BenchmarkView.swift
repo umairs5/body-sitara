@@ -161,20 +161,19 @@ struct BenchmarkView: View {
         appendLog("  Illumination Extraction: \(String(format: "%.1f", lightmapResult.totalMs))ms")
         addPreview("Lightmap", lightmapResult.lightmap.toCGImage())
 
-        appendLog("[diag] running Final Compositing (placeholder character + relight)...")
+        appendLog("[diag] running Final Compositing (placeholder character, relight EXCLUDED per scope decision)...")
         let (placeholderChar, placeholderAlpha) = Compositor.placeholderCharacter(width: backgroundFinal.width, height: backgroundFinal.height)
-        let compositeResult = Compositor.compositeAndRelight(background: backgroundFinal, character: placeholderChar, alpha: placeholderAlpha, lightmap: lightmapResult.lightmap)
-        appendLog("  Final Compositing: composite=\(String(format: "%.1f", compositeResult.compositeMs))ms relight=\(String(format: "%.1f", compositeResult.relightMs))ms")
-        addPreview("Composited\n(before relight)", compositeResult.composited.toCGImage())
-        addPreview("FINAL\n(after relight)", compositeResult.relit.toCGImage())
+        let compositeOnlyResult = Compositor.compositeOnly(background: backgroundFinal, character: placeholderChar, alpha: placeholderAlpha)
+        appendLog("  Final Compositing: composite=\(String(format: "%.1f", compositeOnlyResult.compositeMs))ms")
+        addPreview("Composited\n(FINAL, no relight)", compositeOnlyResult.composited.toCGImage())
 
-        appendLog("\n  SUMMARY (RIFE excluded, per scope decision):")
+        appendLog("\n  SUMMARY (RIFE + relight excluded, per scope decision):")
         appendLog("    Background Reconstruction: \(String(format: "%.0f", bgReconTotalMs))ms")
         appendLog("    Illumination Extraction:   \(String(format: "%.1f", lightmapResult.totalMs))ms")
-        appendLog("    Final Compositing:         \(String(format: "%.1f", compositeResult.compositeMs + compositeResult.relightMs))ms")
-        let totalMs = bgReconTotalMs + lightmapResult.totalMs + compositeResult.compositeMs + compositeResult.relightMs
+        appendLog("    Final Compositing:         \(String(format: "%.1f", compositeOnlyResult.compositeMs))ms")
+        let totalMs = bgReconTotalMs + lightmapResult.totalMs + compositeOnlyResult.compositeMs
         appendLog("    TOTAL (3 stages):          \(String(format: "%.0f", totalMs))ms for \(n) src frames")
-        appendLog("  NOTE: Final Compositing uses a PLACEHOLDER character cutout, not a real WanAnimate render -- tests compositing/relight MATH cost only, not visual fidelity.")
+        appendLog("  NOTE: Final Compositing uses a PLACEHOLDER character cutout, not a real WanAnimate render -- tests compositing MATH cost only, not visual fidelity.")
         appendLog("  Scroll the image strip above to visually verify each stage's output before trusting these numbers.")
     }
 
