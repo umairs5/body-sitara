@@ -48,26 +48,16 @@ struct BenchmarkView: View {
         let config = MLModelConfiguration()
         config.computeUnits = .all // let CoreML pick ANE/GPU/CPU; verified below, not assumed
 
-        // LaMa runs FIRST here (diagnostic reorder, 2026-07-26): RIFE's
-        // MLModel(contentsOf:) load crashed hard on real device (iPhone 15
-        // Pro Max) with no caught Swift error -- running LaMa first
-        // isolates whether this is a RIFE-specific model problem (most
-        // likely: the custom onnx2torch GridSample/Resize converters
-        // producing a graph that passes Xcode's build-time .mlmodelc
-        // compile but fails a stricter runtime validation) or a general
-        // on-device CoreML loading issue that would affect both models.
-        do {
-            try await runLamaBenchmark(config: config)
-        } catch {
-            appendLog("big-LaMa benchmark FAILED: \(error)")
-        }
-
-        do {
-            try await runRifeBenchmark(config: config)
-        } catch {
-            appendLog("RIFE benchmark FAILED: \(error)")
-        }
-
+        // ONLY the Tier2-Mobile System Cost stage runs here (2026-07-27):
+        // RIFE is excluded per the project's RIFE scoping decision (see
+        // memory: project_rife_decision_off.md) -- it's out of the
+        // pipeline entirely, not just out of this specific report, so it
+        // has no reason to run in this benchmark either. The standalone
+        // LaMa-on-synthetic-frames benchmark (runLamaBenchmark, still
+        // defined below for reference/reuse) is also dropped from this
+        // run -- it's now redundant, since Background Reconstruction
+        // below already calls LaMa for real, on real clip data, as part
+        // of its own core-fill step.
         do {
             try await runTier2MobileSystemCostBenchmark(config: config)
         } catch {
