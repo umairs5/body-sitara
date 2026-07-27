@@ -63,10 +63,18 @@ enum BackgroundReconstructor {
         let half = min(height, width) / 4
         guard half > 0 else { return (0, 0) }
 
-        func sadAt(_ ddx: Int, _ ddy: Int) -> Double {
+        // Out-of-bounds probes return `bestSadRef` (a real, finite fallback
+        // value), matching Python's sad_at()'s `return best_sad` -- NOT
+        // infinity. This matters for the parabolic sub-pixel refinement:
+        // an earlier version returned .infinity here, which silently
+        // zeroed sub-pixel refinement (via the isFinite guard below)
+        // whenever a probe neighbor was out of bounds, contributing to
+        // the on-device alignment bug alongside the warpTranslate sign
+        // error fixed in the same pass.
+        func sadAt(_ ddx: Int, _ ddy: Int, fallback: Double) -> Double {
             let y0 = cy0 - half + ddy
             let x0 = cx0 - half + ddx
-            guard y0 >= 0, x0 >= 0, y0 + 2 * half <= height, x0 + 2 * half <= width else { return .infinity }
+            guard y0 >= 0, x0 >= 0, y0 + 2 * half <= height, x0 + 2 * half <= width else { return fallback }
             var sum = 0.0
             for y in 0..<(2 * half) {
                 let refRow = (cy0 - half + y) * width + (cx0 - half)
@@ -83,7 +91,7 @@ enum BackgroundReconstructor {
         var bestDy = 0
         for dy in -searchRadius...searchRadius {
             for dx in -searchRadius...searchRadius {
-                let s = sadAt(dx, dy)
+                let s = sadAt(dx, dy, fallback: .infinity)
                 if s < bestSad {
                     bestSad = s
                     bestDx = dx
@@ -98,10 +106,12 @@ enum BackgroundReconstructor {
             return 0.5 * (m1 - p1) / denom
         }
 
-        let sxLeft = sadAt(bestDx - 1, bestDy), sxRight = sadAt(bestDx + 1, bestDy)
-        let syUp = sadAt(bestDx, bestDy - 1), syDown = sadAt(bestDx, bestDy + 1)
-        let sx = sxLeft.isFinite && sxRight.isFinite ? parabolic(sxLeft, bestSad, sxRight) : 0.0
-        let sy = syUp.isFinite && syDown.isFinite ? parabolic(syUp, bestSad, syDown) : 0.0
+        let sxLeft = sadAt(bestDx - 1, bestDy, fallback: bestSad)
+        let sxRight = sadAt(bestDx + 1, bestDy, fallback: bestSad)
+        let syUp = sadAt(bestDx, bestDy - 1, fallback: bestSad)
+        let syDown = sadAt(bestDx, bestDy + 1, fallback: bestSad)
+        let sx = parabolic(sxLeft, bestSad, sxRight)
+        let sy = parabolic(syUp, bestSad, syDown)
 
         return (Double(bestDx) + sx, Double(bestDy) + sy)
     }
@@ -118,15 +128,25 @@ enum BackgroundReconstructor {
     /// Translates `src` (width x height, single channel or interleaved via
     /// caller looping per-channel) by (dx, dy) using bilinear or
     /// nearest-neighbor sampling with edge-replicate border handling --
-    /// matches cv2.warpAffine(..., borderMode=BORDER_REPLICATE) for color
+    /// matches cv2.warpAffine(src, [[1,0,-dx],[0,1,-dy]], ...) for color
     /// and borderValue=1 (i.e. "treat out-of-bounds as person/hole") for
     /// masks, selected via `nearest`.
+    ///
+    /// SIGN CONVENTION (verified directly against real cv2.warpAffine
+    /// output, 2026-07-27 -- an earlier version of this function had this
+    /// backwards, which produced the on-device smeared/doubled-frame bug):
+    /// cv2.warpAffine with M=[[1,0,-dx],[0,1,-dy]] samples
+    /// dst(x,y) = src(x + dx, y + dy), NOT src(x - dx, y - dy). Confirmed
+    /// with a real test: a stripe at src column 10, total_dx=5, ends up at
+    /// dst column 5 (i.e. dst(x)=src(x+dx) -> the stripe that WAS at x=10
+    /// is now read out at x=10-dx=5). So the correct sample point is
+    /// `x + dx`, not `x - dx`.
     static func warpTranslate(_ src: [Float], width: Int, height: Int, dx: Double, dy: Double, nearest: Bool) -> [Float] {
         var out = [Float](repeating: 0, count: width * height)
         for y in 0..<height {
             for x in 0..<width {
-                let sx = Double(x) - dx
-                let sy = Double(y) - dy
+                let sx = Double(x) + dx
+                let sy = Double(y) + dy
                 out[y * width + x] = nearest
                     ? sampleNearestReplicate(src, width: width, height: height, x: sx, y: sy)
                     : sampleBilinearReplicate(src, width: width, height: height, x: sx, y: sy)
