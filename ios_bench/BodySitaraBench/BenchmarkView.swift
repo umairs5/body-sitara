@@ -156,6 +156,29 @@ struct BenchmarkView: View {
         appendLog("  Background Reconstruction TOTAL: \(String(format: "%.0f", bgReconTotalMs))ms (\(n) frames, \(maskedVideo.width)x\(maskedVideo.height))")
         addPreview("Background FINAL\n(after LaMa)", backgroundFinal.toCGImage())
 
+        // Real per-frame background VIDEO (not the single static plate
+        // repeated): outside the region that ever needed reconstruction,
+        // use each frame's OWN real pixels (real lighting/plant-motion
+        // shows through, exactly as it should); inside that region, paste
+        // in the reconstructed+LaMa-filled result (constant, since that's
+        // genuinely what the algorithm produces -- one plate). A single
+        // repeated still would have thrown away all real background
+        // motion outside the person-hole, which is wrong -- fixed per
+        // explicit correction (2026-07-27).
+        let needsReconstruction = maskBuffers[0].isPerson
+        var reconstructedBgFrames: [CGImage] = []
+        for i in 0..<n {
+            var outR = colorBuffers[i].r, outG = colorBuffers[i].g, outB = colorBuffers[i].b
+            for p in 0..<(backgroundFinal.width * backgroundFinal.height) where needsReconstruction[p] {
+                outR[p] = backgroundFinal.r[p]
+                outG[p] = backgroundFinal.g[p]
+                outB[p] = backgroundFinal.b[p]
+            }
+            let frameBuf = RGBBuffer(r: outR, g: outG, b: outB, width: backgroundFinal.width, height: backgroundFinal.height)
+            if let cg = frameBuf.toCGImage() { reconstructedBgFrames.append(cg) }
+        }
+        appendLog("  reconstructed-background video: \(reconstructedBgFrames.count) real frames (fill region constant, rest is real per-frame background)")
+
         appendLog("[diag] running Illumination Extraction (lightmap)...")
         let lightmapResult = LightmapExtractor.extract(from: backgroundFinal)
         appendLog("  Illumination Extraction: \(String(format: "%.1f", lightmapResult.totalMs))ms")
@@ -190,40 +213,48 @@ struct BenchmarkView: View {
         appendLog("[diag] simulating server response (PLACEHOLDER avatar, no real WanAnimate call)...")
         let (placeholderChar, placeholderAlpha) = Compositor.placeholderCharacter(width: backgroundFinal.width, height: backgroundFinal.height)
 
-        appendLog("[diag] running Final Compositing: placeholder avatar onto reconstructed background (relight EXCLUDED per scope decision)...")
-        let compositeOnlyResult = Compositor.compositeOnly(background: backgroundFinal, character: placeholderChar, alpha: placeholderAlpha)
-        appendLog("  Final Compositing: composite=\(String(format: "%.1f", compositeOnlyResult.compositeMs))ms")
-        addPreview("FINAL\n(avatar on reconstructed bg, no relight)", compositeOnlyResult.composited.toCGImage())
+        appendLog("[diag] running Final Compositing: placeholder avatar onto per-frame reconstructed background (relight EXCLUDED per scope decision)...")
+        var finalFrames: [CGImage] = []
+        var totalCompositeMs = 0.0
+        for i in 0..<n {
+            let frameBg = RGBBuffer.from(cgImage: reconstructedBgFrames[i])
+            let result = Compositor.compositeOnly(background: frameBg, character: placeholderChar, alpha: placeholderAlpha)
+            totalCompositeMs += result.compositeMs
+            if let cg = result.composited.toCGImage() { finalFrames.append(cg) }
+        }
+        appendLog("  Final Compositing: \(finalFrames.count) frames, composite total=\(String(format: "%.1f", totalCompositeMs))ms")
+        if let mid = finalFrames[safe: n / 2] {
+            addPreview("FINAL\n(avatar on reconstructed bg, no relight)", mid)
+        }
 
         // Video export: save the real pipeline stages as .mp4 files so
         // they can be viewed/scrubbed on-device via Photos, not just
         // inspected as single still frames.
-        appendLog("\n[diag] encoding output videos...")
+        appendLog("\n[diag] encoding output videos (\(n) real frames each, not repeated stills)...")
         do {
             let tmpDir = FileManager.default.temporaryDirectory
             let fps: Int32 = 10 // matches the bundled clip's ~10fps sampling
 
-            if let bgImage = backgroundFinal.toCGImage() {
-                let bgFrames = [CGImage](repeating: bgImage, count: n) // one static plate, repeated to match clip length
+            if !reconstructedBgFrames.isEmpty {
                 let bgURL = tmpDir.appendingPathComponent("reconstructed_background.mp4")
-                try VideoEncoder.encode(frames: bgFrames, fps: fps, outputURL: bgURL)
+                try VideoEncoder.encode(frames: reconstructedBgFrames, fps: fps, outputURL: bgURL)
                 try await VideoEncoder.saveToPhotoLibrary(url: bgURL)
-                appendLog("  Saved reconstructed_background.mp4 to Photos")
+                appendLog("  Saved reconstructed_background.mp4 to Photos (\(reconstructedBgFrames.count) frames)")
             }
 
             if !silhouetteOnLightmapFrames.isEmpty {
                 let silURL = tmpDir.appendingPathComponent("silhouette_on_lightmap.mp4")
                 try VideoEncoder.encode(frames: silhouetteOnLightmapFrames, fps: fps, outputURL: silURL)
                 try await VideoEncoder.saveToPhotoLibrary(url: silURL)
-                appendLog("  Saved silhouette_on_lightmap.mp4 to Photos")
+                appendLog("  Saved silhouette_on_lightmap.mp4 to Photos (\(silhouetteOnLightmapFrames.count) frames)")
             }
 
-            if let finalImage = compositeOnlyResult.composited.toCGImage() {
-                let finalFrames = [CGImage](repeating: finalImage, count: n) // placeholder avatar is static; real WanAnimate output would vary per-frame
+            if !finalFrames.isEmpty {
                 let finalURL = tmpDir.appendingPathComponent("final_output.mp4")
                 try VideoEncoder.encode(frames: finalFrames, fps: fps, outputURL: finalURL)
                 try await VideoEncoder.saveToPhotoLibrary(url: finalURL)
-                appendLog("  Saved final_output.mp4 to Photos")
+                appendLog("  Saved final_output.mp4 to Photos (\(finalFrames.count) frames)")
+                appendLog("  NOTE: avatar itself is a static PLACEHOLDER cutout (no per-frame motion) -- background behind it is real per-frame video; a real WanAnimate avatar would also move per-frame.")
             }
         } catch {
             appendLog("  Video export/save FAILED: \(error)")
@@ -232,8 +263,8 @@ struct BenchmarkView: View {
         appendLog("\n  SUMMARY (RIFE + relight excluded, per scope decision):")
         appendLog("    Background Reconstruction: \(String(format: "%.0f", bgReconTotalMs))ms")
         appendLog("    Illumination Extraction:   \(String(format: "%.1f", lightmapResult.totalMs))ms")
-        appendLog("    Final Compositing:         \(String(format: "%.1f", compositeOnlyResult.compositeMs))ms")
-        let totalMs = bgReconTotalMs + lightmapResult.totalMs + compositeOnlyResult.compositeMs
+        appendLog("    Final Compositing:         \(String(format: "%.1f", totalCompositeMs))ms")
+        let totalMs = bgReconTotalMs + lightmapResult.totalMs + totalCompositeMs
         appendLog("    TOTAL (3 stages):          \(String(format: "%.0f", totalMs))ms for \(n) src frames")
         appendLog("  NOTE: Final Compositing uses a PLACEHOLDER character cutout, not a real WanAnimate render -- tests compositing MATH cost only, not visual fidelity.")
         appendLog("  Scroll the image strip above to visually verify each stage's output before trusting these numbers.")
