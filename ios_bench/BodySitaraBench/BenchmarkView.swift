@@ -12,6 +12,7 @@ import CoreML
 struct BenchmarkView: View {
     @State private var log: [String] = []
     @State private var isRunning = false
+    @State private var previewImages: [(label: String, image: UIImage)] = []
     static let repetitions = 5 // matches Table 8's 5-repetition methodology
 
     var body: some View {
@@ -22,6 +23,33 @@ struct BenchmarkView: View {
                 }
                 .disabled(isRunning)
                 .padding()
+
+                // Visual sanity-check gallery: input frame, reconstructed
+                // background (before/after LaMa), lightmap, and final
+                // composite -- added so the pipeline's OUTPUT can be
+                // visually confirmed correct on-device, not just its
+                // timing. A fast benchmark number is meaningless if the
+                // stage it's timing produced garbage.
+                if !previewImages.isEmpty {
+                    ScrollView(.horizontal) {
+                        HStack(alignment: .top) {
+                            ForEach(previewImages, id: \.label) { item in
+                                VStack {
+                                    Text(item.label)
+                                        .font(.caption)
+                                    Image(uiImage: item.image)
+                                        .resizable()
+                                        .scaledToFit()
+                                        .frame(width: 160, height: 160)
+                                        .border(Color.gray)
+                                }
+                                .padding(.horizontal, 4)
+                            }
+                        }
+                        .padding()
+                    }
+                    .frame(height: 220)
+                }
 
                 ScrollView {
                     Text(log.joined(separator: "\n"))
@@ -37,6 +65,11 @@ struct BenchmarkView: View {
     private func appendLog(_ line: String) {
         log.append(line)
         print(line)
+    }
+
+    private func addPreview(_ label: String, _ cgImage: CGImage?) {
+        guard let cgImage else { return }
+        previewImages.append((label, UIImage(cgImage: cgImage)))
     }
 
     private func runBenchmark() async {
@@ -79,6 +112,7 @@ struct BenchmarkView: View {
     /// measurements at the same granularity.
     private func runTier2MobileSystemCostBenchmark(config: MLModelConfiguration) async throws {
         appendLog("\n--- Tier2-Mobile System Cost (Bg Recon + Illum Extraction + Compositing, RIFE excluded) ---")
+        previewImages = []
 
         guard let maskedURL = Bundle.main.url(forResource: "masked_video", withExtension: "mp4"),
               let maskURL = Bundle.main.url(forResource: "mask", withExtension: "mp4") else {
@@ -93,6 +127,10 @@ struct BenchmarkView: View {
         let n = min(maskedVideo.frames.count, maskVideo.frames.count)
         appendLog("[diag] loaded \(n) frames (\(maskedVideo.width)x\(maskedVideo.height)) in \(String(format: "%.0f", loadMs))ms")
 
+        addPreview("Input frame 0\n(masked_video)", maskedVideo.frames[0])
+        addPreview("Input mask 0\n(mask.mp4)", maskVideo.frames[0])
+        addPreview("Input frame \(n/2)\n(mid-clip)", maskedVideo.frames[n / 2])
+
         appendLog("[diag] converting frames to RGB/mask buffers...")
         let colorBuffers = maskedVideo.frames[0..<n].map { RGBBuffer.from(cgImage: $0) }
         let maskBuffers = maskVideo.frames[0..<n].map { MaskBuffer.from(cgImage: $0) }
@@ -101,6 +139,8 @@ struct BenchmarkView: View {
         let reconResult = BackgroundReconstructor.reconstruct(colorFrames: colorBuffers, masks: maskBuffers)
         let neverRevealedPct = 100.0 * Double(reconResult.neverRevealed.filter { $0 }.count) / Double(reconResult.neverRevealed.count)
         appendLog("  align=\(String(format: "%.0f", reconResult.alignMs))ms trimmed-mean=\(String(format: "%.0f", reconResult.trimmedMeanMs))ms (never-revealed core: \(String(format: "%.1f", neverRevealedPct))%)")
+        addPreview("Plate BEFORE LaMa\n(trimmed-mean)", reconResult.plateBeforeLama.toCGImage())
+        addPreview("Never-revealed core\n(white=needs LaMa)", Self.maskPreviewImage(reconResult.neverRevealed, width: reconResult.plateBeforeLama.width, height: reconResult.plateBeforeLama.height))
 
         appendLog("[diag] running LaMa core-fill (once per clip, on never-revealed core only)...")
         let lamaRunner = try LamaRunner(configuration: config)
@@ -114,15 +154,19 @@ struct BenchmarkView: View {
         let bgReconTotalMs = reconResult.alignMs + reconResult.trimmedMeanMs + lamaTiming.buildMs + lamaTiming.runMs + lamaTiming.postprocessMs
         appendLog("  LaMa: build=\(String(format: "%.1f", lamaTiming.buildMs))ms run=\(String(format: "%.1f", lamaTiming.runMs))ms post=\(String(format: "%.1f", lamaTiming.postprocessMs))ms")
         appendLog("  Background Reconstruction TOTAL: \(String(format: "%.0f", bgReconTotalMs))ms (\(n) frames, \(maskedVideo.width)x\(maskedVideo.height))")
+        addPreview("Background FINAL\n(after LaMa)", backgroundFinal.toCGImage())
 
         appendLog("[diag] running Illumination Extraction (lightmap)...")
         let lightmapResult = LightmapExtractor.extract(from: backgroundFinal)
         appendLog("  Illumination Extraction: \(String(format: "%.1f", lightmapResult.totalMs))ms")
+        addPreview("Lightmap", lightmapResult.lightmap.toCGImage())
 
         appendLog("[diag] running Final Compositing (placeholder character + relight)...")
         let (placeholderChar, placeholderAlpha) = Compositor.placeholderCharacter(width: backgroundFinal.width, height: backgroundFinal.height)
         let compositeResult = Compositor.compositeAndRelight(background: backgroundFinal, character: placeholderChar, alpha: placeholderAlpha, lightmap: lightmapResult.lightmap)
         appendLog("  Final Compositing: composite=\(String(format: "%.1f", compositeResult.compositeMs))ms relight=\(String(format: "%.1f", compositeResult.relightMs))ms")
+        addPreview("Composited\n(before relight)", compositeResult.composited.toCGImage())
+        addPreview("FINAL\n(after relight)", compositeResult.relit.toCGImage())
 
         appendLog("\n  SUMMARY (RIFE excluded, per scope decision):")
         appendLog("    Background Reconstruction: \(String(format: "%.0f", bgReconTotalMs))ms")
@@ -131,6 +175,20 @@ struct BenchmarkView: View {
         let totalMs = bgReconTotalMs + lightmapResult.totalMs + compositeResult.compositeMs + compositeResult.relightMs
         appendLog("    TOTAL (3 stages):          \(String(format: "%.0f", totalMs))ms for \(n) src frames")
         appendLog("  NOTE: Final Compositing uses a PLACEHOLDER character cutout, not a real WanAnimate render -- tests compositing/relight MATH cost only, not visual fidelity.")
+        appendLog("  Scroll the image strip above to visually verify each stage's output before trusting these numbers.")
+    }
+
+    private static func maskPreviewImage(_ mask: [Bool], width: Int, height: Int) -> CGImage? {
+        var raw = [UInt8](repeating: 0, count: width * height)
+        for i in 0..<(width * height) { raw[i] = mask[i] ? 255 : 0 }
+        let colorSpace = CGColorSpaceCreateDeviceGray()
+        guard let provider = CGDataProvider(data: Data(raw) as CFData) else { return nil }
+        return CGImage(
+            width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 8,
+            bytesPerRow: width, space: colorSpace,
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+            provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent
+        )
     }
 
     private func runRifeBenchmark(config: MLModelConfiguration) async throws {
