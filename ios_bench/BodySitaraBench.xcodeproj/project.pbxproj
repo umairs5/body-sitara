@@ -15,6 +15,13 @@
 		CC913A2B253742D99B486373 /* TestFrameProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 915D2299C98D47C89F952113 /* TestFrameProvider.swift */; };
 		C482D9A3E3D143038661187B /* RifeIFNet.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = 800CB20ADE3C4C389CF82366 /* RifeIFNet.mlpackage */; };
 		8435FBE2252B4E82A3CE1755 /* BigLama.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = 8A360F55EE96400C80D37E52 /* BigLama.mlpackage */; };
+		1A2B3C4D5E6F708192A3B4C5 /* VideoFrameLoader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A2B3C4D5E6F708192A3B4C6 /* VideoFrameLoader.swift */; };
+		1A2B3C4D5E6F708192A3B4C7 /* PixelBuffer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A2B3C4D5E6F708192A3B4C8 /* PixelBuffer.swift */; };
+		1A2B3C4D5E6F708192A3B4C9 /* BackgroundReconstructor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A2B3C4D5E6F708192A3B4CA /* BackgroundReconstructor.swift */; };
+		1A2B3C4D5E6F708192A3B4CB /* LightmapExtractor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A2B3C4D5E6F708192A3B4CC /* LightmapExtractor.swift */; };
+		1A2B3C4D5E6F708192A3B4CD /* Compositor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A2B3C4D5E6F708192A3B4CE /* Compositor.swift */; };
+		1A2B3C4D5E6F708192A3B4CF /* masked_video.mp4 in Resources */ = {isa = PBXBuildFile; fileRef = 2A2B3C4D5E6F708192A3B4D0 /* masked_video.mp4 */; };
+		1A2B3C4D5E6F708192A3B4D1 /* mask.mp4 in Resources */ = {isa = PBXBuildFile; fileRef = 2A2B3C4D5E6F708192A3B4D2 /* mask.mp4 */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -28,6 +35,13 @@
 		800CB20ADE3C4C389CF82366 /* RifeIFNet.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; path = RifeIFNet.mlpackage; sourceTree = "<group>"; };
 		8A360F55EE96400C80D37E52 /* BigLama.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; path = BigLama.mlpackage; sourceTree = "<group>"; };
 		963DB22D281D4FDF9EE93B36 /* BodySitaraBench.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = BodySitaraBench.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		2A2B3C4D5E6F708192A3B4C6 /* VideoFrameLoader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoFrameLoader.swift; sourceTree = "<group>"; };
+		2A2B3C4D5E6F708192A3B4C8 /* PixelBuffer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PixelBuffer.swift; sourceTree = "<group>"; };
+		2A2B3C4D5E6F708192A3B4CA /* BackgroundReconstructor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackgroundReconstructor.swift; sourceTree = "<group>"; };
+		2A2B3C4D5E6F708192A3B4CC /* LightmapExtractor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LightmapExtractor.swift; sourceTree = "<group>"; };
+		2A2B3C4D5E6F708192A3B4CE /* Compositor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Compositor.swift; sourceTree = "<group>"; };
+		2A2B3C4D5E6F708192A3B4D0 /* masked_video.mp4 */ = {isa = PBXFileReference; lastKnownFileType = file; path = masked_video.mp4; sourceTree = "<group>"; };
+		2A2B3C4D5E6F708192A3B4D2 /* mask.mp4 */ = {isa = PBXFileReference; lastKnownFileType = file; path = mask.mp4; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -46,6 +60,7 @@
 			children = (
 				2B0000000000000000000001 /* BodySitaraBench */,
 				2B0000000000000000000002 /* Models */,
+				2A2B3C4D5E6F708192A3B4D3 /* TestAssets */,
 				2B0000000000000000000003 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -59,6 +74,11 @@
 				D320B00ADC2C492F9E02B442 /* RifeRunner.swift */,
 				EF31D71822E44EDF9F4EEB81 /* LamaRunner.swift */,
 				915D2299C98D47C89F952113 /* TestFrameProvider.swift */,
+				2A2B3C4D5E6F708192A3B4C6 /* VideoFrameLoader.swift */,
+				2A2B3C4D5E6F708192A3B4C8 /* PixelBuffer.swift */,
+				2A2B3C4D5E6F708192A3B4CA /* BackgroundReconstructor.swift */,
+				2A2B3C4D5E6F708192A3B4CC /* LightmapExtractor.swift */,
+				2A2B3C4D5E6F708192A3B4CE /* Compositor.swift */,
 				24D1D2B0591D41058A313829 /* Info.plist */,
 			);
 			path = BodySitaraBench;
@@ -71,6 +91,15 @@
 				8A360F55EE96400C80D37E52 /* BigLama.mlpackage */,
 			);
 			path = Models;
+			sourceTree = "<group>";
+		};
+		2A2B3C4D5E6F708192A3B4D3 /* TestAssets */ = {
+			isa = PBXGroup;
+			children = (
+				2A2B3C4D5E6F708192A3B4D0 /* masked_video.mp4 */,
+				2A2B3C4D5E6F708192A3B4D2 /* mask.mp4 */,
+			);
+			path = TestAssets;
 			sourceTree = "<group>";
 		};
 		2B0000000000000000000003 /* Products */ = {
@@ -141,6 +170,8 @@
 			files = (
 				C482D9A3E3D143038661187B /* RifeIFNet.mlpackage in Resources */,
 				8435FBE2252B4E82A3CE1755 /* BigLama.mlpackage in Resources */,
+				1A2B3C4D5E6F708192A3B4CF /* masked_video.mp4 in Resources */,
+				1A2B3C4D5E6F708192A3B4D1 /* mask.mp4 in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -157,6 +188,11 @@
 				2EC5B025C01245928B934DBE /* RifeRunner.swift in Sources */,
 				9098AFF955E04E1590DD73F5 /* LamaRunner.swift in Sources */,
 				CC913A2B253742D99B486373 /* TestFrameProvider.swift in Sources */,
+				1A2B3C4D5E6F708192A3B4C5 /* VideoFrameLoader.swift in Sources */,
+				1A2B3C4D5E6F708192A3B4C7 /* PixelBuffer.swift in Sources */,
+				1A2B3C4D5E6F708192A3B4C9 /* BackgroundReconstructor.swift in Sources */,
+				1A2B3C4D5E6F708192A3B4CB /* LightmapExtractor.swift in Sources */,
+				1A2B3C4D5E6F708192A3B4CD /* Compositor.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -68,7 +68,79 @@ struct BenchmarkView: View {
             appendLog("RIFE benchmark FAILED: \(error)")
         }
 
+        do {
+            try await runTier2MobileSystemCostBenchmark(config: config)
+        } catch {
+            appendLog("Tier2-mobile system cost benchmark FAILED: \(error)")
+        }
+
         isRunning = false
+    }
+
+    /// Native (STATIC/JITTER-path only) port of the three Tier2-mobile
+    /// local pipeline stages, RIFE deliberately EXCLUDED per explicit
+    /// scope decision (see project_rife_decision_off.md): Background
+    /// Reconstruction (alignment pyramid + trimmed-mean + LaMa core-fill),
+    /// Illumination Extraction (lightmap), and Final Compositing
+    /// (alpha-blend PLACEHOLDER character + relight -- no real WanAnimate
+    /// render used here, per scope decision). Runs fully on-device
+    /// (alignment math included, not precomputed) so latency is a real,
+    /// honest end-to-end number comparable to Android's per-stage
+    /// measurements at the same granularity.
+    private func runTier2MobileSystemCostBenchmark(config: MLModelConfiguration) async throws {
+        appendLog("\n--- Tier2-Mobile System Cost (Bg Recon + Illum Extraction + Compositing, RIFE excluded) ---")
+
+        guard let maskedURL = Bundle.main.url(forResource: "masked_video", withExtension: "mp4"),
+              let maskURL = Bundle.main.url(forResource: "mask", withExtension: "mp4") else {
+            appendLog("masked_video.mp4 / mask.mp4 not found in bundle -- skipping (see ios_bench/TestAssets/README)")
+            return
+        }
+        appendLog("[diag] loading real clip frames...")
+        let tLoadStart = CFAbsoluteTimeGetCurrent()
+        let maskedVideo = try VideoFrameLoader.loadFrames(url: maskedURL)
+        let maskVideo = try VideoFrameLoader.loadFrames(url: maskURL)
+        let loadMs = (CFAbsoluteTimeGetCurrent() - tLoadStart) * 1000
+        let n = min(maskedVideo.frames.count, maskVideo.frames.count)
+        appendLog("[diag] loaded \(n) frames (\(maskedVideo.width)x\(maskedVideo.height)) in \(String(format: "%.0f", loadMs))ms")
+
+        appendLog("[diag] converting frames to RGB/mask buffers...")
+        let colorBuffers = maskedVideo.frames[0..<n].map { RGBBuffer.from(cgImage: $0) }
+        let maskBuffers = maskVideo.frames[0..<n].map { MaskBuffer.from(cgImage: $0) }
+
+        appendLog("[diag] running Background Reconstruction (align pyramid + trimmed-mean, on-device)...")
+        let reconResult = BackgroundReconstructor.reconstruct(colorFrames: colorBuffers, masks: maskBuffers)
+        let neverRevealedPct = 100.0 * Double(reconResult.neverRevealed.filter { $0 }.count) / Double(reconResult.neverRevealed.count)
+        appendLog("  align=\(String(format: "%.0f", reconResult.alignMs))ms trimmed-mean=\(String(format: "%.0f", reconResult.trimmedMeanMs))ms (never-revealed core: \(String(format: "%.1f", neverRevealedPct))%)")
+
+        appendLog("[diag] running LaMa core-fill (once per clip, on never-revealed core only)...")
+        let lamaRunner = try LamaRunner(configuration: config)
+        var lamaTiming: LamaRunner.StageTiming!
+        var backgroundFinal: RGBBuffer!
+        try autoreleasepool {
+            let (filled, timing) = try lamaRunner.fillPixels(plate: reconResult.plateBeforeLama, neverRevealed: reconResult.neverRevealed)
+            backgroundFinal = filled
+            lamaTiming = timing
+        }
+        let bgReconTotalMs = reconResult.alignMs + reconResult.trimmedMeanMs + lamaTiming.buildMs + lamaTiming.runMs + lamaTiming.postprocessMs
+        appendLog("  LaMa: build=\(String(format: "%.1f", lamaTiming.buildMs))ms run=\(String(format: "%.1f", lamaTiming.runMs))ms post=\(String(format: "%.1f", lamaTiming.postprocessMs))ms")
+        appendLog("  Background Reconstruction TOTAL: \(String(format: "%.0f", bgReconTotalMs))ms (\(n) frames, \(maskedVideo.width)x\(maskedVideo.height))")
+
+        appendLog("[diag] running Illumination Extraction (lightmap)...")
+        let lightmapResult = LightmapExtractor.extract(from: backgroundFinal)
+        appendLog("  Illumination Extraction: \(String(format: "%.1f", lightmapResult.totalMs))ms")
+
+        appendLog("[diag] running Final Compositing (placeholder character + relight)...")
+        let (placeholderChar, placeholderAlpha) = Compositor.placeholderCharacter(width: backgroundFinal.width, height: backgroundFinal.height)
+        let compositeResult = Compositor.compositeAndRelight(background: backgroundFinal, character: placeholderChar, alpha: placeholderAlpha, lightmap: lightmapResult.lightmap)
+        appendLog("  Final Compositing: composite=\(String(format: "%.1f", compositeResult.compositeMs))ms relight=\(String(format: "%.1f", compositeResult.relightMs))ms")
+
+        appendLog("\n  SUMMARY (RIFE excluded, per scope decision):")
+        appendLog("    Background Reconstruction: \(String(format: "%.0f", bgReconTotalMs))ms")
+        appendLog("    Illumination Extraction:   \(String(format: "%.1f", lightmapResult.totalMs))ms")
+        appendLog("    Final Compositing:         \(String(format: "%.1f", compositeResult.compositeMs + compositeResult.relightMs))ms")
+        let totalMs = bgReconTotalMs + lightmapResult.totalMs + compositeResult.compositeMs + compositeResult.relightMs
+        appendLog("    TOTAL (3 stages):          \(String(format: "%.0f", totalMs))ms for \(n) src frames")
+        appendLog("  NOTE: Final Compositing uses a PLACEHOLDER character cutout, not a real WanAnimate render -- tests compositing/relight MATH cost only, not visual fidelity.")
     }
 
     private func runRifeBenchmark(config: MLModelConfiguration) async throws {

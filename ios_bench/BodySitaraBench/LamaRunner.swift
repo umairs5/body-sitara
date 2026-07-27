@@ -31,6 +31,11 @@ final class LamaRunner {
     /// convention as the Android LamaDilatedFiller). image/mask must be
     /// inputSize x inputSize -- caller resizes/pads before calling, same
     /// as the real pipeline's _resize_square step.
+    ///
+    /// Also exposed via `fillPixels(background:neverRevealed:)` below for
+    /// the real-clip Background Reconstruction pipeline (Tier2-mobile
+    /// system-cost benchmark), which works in RGBBuffer/[Bool] space
+    /// rather than CGImage, matching BackgroundReconstructor's output.
     func fill(image: CGImage, mask: CGImage) throws -> (UIImage, StageTiming) {
         precondition(image.width == Self.inputSize && image.height == Self.inputSize, "image must be pre-resized to \(Self.inputSize)x\(Self.inputSize)")
         precondition(mask.width == Self.inputSize && mask.height == Self.inputSize, "mask must be pre-resized to \(Self.inputSize)x\(Self.inputSize)")
@@ -131,5 +136,78 @@ final class LamaRunner {
             throw NSError(domain: "LamaRunner", code: 4, userInfo: [NSLocalizedDescriptionKey: "failed to build output CGImage"])
         }
         return UIImage(cgImage: cgImage)
+    }
+
+    /// Core-fill entry point for the real Background Reconstruction
+    /// pipeline: fills ONLY the never-revealed pixels of `plate`, once per
+    /// clip -- matching the Python reference's run_lama_fill() (resize to
+    /// model's fixed square input, infer, paste back only the
+    /// never-revealed region at original resolution) and Danial's
+    /// confirmed once-per-clip design (not per-frame).
+    func fillPixels(plate: RGBBuffer, neverRevealed: [Bool]) throws -> (RGBBuffer, StageTiming) {
+        guard let plateImage = plate.toCGImage() else {
+            throw NSError(domain: "LamaRunner", code: 5, userInfo: [NSLocalizedDescriptionKey: "failed to rasterize plate"])
+        }
+        let maskImage = Self.maskToCGImage(neverRevealed, width: plate.width, height: plate.height)
+
+        let resizedImage = Self.resizeSquare(plateImage, to: Self.inputSize)
+        let resizedMask = Self.resizeSquare(maskImage, to: Self.inputSize)
+
+        let (filledUIImage, timing) = try fill(image: resizedImage, mask: resizedMask)
+        guard let filledCG = filledUIImage.cgImage else {
+            throw NSError(domain: "LamaRunner", code: 6, userInfo: [NSLocalizedDescriptionKey: "no cgImage on LaMa output"])
+        }
+        let filledFull = Self.resizeSquareBackToOriginal(filledCG, width: plate.width, height: plate.height)
+        let filledBuf = RGBBuffer.from(cgImage: filledFull)
+
+        var outR = plate.r, outG = plate.g, outB = plate.b
+        for i in 0..<(plate.width * plate.height) where neverRevealed[i] {
+            outR[i] = filledBuf.r[i]
+            outG[i] = filledBuf.g[i]
+            outB[i] = filledBuf.b[i]
+        }
+        return (RGBBuffer(r: outR, g: outG, b: outB, width: plate.width, height: plate.height), timing)
+    }
+
+    private static func maskToCGImage(_ neverRevealed: [Bool], width: Int, height: Int) -> CGImage {
+        var raw = [UInt8](repeating: 0, count: width * height)
+        for i in 0..<(width * height) { raw[i] = neverRevealed[i] ? 255 : 0 }
+        let colorSpace = CGColorSpaceCreateDeviceGray()
+        let provider = CGDataProvider(data: Data(raw) as CFData)!
+        return CGImage(
+            width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 8,
+            bytesPerRow: width, space: colorSpace,
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+            provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent
+        )!
+    }
+
+    /// Resizes to a size x size square. Always rasterizes through an RGBA
+    /// context (rather than passing the source image's own bitmapInfo
+    /// through, which is fragile for grayscale-no-alpha sources) -- safe
+    /// for both the RGB plate and the single-channel mask image, since
+    /// CGContext.draw() handles the colorspace conversion either way.
+    private static func resizeSquare(_ image: CGImage, to size: Int) -> CGImage {
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let ctx = CGContext(
+            data: nil, width: size, height: size,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        )!
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: size, height: size))
+        return ctx.makeImage()!
+    }
+
+    private static func resizeSquareBackToOriginal(_ image: CGImage, width: Int, height: Int) -> CGImage {
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let ctx = CGContext(
+            data: nil, width: width, height: height,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        )!
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return ctx.makeImage()!
     }
 }
