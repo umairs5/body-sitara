@@ -316,6 +316,12 @@ struct BenchmarkView: View {
         let maskVideo = try VideoFrameLoader.loadFramesAsPackedMask(url: maskURL, previewIndices: [0])
         let loadMs = (CFAbsoluteTimeGetCurrent() - tLoadStart) * 1000
         let n = min(maskedVideo.frames.count, maskVideo.frames.count)
+        // Hoisted up here (previously declared much later, right before the
+        // export `do` block) because the three streaming video writers now
+        // open BEFORE their respective per-frame loops run, not after --
+        // they all need `fps` at construction time, and this is the
+        // earliest point `n`/dimensions are known for all of them.
+        let fps: Int32 = 10 // matches the bundled clip's ~10fps sampling
         appendLog("[diag] loaded \(n) frames (\(maskedVideo.width)x\(maskedVideo.height)) in \(String(format: "%.0f", loadMs))ms")
 
         // colorBuffers/maskBuffers hold EVERY frame of the clip
@@ -367,7 +373,52 @@ struct BenchmarkView: View {
         let usedPushPull: Bool
         let coreFillMethodSummary: String
         let coreFillCorePct: Double
-        let reconstructedBgFrames: [CGImage]
+        // renderReconFrame(i): "what does frame i's reconstructed background
+        // look like" -- the SAME per-frame computation each branch below
+        // already needed for its bgWriter loop, now also reused by Final
+        // Compositing (Loop 3, further down) instead of Loop 3 reading back
+        // a stored [CGImage] array. This is option (a) from the task's two
+        // alternatives for Loop 3's dependency on Loop 1's output: recompute
+        // frame i's reconstructed-background content from the same source
+        // data (backgroundFinal/colorBuffers[i]/maskBuffers[i], or
+        // windows for the DYNAMIC branch) rather than (b) decoding it back
+        // from the just-written .mp4. (a) was chosen because every input
+        // renderReconFrame needs (backgroundFinal, colorBuffers, maskBuffers,
+        // windows) is ALREADY cheaply resident for the rest of this
+        // function's duration regardless -- colorBuffers/maskBuffers are
+        // the function-wide compact arrays, backgroundFinal/windows are O(1)
+        // plates -- so recomputing costs one extra pass of the same cheap
+        // per-pixel paste/blend math (milliseconds, not the LaMa/alignment
+        // cost), with no new decode, no new file I/O, and byte-for-byte the
+        // same pixels Loop 1 wrote (same function, same inputs, called
+        // twice instead of read back once). Option (b) would have added a
+        // full video decode (AVAssetReader + CIContext, the same streaming
+        // pass VideoFrameLoader already does) per Final Compositing run
+        // purely to undo work already done in memory this same function
+        // call -- clearly the worse trade here.
+        let renderReconFrame: (Int) -> RGBBuffer
+
+        // Reconstructed-background frames are no longer accumulated into a
+        // [CGImage] array (that was ~1.97GB resident for a 300-frame
+        // 1280x1280 clip, plus it stayed alive afterward because Loop 3 --
+        // Final Compositing below -- used to read it back via
+        // reconstructedBgFrames[i]). Instead each frame is written straight
+        // to reconstructed_background.mp4 as it's computed, via this
+        // streaming writer opened BEFORE either branch's loop runs.
+        // bgReconFrameCount tracks how many frames were actually written
+        // (replaces the old `!reconstructedBgFrames.isEmpty` check at
+        // export time -- both branches iterate 0..<n, so this is always n
+        // once the writer finishes, but tracking it explicitly keeps the
+        // export gate honest if a future branch could legitimately write 0
+        // frames). One frame (index n/2) is additionally kept as a real
+        // CGImage for the mid-clip gallery preview -- see reconMidPreview
+        // below -- since the gallery needs an actual UIImage-backed frame,
+        // not a video file, for that one specific stage snapshot.
+        let tmpDir = FileManager.default.temporaryDirectory
+        let bgURL = tmpDir.appendingPathComponent("reconstructed_background.mp4")
+        let bgWriter = try StreamingVideoWriter(outputURL: bgURL, width: maskedVideo.width, height: maskedVideo.height, fps: fps)
+        var bgReconFrameCount = 0
+        var reconMidPreview: CGImage?
 
         switch reconResult.method {
         case .staticJitter:
@@ -408,26 +459,50 @@ struct BenchmarkView: View {
             // backgroundFinal plate (which represents "what's really
             // behind wherever the person was, aggregated across the whole
             // clip"), everywhere else uses that frame's real pixels.
-            reconstructedBgFrames = await Task.detached(priority: .userInitiated) {
-                var frames: [CGImage] = []
-                for i in 0..<n {
-                    // Promote just THIS frame's UInt8 color to Float32 for
-                    // pasting against backgroundFinal (already Float32) --
-                    // discarded at the end of this iteration, never
-                    // retained alongside the other N-1 frames.
-                    var outR = colorBuffers[i].r.map { Float($0) }
-                    var outG = colorBuffers[i].g.map { Float($0) }
-                    var outB = colorBuffers[i].b.map { Float($0) }
-                    let frameMask = maskBuffers[i].unpacked().isPerson
-                    for p in 0..<(backgroundFinal.width * backgroundFinal.height) where frameMask[p] {
-                        outR[p] = backgroundFinal.r[p]
-                        outG[p] = backgroundFinal.g[p]
-                        outB[p] = backgroundFinal.b[p]
-                    }
-                    let frameBuf = RGBBuffer(r: outR, g: outG, b: outB, width: backgroundFinal.width, height: backgroundFinal.height)
-                    if let cg = frameBuf.toCGImage() { frames.append(cg) }
+            // renderReconFrame for this branch: promote frame i's UInt8
+            // color to Float32 and paste backgroundFinal into its mask
+            // region -- exactly the per-frame computation this branch
+            // always did, just factored out so Loop 3 (Final Compositing)
+            // can call it again later instead of reading back a stored
+            // array. `backgroundFinal` is captured by reference to the
+            // already-assigned `let` above (Swift allows this since it's
+            // definitely-initialized by this point in the branch).
+            renderReconFrame = { i in
+                var outR = colorBuffers[i].r.map { Float($0) }
+                var outG = colorBuffers[i].g.map { Float($0) }
+                var outB = colorBuffers[i].b.map { Float($0) }
+                let frameMask = maskBuffers[i].unpacked().isPerson
+                for p in 0..<(backgroundFinal.width * backgroundFinal.height) where frameMask[p] {
+                    outR[p] = backgroundFinal.r[p]
+                    outG[p] = backgroundFinal.g[p]
+                    outB[p] = backgroundFinal.b[p]
                 }
-                return frames
+                return RGBBuffer(r: outR, g: outG, b: outB, width: backgroundFinal.width, height: backgroundFinal.height)
+            }
+
+            // Streams straight to bgWriter instead of building a [CGImage]
+            // array: each iteration computes ONE frame's reconstructed-
+            // background pixels via renderReconFrame, writes it to
+            // reconstructed_background.mp4, then lets it fall out of scope
+            // before the next iteration -- at most one frame's worth of
+            // CGImage/RGBBuffer is resident at a time, versus the old
+            // design's full N-frame [CGImage] array (~1.97GB at 300
+            // frames/1280x1280). The n/2 frame is also captured into
+            // reconMidPreview for the gallery, mirroring how
+            // VideoFrameLoader captures specific preview indices during its
+            // own streaming decode pass rather than keeping everything.
+            (bgReconFrameCount, reconMidPreview) = try await Task.detached(priority: .userInitiated) {
+                var count = 0
+                var midPreview: CGImage?
+                for i in 0..<n {
+                    let frameBuf = renderReconFrame(i)
+                    if let cg = frameBuf.toCGImage() {
+                        try bgWriter.append(cg)
+                        count += 1
+                        if i == n / 2 { midPreview = cg }
+                    }
+                }
+                return (count, midPreview)
             }.value
 
         case .dynamicWindowed:
@@ -452,19 +527,49 @@ struct BenchmarkView: View {
             backgroundFinal = windows.first?.plate ?? reconResult.plateBeforeLama
 
             appendLog("[diag] compositing per-frame windowed background (\(n) frames, trapezoidal cross-fade across \(windows.count) window(s))...")
-            reconstructedBgFrames = await Task.detached(priority: .userInitiated) {
-                var frames: [CGImage] = []
+            // renderReconFrame for this branch: compositeFrame blends every
+            // covering window's plate into frame i's hole region
+            // (trapezoidal cross-fade, exposure-matched) -- same per-frame
+            // computation this branch always did, factored out so Loop 3
+            // can call it again later instead of reading back a stored
+            // array. `windows` is captured by this closure.
+            renderReconFrame = { i in
+                BackgroundReconstructor.compositeFrame(colorBuffers[i].toFloatRGBBuffer(), mask: maskBuffers[i].unpacked(), frameIndex: i, windows: windows)
+            }
+
+            // Same streaming-to-bgWriter rewrite as the STATIC/JITTER
+            // branch above -- see that branch's comment for the full
+            // reasoning. Only the per-frame compute differs (compositeFrame
+            // vs. the direct paste, both now behind renderReconFrame); the
+            // write-then-discard discipline is identical.
+            (bgReconFrameCount, reconMidPreview) = try await Task.detached(priority: .userInitiated) {
+                var count = 0
+                var midPreview: CGImage?
                 for i in 0..<n {
-                    // Per-frame Float32/[Bool] promotion, scoped to this
-                    // loop iteration only -- compositeFrame operates on
-                    // ONE frame at a time by design, so there is no reason
-                    // for its input to be anything but the existing
-                    // Float32 RGBBuffer/MaskBuffer API.
-                    let composited = BackgroundReconstructor.compositeFrame(colorBuffers[i].toFloatRGBBuffer(), mask: maskBuffers[i].unpacked(), frameIndex: i, windows: windows)
-                    if let cg = composited.toCGImage() { frames.append(cg) }
+                    let composited = renderReconFrame(i)
+                    if let cg = composited.toCGImage() {
+                        try bgWriter.append(cg)
+                        count += 1
+                        if i == n / 2 { midPreview = cg }
+                    }
                 }
-                return frames
+                return (count, midPreview)
             }.value
+        }
+
+        // Close out reconstructed_background.mp4 now that both branches'
+        // loop has fully finished writing to it. Saved to Photos and
+        // registered in outputVideos here (rather than in the old shared
+        // "Export" do-block at the very end of this function) because the
+        // writer -- and the only CGImages it ever touched -- belongs to
+        // THIS stage; there is no reason to defer closing the file until
+        // after Illumination Extraction/Final Compositing run.
+        try await bgWriter.finish()
+        outputVideos.append((label: "Masked Input", url: maskedURL))
+        outputVideos.append((label: "Reconstructed Background", url: bgURL))
+        try await VideoEncoder.saveToPhotoLibrary(url: bgURL)
+        if let reconMidPreview {
+            addPreview("Reconstructed Background\n(mid-clip)", reconMidPreview)
         }
 
         let bgReconTotalMs = reconResult.alignMs + reconResult.trimmedMeanMs + lamaStageMs
@@ -484,7 +589,8 @@ struct BenchmarkView: View {
                   timings: [("align", reconResult.alignMs), ("trim", reconResult.trimmedMeanMs), ("fill", lamaStageMs)],
                   method: (methodBadgeText, usedPushPull),
                   detail: [reconResult.methodDetail, coreFillMethodSummary, "core: \(String(format: "%.1f", coreFillCorePct))% of frame"])
-        appendLog("  reconstructed-background video: \(reconstructedBgFrames.count) frames, each using its OWN mask for the fill region")
+        appendLog("  reconstructed-background video: \(bgReconFrameCount) frames written to reconstructed_background.mp4, each using its OWN mask for the fill region")
+        appendLog("  Saved reconstructed_background.mp4 to Photos (\(bgReconFrameCount) frames)")
 
         setStage("Illumination Extraction", status: .running)
         appendLog("[diag] running Illumination Extraction (lightmap)...")
@@ -503,18 +609,38 @@ struct BenchmarkView: View {
         // background around it).
         appendLog("[diag] compositing original silhouette onto lightmap (outbound-to-server signal, all \(n) frames)...")
         let lightmapForComposite = lightmapResult.lightmap
-        let silhouetteOnLightmapFrames: [CGImage] = await Task.detached(priority: .userInitiated) {
-            var frames: [CGImage] = []
+        // Streams to silhouette_on_lightmap.mp4 the same way Loop 1 streams
+        // to reconstructed_background.mp4 above -- opened here (right
+        // before this loop, dimensions/fps already known), appended to
+        // inside the loop, closed right after. Previously this built a
+        // [CGImage] for all n frames (~1.97GB at 300 frames/1280x1280)
+        // purely so it could be handed to VideoEncoder.encode(frames:...)
+        // at export time and to grab index n/2 for the gallery -- neither
+        // need survives the loop now: export is inline via silWriter, and
+        // the n/2 CGImage is captured directly into silMidPreview as it's
+        // produced.
+        let silURL = tmpDir.appendingPathComponent("silhouette_on_lightmap.mp4")
+        let silWriter = try StreamingVideoWriter(outputURL: silURL, width: lightmapForComposite.width, height: lightmapForComposite.height, fps: fps)
+        let (silFrameCount, silMidPreview): (Int, CGImage?) = try await Task.detached(priority: .userInitiated) {
+            var count = 0
+            var midPreview: CGImage?
             for i in 0..<n {
                 let alpha = maskBuffers[i].unpacked().isPerson.map { $0 ? Float(1) : Float(0) }
                 let result = Compositor.compositeOnly(background: lightmapForComposite, character: colorBuffers[i].toFloatRGBBuffer(), alpha: alpha)
-                if let cg = result.composited.toCGImage() { frames.append(cg) }
+                if let cg = result.composited.toCGImage() {
+                    try silWriter.append(cg)
+                    count += 1
+                    if i == n / 2 { midPreview = cg }
+                }
             }
-            return frames
+            return (count, midPreview)
         }.value
-        appendLog("  silhouette-on-lightmap: \(silhouetteOnLightmapFrames.count) frames composited")
-        if let mid = silhouetteOnLightmapFrames[safe: n / 2] {
-            addPreview("Silhouette-on-Lightmap\n(TO SERVER)", mid)
+        try await silWriter.finish()
+        outputVideos.append((label: "Silhouette on Lightmap", url: silURL))
+        try await VideoEncoder.saveToPhotoLibrary(url: silURL)
+        appendLog("  silhouette-on-lightmap: \(silFrameCount) frames composited, saved to Photos")
+        if let silMidPreview {
+            addPreview("Silhouette-on-Lightmap\n(TO SERVER)", silMidPreview)
         }
 
         // Steps 5-6: the server call (WanAnimate) can't be made from this
@@ -527,67 +653,60 @@ struct BenchmarkView: View {
         appendLog("[diag] simulating server response (PLACEHOLDER avatar, no real WanAnimate call -- a DIFFERENT synthetic frame is generated per source frame, not one cached still, so Compositing's timing reflects real per-frame data volume)...")
 
         appendLog("[diag] running Final Compositing: placeholder avatar onto per-frame reconstructed background (relight EXCLUDED per scope decision)...")
-        let (finalFrames, totalCompositeMs): ([CGImage], Double) = await Task.detached(priority: .userInitiated) {
-            var frames: [CGImage] = []
+        // Streams to final_output.mp4 exactly like Loop 1/Loop 2 above.
+        // The one structural difference from before: this loop needs
+        // "frame i's reconstructed-background content" as its own per-frame
+        // input, which used to come from reading back Loop 1's
+        // reconstructedBgFrames[i] CGImage array. That array no longer
+        // exists (Loop 1 streams straight to disk and discards), so this
+        // calls renderReconFrame(i) -- the SAME closure Loop 1 used to
+        // produce that exact content -- to recompute it in place. See
+        // renderReconFrame's declaration above the switch statement for the
+        // full reasoning on why recomputing (option a) beats decoding
+        // reconstructed_background.mp4 back from disk (option b) here.
+        let finalURL = tmpDir.appendingPathComponent("final_output.mp4")
+        let finalWriter = try StreamingVideoWriter(outputURL: finalURL, width: backgroundFinal.width, height: backgroundFinal.height, fps: fps)
+        let (finalFrameCount, totalCompositeMs, finalMidPreview): (Int, Double, CGImage?) = try await Task.detached(priority: .userInitiated) {
+            var count = 0
             var totalMs = 0.0
+            var midPreview: CGImage?
             for i in 0..<n {
-                let frameBg = RGBBuffer.from(cgImage: reconstructedBgFrames[i])
+                let frameBg = renderReconFrame(i)
                 let (character, alpha) = Compositor.placeholderCharacter(width: backgroundFinal.width, height: backgroundFinal.height, frameIndex: i, totalFrames: n)
                 let result = Compositor.compositeOnly(background: frameBg, character: character, alpha: alpha)
                 totalMs += result.compositeMs
-                if let cg = result.composited.toCGImage() { frames.append(cg) }
+                if let cg = result.composited.toCGImage() {
+                    try finalWriter.append(cg)
+                    count += 1
+                    if i == n / 2 { midPreview = cg }
+                }
             }
-            return (frames, totalMs)
+            return (count, totalMs, midPreview)
         }.value
-        appendLog("  Final Compositing: \(finalFrames.count) frames, composite total=\(String(format: "%.1f", totalCompositeMs))ms")
-        if let mid = finalFrames[safe: n / 2] {
-            addPreview("FINAL\n(avatar on reconstructed bg, no relight)", mid)
+        appendLog("  Final Compositing: \(finalFrameCount) frames, composite total=\(String(format: "%.1f", totalCompositeMs))ms")
+        if let finalMidPreview {
+            addPreview("FINAL\n(avatar on reconstructed bg, no relight)", finalMidPreview)
         }
         setStage("Final Compositing", status: .done, timings: [("composite", totalCompositeMs)])
 
-        // Video export: save the real pipeline stages as .mp4 files so
-        // they can be viewed/scrubbed on-device via Photos, not just
-        // inspected as single still frames. Also kept in-memory (via
-        // outputVideos) so the Gallery/Compare cards can play them
-        // in-app immediately, without a round-trip through Photos.
+        // Video export: reconstructed_background.mp4 and
+        // silhouette_on_lightmap.mp4 were already written+saved inline,
+        // right after their own stage's loop finished (see bgWriter/
+        // silWriter above) -- only final_output.mp4 (just produced) still
+        // needs closing out and saving. All three videos ARE still real
+        // .mp4 files on disk, viewable/scrubbable via Photos exactly as
+        // before -- only WHEN each one gets closed/saved moved earlier,
+        // from one shared do-block at the very end to right after each
+        // stage's own loop, since there's no longer a stage-spanning
+        // [CGImage] array forcing everything to wait until the end.
         setStage("Export", status: .running)
-        appendLog("\n[diag] encoding output videos (\(n) real frames each, not repeated stills)...")
+        appendLog("\n[diag] finishing output videos (\(n) real frames each, not repeated stills)...")
         do {
-            let tmpDir = FileManager.default.temporaryDirectory
-            let fps: Int32 = 10 // matches the bundled clip's ~10fps sampling
-
-            outputVideos.append((label: "Masked Input", url: maskedURL))
-
-            if !reconstructedBgFrames.isEmpty {
-                let bgURL = tmpDir.appendingPathComponent("reconstructed_background.mp4")
-                try await Task.detached(priority: .userInitiated) {
-                    try VideoEncoder.encode(frames: reconstructedBgFrames, fps: fps, outputURL: bgURL)
-                }.value
-                outputVideos.append((label: "Reconstructed Background", url: bgURL))
-                try await VideoEncoder.saveToPhotoLibrary(url: bgURL)
-                appendLog("  Saved reconstructed_background.mp4 to Photos (\(reconstructedBgFrames.count) frames)")
-            }
-
-            if !silhouetteOnLightmapFrames.isEmpty {
-                let silURL = tmpDir.appendingPathComponent("silhouette_on_lightmap.mp4")
-                try await Task.detached(priority: .userInitiated) {
-                    try VideoEncoder.encode(frames: silhouetteOnLightmapFrames, fps: fps, outputURL: silURL)
-                }.value
-                outputVideos.append((label: "Silhouette on Lightmap", url: silURL))
-                try await VideoEncoder.saveToPhotoLibrary(url: silURL)
-                appendLog("  Saved silhouette_on_lightmap.mp4 to Photos (\(silhouetteOnLightmapFrames.count) frames)")
-            }
-
-            if !finalFrames.isEmpty {
-                let finalURL = tmpDir.appendingPathComponent("final_output.mp4")
-                try await Task.detached(priority: .userInitiated) {
-                    try VideoEncoder.encode(frames: finalFrames, fps: fps, outputURL: finalURL)
-                }.value
-                outputVideos.append((label: "Final Output", url: finalURL))
-                try await VideoEncoder.saveToPhotoLibrary(url: finalURL)
-                appendLog("  Saved final_output.mp4 to Photos (\(finalFrames.count) frames)")
-                appendLog("  NOTE: avatar itself is a static PLACEHOLDER cutout (no per-frame motion) -- background behind it is real per-frame video; a real WanAnimate avatar would also move per-frame.")
-            }
+            try await finalWriter.finish()
+            outputVideos.append((label: "Final Output", url: finalURL))
+            try await VideoEncoder.saveToPhotoLibrary(url: finalURL)
+            appendLog("  Saved final_output.mp4 to Photos (\(finalFrameCount) frames)")
+            appendLog("  NOTE: avatar itself is a static PLACEHOLDER cutout (no per-frame motion) -- background behind it is real per-frame video; a real WanAnimate avatar would also move per-frame.")
             setStage("Export", status: .done, detail: outputVideos.map { $0.label })
         } catch {
             appendLog("  Video export/save FAILED: \(error)")
