@@ -23,6 +23,8 @@
 		1A2B3C4D5E6F708192A3B4CF /* masked_video.mp4 in Resources */ = {isa = PBXBuildFile; fileRef = 2A2B3C4D5E6F708192A3B4D0 /* masked_video.mp4 */; };
 		1A2B3C4D5E6F708192A3B4D1 /* mask.mp4 in Resources */ = {isa = PBXBuildFile; fileRef = 2A2B3C4D5E6F708192A3B4D2 /* mask.mp4 */; };
 		3B3C4D5E6F708192A3B4C6D3 /* VideoEncoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3B3C4D5E6F708192A3B4C6D4 /* VideoEncoder.swift */; };
+		B6E1DFC371A4495881382798 /* PushPullFill.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3F09D4B875AF40C7991D7625 /* PushPullFill.swift */; };
+		A02C3569B651453588E681AE /* GrainMatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = F16D47FBD3094138A5755CA3 /* GrainMatcher.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -44,6 +46,8 @@
 		2A2B3C4D5E6F708192A3B4D0 /* masked_video.mp4 */ = {isa = PBXFileReference; lastKnownFileType = file; path = masked_video.mp4; sourceTree = "<group>"; };
 		2A2B3C4D5E6F708192A3B4D2 /* mask.mp4 */ = {isa = PBXFileReference; lastKnownFileType = file; path = mask.mp4; sourceTree = "<group>"; };
 		3B3C4D5E6F708192A3B4C6D4 /* VideoEncoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoEncoder.swift; sourceTree = "<group>"; };
+		3F09D4B875AF40C7991D7625 /* PushPullFill.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PushPullFill.swift; sourceTree = "<group>"; };
+		F16D47FBD3094138A5755CA3 /* GrainMatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GrainMatcher.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -82,6 +86,8 @@
 				2A2B3C4D5E6F708192A3B4CC /* LightmapExtractor.swift */,
 				2A2B3C4D5E6F708192A3B4CE /* Compositor.swift */,
 				3B3C4D5E6F708192A3B4C6D4 /* VideoEncoder.swift */,
+				3F09D4B875AF40C7991D7625 /* PushPullFill.swift */,
+				F16D47FBD3094138A5755CA3 /* GrainMatcher.swift */,
 				24D1D2B0591D41058A313829 /* Info.plist */,
 			);
 			path = BodySitaraBench;
@@ -197,6 +203,8 @@
 				1A2B3C4D5E6F708192A3B4CB /* LightmapExtractor.swift in Sources */,
 				1A2B3C4D5E6F708192A3B4CD /* Compositor.swift in Sources */,
 				3B3C4D5E6F708192A3B4C6D3 /* VideoEncoder.swift in Sources */,
+				B6E1DFC371A4495881382798 /* PushPullFill.swift in Sources */,
+				A02C3569B651453588E681AE /* GrainMatcher.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

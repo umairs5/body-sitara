@@ -169,6 +169,118 @@ final class LamaRunner {
         return (RGBBuffer(r: outR, g: outG, b: outB, width: plate.width, height: plate.height), timing)
     }
 
+    /// Result of the core-fill stage, mirroring Android's per-clip log
+    /// output (BackgroundInpaint.kt fillCore()) so the benchmark can report
+    /// which strategy actually ran.
+    struct CoreFillResult {
+        let filled: RGBBuffer
+        let method: String   // "lama-crop", "push-pull (anti-hallucination)", or "none (no core)"
+        let corePct: Double  // % of frame that was core
+        let timing: StageTiming?
+    }
+
+    /// Core-fill entry point matching Android's fillCore() (BackgroundInpaint.kt
+    /// lines 660-700): crops LaMa's input to a PADDED SQUARE around the
+    /// core's bounding box (not the whole frame downscaled to inputSize),
+    /// so the neural fill resolves the hole at much higher effective
+    /// resolution, then grafts the result back into ONLY the true
+    /// (undilated) `core` pixels -- keeping the real trimmed-mean ring
+    /// around it untouched. If the core exceeds 35% of the frame (the
+    /// near-static-clip failure case: a huge person-shaped hole invites
+    /// LaMa to hallucinate a person/statue-like blob), skips LaMa entirely
+    /// and falls back to PushPullFill (structureless, cannot hallucinate a
+    /// person by construction). Finishes with GrainMatcher so the fill's
+    /// noise floor matches the surrounding real background.
+    func fillCore(plate: RGBBuffer, core: [Bool]) throws -> CoreFillResult {
+        let w = plate.width, h = plate.height
+        let corePx = core.filter { $0 }.count
+        let corePct = 100.0 * Double(corePx) / Double(w * h)
+
+        guard corePx > 0 else {
+            return CoreFillResult(filled: plate, method: "none (no core)", corePct: 0, timing: nil)
+        }
+
+        // §2b anti-hallucination guard, matching Android's `corePx > np *
+        // 0.35`: a very large person-shaped hole risks LaMa inventing a
+        // person. Fall to structureless push-pull instead.
+        if corePct > 35.0 {
+            let filled = PushPullFill.fill(plate: plate, hole: core)
+            let grained = GrainMatcher.apply(plate: filled, core: core)
+            return CoreFillResult(filled: grained, method: "push-pull (anti-hallucination, core \(String(format: "%.1f", corePct))% > 35%)", corePct: corePct, timing: nil)
+        }
+
+        // Padded context ring around the core so LaMa gets surrounding
+        // real texture to key off (Android's CORE_DILATE=3 dilation before
+        // computing the bbox, plus pad=24 around that bbox).
+        let coreDilated = BackgroundReconstructor.dilate(core, width: w, height: h, radius: 3)
+        guard let bbox = Self.boundingBox(of: coreDilated, width: w, height: h) else {
+            return CoreFillResult(filled: plate, method: "none (no core)", corePct: 0, timing: nil)
+        }
+
+        let pad = 24
+        let side = min(max(bbox.maxX - bbox.minX + 1, bbox.maxY - bbox.minY + 1) + 2 * pad, max(w, h))
+        let cw = min(side, w), ch = min(side, h)
+        let cx0 = min(max((bbox.minX + bbox.maxX) / 2 - cw / 2, 0), w - cw)
+        let cy0 = min(max((bbox.minY + bbox.maxY) / 2 - ch / 2, 0), h - ch)
+
+        var cropR = [Float](repeating: 0, count: cw * ch)
+        var cropG = [Float](repeating: 0, count: cw * ch)
+        var cropB = [Float](repeating: 0, count: cw * ch)
+        var cropHole = [Bool](repeating: false, count: cw * ch)
+        for yy in 0..<ch {
+            for xx in 0..<cw {
+                let sp = (cy0 + yy) * w + (cx0 + xx)
+                let dp = yy * cw + xx
+                cropR[dp] = plate.r[sp]; cropG[dp] = plate.g[sp]; cropB[dp] = plate.b[sp]
+                cropHole[dp] = coreDilated[sp]
+            }
+        }
+        let cropBuf = RGBBuffer(r: cropR, g: cropG, b: cropB, width: cw, height: ch)
+
+        guard let cropImage = cropBuf.toCGImage() else {
+            throw NSError(domain: "LamaRunner", code: 7, userInfo: [NSLocalizedDescriptionKey: "failed to rasterize core crop"])
+        }
+        let cropMaskImage = Self.maskToCGImage(cropHole, width: cw, height: ch)
+        let resizedImage = Self.resizeSquare(cropImage, to: Self.inputSize)
+        let resizedMask = Self.resizeSquare(cropMaskImage, to: Self.inputSize)
+
+        let (filledUIImage, timing) = try fill(image: resizedImage, mask: resizedMask)
+        guard let filledCG = filledUIImage.cgImage else {
+            throw NSError(domain: "LamaRunner", code: 6, userInfo: [NSLocalizedDescriptionKey: "no cgImage on LaMa output"])
+        }
+        let filledCropFull = Self.resizeSquareBackToOriginal(filledCG, width: cw, height: ch)
+        let filledCropBuf = RGBBuffer.from(cgImage: filledCropFull)
+
+        // Graft the LaMa result back ONLY into the true (undilated) core --
+        // keeps the real trimmed-mean ring intact right up to the core edge.
+        var outR = plate.r, outG = plate.g, outB = plate.b
+        for yy in 0..<ch {
+            for xx in 0..<cw {
+                let sp = (cy0 + yy) * w + (cx0 + xx)
+                guard core[sp] else { continue }
+                let dp = yy * cw + xx
+                outR[sp] = filledCropBuf.r[dp]; outG[sp] = filledCropBuf.g[dp]; outB[sp] = filledCropBuf.b[dp]
+            }
+        }
+        let lamaFilled = RGBBuffer(r: outR, g: outG, b: outB, width: w, height: h)
+        let grained = GrainMatcher.apply(plate: lamaFilled, core: core)
+        return CoreFillResult(filled: grained, method: "lama-crop (\(cw)x\(ch) @ (\(cx0),\(cy0)))", corePct: corePct, timing: timing)
+    }
+
+    private static func boundingBox(of mask: [Bool], width: Int, height: Int) -> (minX: Int, minY: Int, maxX: Int, maxY: Int)? {
+        var minX = width, minY = height, maxX = -1, maxY = -1
+        for y in 0..<height {
+            for x in 0..<width where mask[y * width + x] {
+                if x < minX { minX = x }
+                if x > maxX { maxX = x }
+                if y < minY { minY = y }
+                if y > maxY { maxY = y }
+            }
+        }
+        guard maxX >= 0 else { return nil }
+        return (minX, minY, maxX, maxY)
+    }
+
     private static func maskToCGImage(_ neverRevealed: [Bool], width: Int, height: Int) -> CGImage {
         var raw = [UInt8](repeating: 0, count: width * height)
         for i in 0..<(width * height) { raw[i] = neverRevealed[i] ? 255 : 0 }

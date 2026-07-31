@@ -14,8 +14,28 @@ import UIKit
 /// comparable to Android's measured 33.59s/34.1s figures at the same
 /// pipeline stage -- not just the LaMa call in isolation.
 enum BackgroundReconstructor {
+    /// px: dilate the person mask OUT before sampling, so codec-bleed /
+    /// silhouette-edge pixels never contaminate the plate -- matches
+    /// Android's MASK_DILATE (BackgroundInpaint.kt).
+    static let maskDilate = 5
+    /// Minimum number of valid (real-background) temporal samples a pixel
+    /// needs before it's trusted as "revealed" -- matches Android's
+    /// minCov = max(3, 5% of sampled frames). A pixel seen in only 1-2
+    /// frames out of hundreds is not reliably real background (could be a
+    /// sliver of alignment error), so it's still routed to the neural/
+    /// push-pull core if it was EVER part of the hole union.
+    static func minCoverage(sampledFrames: Int) -> Int { max(3, sampledFrames / 20) }
+
     struct Result {
         let plateBeforeLama: RGBBuffer
+        /// True core: pixels with < minCoverage real samples AND part of
+        /// the hole union -- these need neural/push-pull fill. Distinct
+        /// from `neverRevealed` (zero samples) per Android's core vs.
+        /// never-revealed distinction (BackgroundInpaint.kt line 422-426).
+        let core: [Bool]
+        /// Union of the (dilated) hole across every aligned frame -- the
+        /// full region that ever needed reconstruction.
+        let union: [Bool]
         let neverRevealed: [Bool]
         let alignMs: Double
         let trimmedMeanMs: Double
@@ -174,17 +194,72 @@ enum BackgroundReconstructor {
         return top * (1 - fy) + bottom * fy
     }
 
+    /// In-place binary dilation by radius `r` (separable max-filter over a
+    /// [Bool] plane) -- matches Android's dilateInPlace(). Only ever adds
+    /// `true` pixels, never removes them.
+    static func dilate(_ mask: [Bool], width: Int, height: Int, radius: Int) -> [Bool] {
+        guard radius > 0 else { return mask }
+        var tmp = [Bool](repeating: false, count: mask.count)
+        for y in 0..<height {
+            let row = y * width
+            for x in 0..<width {
+                var on = false
+                var d = -radius
+                while d <= radius {
+                    let xx = x + d
+                    if xx >= 0, xx < width, mask[row + xx] { on = true; break }
+                    d += 1
+                }
+                tmp[row + x] = on
+            }
+        }
+        var out = [Bool](repeating: false, count: mask.count)
+        for x in 0..<width {
+            for y in 0..<height {
+                var on = false
+                var d = -radius
+                while d <= radius {
+                    let yy = y + d
+                    if yy >= 0, yy < height, tmp[yy * width + x] { on = true; break }
+                    d += 1
+                }
+                out[y * width + x] = on
+            }
+        }
+        return out
+    }
+
+    /// Mean luma over the non-hole (real background) pixels of a frame --
+    /// used to exposure-normalize each frame's samples before aggregation
+    /// (matches Android's meanLuma()/referenceMeanLuma()).
+    private static func meanLuma(_ frame: RGBBuffer, hole: [Bool]) -> Double {
+        var sum = 0.0
+        var count = 0
+        for i in 0..<(frame.width * frame.height) where !hole[i] {
+            sum += (Double(frame.r[i]) + Double(frame.g[i]) + Double(frame.b[i])) / 3.0
+            count += 1
+        }
+        return count > 0 ? sum / Double(count) : 128.0
+    }
+
     /// Per-pixel temporal trimmed-mean across all aligned frames: for each
     /// pixel, gather values from every frame where it's real background
     /// (not person-hole), sort, and mean the middle 60% (drop lowest/
     /// highest 20% of the VALID samples, matching robustCenter() /
     /// trimmed_mean_vectorized()'s per-pixel-n_valid semantics -- not a
-    /// fixed global trim count). Runs once per color channel.
-    static func trimmedMean(channelStack: [[Float]], validStack: [[Bool]], width: Int, height: Int, trimFrac: Float = 0.20) -> (plate: [Float], neverRevealed: [Bool]) {
+    /// fixed global trim count). Runs once per color channel. Returns the
+    /// aggregated plate channel plus `neverRevealed` (zero real samples)
+    /// and `lowCoverage` (some samples, but fewer than minCov -- still
+    /// routed to the core if part of the hole union at the call site).
+    /// Matches Android's per-pixel k>=minCov / 0<k<minCov / k==0 three-way
+    /// split (aggregatePlate() line 422-426).
+    static func trimmedMean(channelStack: [[Float]], validStack: [[Bool]], width: Int, height: Int, trimFrac: Float = 0.20) -> (plate: [Float], neverRevealed: [Bool], lowCoverage: [Bool]) {
         let n = channelStack.count
         let pixCount = width * height
+        let minCov = minCoverage(sampledFrames: n)
         var plate = [Float](repeating: 0, count: pixCount)
         var neverRevealed = [Bool](repeating: true, count: pixCount)
+        var lowCoverage = [Bool](repeating: false, count: pixCount)
 
         var samples = [Float](repeating: 0, count: n)
         for p in 0..<pixCount {
@@ -195,6 +270,7 @@ enum BackgroundReconstructor {
             }
             guard count > 0 else { continue }
             neverRevealed[p] = false
+            lowCoverage[p] = count < minCov
 
             let validSlice = samples[0..<count].sorted()
             let lo = Int(Float(count) * trimFrac)
@@ -206,42 +282,82 @@ enum BackgroundReconstructor {
                 plate[p] = kept.reduce(0, +) / Float(kept.count)
             }
         }
-        return (plate, neverRevealed)
+        return (plate, neverRevealed, lowCoverage)
     }
 
-    /// Full stage: align every frame to frame 0, then trimmed-mean-aggregate
-    /// all channels. Does NOT run LaMa (caller does that separately via
-    /// LamaRunner, matching the existing per-stage timing discipline).
+    /// Full stage: align every frame to frame 0, dilate each frame's mask
+    /// (keeps codec-bleed/silhouette-edge pixels out of the plate samples,
+    /// matching MASK_DILATE), exposure-normalize each frame's samples to
+    /// the reference frame's mean luma before aggregating, then
+    /// trimmed-mean-aggregate all channels. Does NOT run LaMa/push-pull
+    /// (caller does that separately via LamaRunner, matching the existing
+    /// per-stage timing discipline).
     static func reconstruct(colorFrames: [RGBBuffer], masks: [MaskBuffer]) -> Result {
         precondition(!colorFrames.isEmpty, "need at least 1 frame")
         let width = colorFrames[0].width
         let height = colorFrames[0].height
         let n = colorFrames.count
+        let pixCount = width * height
 
         let tAlignStart = CFAbsoluteTimeGetCurrent()
         let refGray = colorFrames[0].grayscale()
 
+        // Dilate every frame's hole mask BEFORE alignment/sampling so the
+        // person's silhouette edge (and any codec-bleed bordering it)
+        // never counts as "real background" -- matches Android sampling
+        // person-holes dilated by MASK_DILATE ahead of aggregatePlate().
+        let dilatedHoles = masks.map { dilate($0.isPerson, width: width, height: height, radius: maskDilate) }
+        let refMeanLuma = meanLuma(colorFrames[0], hole: dilatedHoles[0])
+
         var alignedR = [colorFrames[0].r]
         var alignedG = [colorFrames[0].g]
         var alignedB = [colorFrames[0].b]
-        var alignedValid = [masks[0].isPerson.map { !$0 }]
+        var alignedValid = [dilatedHoles[0].map { !$0 }]
+        var union = dilatedHoles[0]
 
         for i in 1..<n {
             let tgtGray = colorFrames[i].grayscale()
             let (dx, dy) = alignPyramid(ref: refGray, tgt: tgtGray, width: width, height: height)
-            alignedR.append(warpTranslate(colorFrames[i].r, width: width, height: height, dx: dx, dy: dy, nearest: false))
-            alignedG.append(warpTranslate(colorFrames[i].g, width: width, height: height, dx: dx, dy: dy, nearest: false))
-            alignedB.append(warpTranslate(colorFrames[i].b, width: width, height: height, dx: dx, dy: dy, nearest: false))
-            let maskF = masks[i].isPerson.map { $0 ? Float(1) : Float(0) }
+
+            // Exposure-normalize this frame's samples to the reference's
+            // mean luma before they enter the temporal stack -- otherwise
+            // auto-exposure drift across frames blurs/smears the trimmed-
+            // mean plate even with perfect alignment (matches Android's
+            // per-frame gain in aggregatePlate(), clamped [0.85, 1.18]).
+            let frameMeanLuma = meanLuma(colorFrames[i], hole: dilatedHoles[i])
+            let gain = Float(min(1.18, max(0.85, refMeanLuma / max(1.0, frameMeanLuma))))
+            let gainedR = colorFrames[i].r.map { min(255, max(0, $0 * gain)) }
+            let gainedG = colorFrames[i].g.map { min(255, max(0, $0 * gain)) }
+            let gainedB = colorFrames[i].b.map { min(255, max(0, $0 * gain)) }
+
+            alignedR.append(warpTranslate(gainedR, width: width, height: height, dx: dx, dy: dy, nearest: false))
+            alignedG.append(warpTranslate(gainedG, width: width, height: height, dx: dx, dy: dy, nearest: false))
+            alignedB.append(warpTranslate(gainedB, width: width, height: height, dx: dx, dy: dy, nearest: false))
+            let maskF = dilatedHoles[i].map { $0 ? Float(1) : Float(0) }
             let warpedMaskF = warpTranslate(maskF, width: width, height: height, dx: dx, dy: dy, nearest: true)
-            alignedValid.append(warpedMaskF.map { $0 < 0.5 })
+            let warpedHole = warpedMaskF.map { $0 >= 0.5 }
+            alignedValid.append(warpedHole.map { !$0 })
+            for p in 0..<pixCount where warpedHole[p] { union[p] = true }
         }
         let alignMs = (CFAbsoluteTimeGetCurrent() - tAlignStart) * 1000
 
         let tTrimStart = CFAbsoluteTimeGetCurrent()
-        var (rPlate, neverRevealed) = trimmedMean(channelStack: alignedR, validStack: alignedValid, width: width, height: height)
-        var (gPlate, _) = trimmedMean(channelStack: alignedG, validStack: alignedValid, width: width, height: height)
-        var (bPlate, _) = trimmedMean(channelStack: alignedB, validStack: alignedValid, width: width, height: height)
+        let (rPlate, neverRevealedR, lowCovR) = trimmedMean(channelStack: alignedR, validStack: alignedValid, width: width, height: height)
+        let (gPlate, _, _) = trimmedMean(channelStack: alignedG, validStack: alignedValid, width: width, height: height)
+        let (bPlate, _, _) = trimmedMean(channelStack: alignedB, validStack: alignedValid, width: width, height: height)
+        var rPlateOut = rPlate, gPlateOut = gPlate, bPlateOut = bPlate
+        var neverRevealed = neverRevealedR
+
+        // True core = pixels the temporal aggregation can't be trusted for:
+        // either never revealed at all, or revealed in too few frames to
+        // trust (lowCoverage) while still being part of the hole union at
+        // some point -- matches Android's core flag (aggregatePlate() line
+        // 422-426), NOT a simple "revealed anywhere" test.
+        var core = [Bool](repeating: false, count: pixCount)
+        for p in 0..<pixCount {
+            if neverRevealed[p] { core[p] = true }
+            else if lowCovR[p] && union[p] { core[p] = true }
+        }
 
         // Only pixels the REFERENCE frame's own mask actually covered need
         // reconstruction at all -- everywhere else is already real,
@@ -256,15 +372,17 @@ enum BackgroundReconstructor {
         // (reveal_and_fill_static.py) producing a clean, sharp result on
         // the same clip once applied.
         let needsReconstruction = masks[0].isPerson
-        for p in 0..<(width * height) where !needsReconstruction[p] {
-            rPlate[p] = colorFrames[0].r[p]
-            gPlate[p] = colorFrames[0].g[p]
-            bPlate[p] = colorFrames[0].b[p]
+        for p in 0..<pixCount where !needsReconstruction[p] {
+            rPlateOut[p] = colorFrames[0].r[p]
+            gPlateOut[p] = colorFrames[0].g[p]
+            bPlateOut[p] = colorFrames[0].b[p]
             neverRevealed[p] = false
+            core[p] = false
+            union[p] = false
         }
         let trimmedMeanMs = (CFAbsoluteTimeGetCurrent() - tTrimStart) * 1000
 
-        let plate = RGBBuffer(r: rPlate, g: gPlate, b: bPlate, width: width, height: height)
-        return Result(plateBeforeLama: plate, neverRevealed: neverRevealed, alignMs: alignMs, trimmedMeanMs: trimmedMeanMs)
+        let plate = RGBBuffer(r: rPlateOut, g: gPlateOut, b: bPlateOut, width: width, height: height)
+        return Result(plateBeforeLama: plate, core: core, union: union, neverRevealed: neverRevealed, alignMs: alignMs, trimmedMeanMs: trimmedMeanMs)
     }
 }

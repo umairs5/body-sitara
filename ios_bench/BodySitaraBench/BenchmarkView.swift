@@ -137,24 +137,28 @@ struct BenchmarkView: View {
 
         appendLog("[diag] running Background Reconstruction (align pyramid + trimmed-mean, on-device)...")
         let reconResult = BackgroundReconstructor.reconstruct(colorFrames: colorBuffers, masks: maskBuffers)
-        let neverRevealedPct = 100.0 * Double(reconResult.neverRevealed.filter { $0 }.count) / Double(reconResult.neverRevealed.count)
-        appendLog("  align=\(String(format: "%.0f", reconResult.alignMs))ms trimmed-mean=\(String(format: "%.0f", reconResult.trimmedMeanMs))ms (never-revealed core: \(String(format: "%.1f", neverRevealedPct))%)")
-        addPreview("Plate BEFORE LaMa\n(trimmed-mean)", reconResult.plateBeforeLama.toCGImage())
-        addPreview("Never-revealed core\n(white=needs LaMa)", Self.maskPreviewImage(reconResult.neverRevealed, width: reconResult.plateBeforeLama.width, height: reconResult.plateBeforeLama.height))
+        let corePctPreview = 100.0 * Double(reconResult.core.filter { $0 }.count) / Double(reconResult.core.count)
+        appendLog("  align=\(String(format: "%.0f", reconResult.alignMs))ms trimmed-mean=\(String(format: "%.0f", reconResult.trimmedMeanMs))ms (neural/push-pull core: \(String(format: "%.1f", corePctPreview))%)")
+        addPreview("Plate BEFORE fill\n(trimmed-mean)", reconResult.plateBeforeLama.toCGImage())
+        addPreview("Core\n(white=needs fill)", Self.maskPreviewImage(reconResult.core, width: reconResult.plateBeforeLama.width, height: reconResult.plateBeforeLama.height))
 
-        appendLog("[diag] running LaMa core-fill (once per clip, on never-revealed core only)...")
+        appendLog("[diag] running core-fill (bbox-cropped LaMa, or push-pull if core > 35% of frame)...")
         let lamaRunner = try LamaRunner(configuration: config)
-        var lamaTiming: LamaRunner.StageTiming!
-        var backgroundFinal: RGBBuffer!
+        var coreFillResult: LamaRunner.CoreFillResult!
         try autoreleasepool {
-            let (filled, timing) = try lamaRunner.fillPixels(plate: reconResult.plateBeforeLama, neverRevealed: reconResult.neverRevealed)
-            backgroundFinal = filled
-            lamaTiming = timing
+            coreFillResult = try lamaRunner.fillCore(plate: reconResult.plateBeforeLama, core: reconResult.core)
         }
-        let bgReconTotalMs = reconResult.alignMs + reconResult.trimmedMeanMs + lamaTiming.buildMs + lamaTiming.runMs + lamaTiming.postprocessMs
-        appendLog("  LaMa: build=\(String(format: "%.1f", lamaTiming.buildMs))ms run=\(String(format: "%.1f", lamaTiming.runMs))ms post=\(String(format: "%.1f", lamaTiming.postprocessMs))ms")
+        let backgroundFinal = coreFillResult.filled
+        let lamaTiming = coreFillResult.timing
+        let lamaStageMs = (lamaTiming?.buildMs ?? 0) + (lamaTiming?.runMs ?? 0) + (lamaTiming?.postprocessMs ?? 0)
+        let bgReconTotalMs = reconResult.alignMs + reconResult.trimmedMeanMs + lamaStageMs
+        if let t = lamaTiming {
+            appendLog("  core-fill (\(coreFillResult.method)): build=\(String(format: "%.1f", t.buildMs))ms run=\(String(format: "%.1f", t.runMs))ms post=\(String(format: "%.1f", t.postprocessMs))ms")
+        } else {
+            appendLog("  core-fill: \(coreFillResult.method) (no LaMa call)")
+        }
         appendLog("  Background Reconstruction TOTAL: \(String(format: "%.0f", bgReconTotalMs))ms (\(n) frames, \(maskedVideo.width)x\(maskedVideo.height))")
-        addPreview("Background FINAL\n(after LaMa)", backgroundFinal.toCGImage())
+        addPreview("Background FINAL\n(after core-fill)", backgroundFinal.toCGImage())
 
         // Real per-frame background VIDEO: for EACH frame i, the hole that
         // needs filling is THAT FRAME's own mask (maskBuffers[i]), not
