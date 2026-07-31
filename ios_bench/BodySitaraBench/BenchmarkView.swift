@@ -292,35 +292,53 @@ struct BenchmarkView: View {
         setStage("Load & Align", status: .running)
         appendLog("[diag] loading real clip frames...")
         let tLoadStart = CFAbsoluteTimeGetCurrent()
-        let maskedVideo = try VideoFrameLoader.loadFrames(url: maskedURL)
-        let maskVideo = try VideoFrameLoader.loadFrames(url: maskURL)
+        // Stream-decode straight to the compact per-frame types
+        // (RGBBuffer8/PackedMaskFrame), converting each CGImage the moment
+        // it's decoded instead of first materializing a [CGImage] for the
+        // whole clip. This is a THIRD, previously-unaddressed memory sink
+        // upstream of the two already-fixed ones (BackgroundReconstructor's
+        // internal aligned-frame stack, and colorBuffers/maskBuffers below
+        // being UInt8/bit-packed instead of Float32/[Bool]): the earlier
+        // `VideoFrameLoader.loadFrames` returned ALL decoded CGImages for a
+        // clip at once, so loading BOTH masked_video and mask.mp4 held
+        // ~3.9GB of CGImage backing stores simultaneously on a real
+        // 300-frame/1280x1280 clip -- enough to jetsam-kill on its own,
+        // matching the observed "crash during Load & Align, before
+        // Background Reconstruction" symptom (2026-07-31). See
+        // VideoFrameLoader.swift's header doc for the full before/after
+        // memory math. Only index 0 is captured as a CGImage during this
+        // pass (for the "Input frame 0"/"Input mask 0" previews below) --
+        // the mid-clip preview needs index n/2, which isn't known until
+        // BOTH videos are loaded (n depends on both counts), so it's
+        // reconstructed from the already-decoded colorBuffers afterward
+        // (single O(1) frame, not a re-decode).
+        let maskedVideo = try VideoFrameLoader.loadFramesAsRGBBuffer8(url: maskedURL, previewIndices: [0])
+        let maskVideo = try VideoFrameLoader.loadFramesAsPackedMask(url: maskURL, previewIndices: [0])
         let loadMs = (CFAbsoluteTimeGetCurrent() - tLoadStart) * 1000
         let n = min(maskedVideo.frames.count, maskVideo.frames.count)
         appendLog("[diag] loaded \(n) frames (\(maskedVideo.width)x\(maskedVideo.height)) in \(String(format: "%.0f", loadMs))ms")
-
-        addPreview("Input frame 0\n(masked_video)", maskedVideo.frames[0])
-        addPreview("Input mask 0\n(mask.mp4)", maskVideo.frames[0])
-        addPreview("Input frame \(n/2)\n(mid-clip)", maskedVideo.frames[n / 2])
 
         // colorBuffers/maskBuffers hold EVERY frame of the clip
         // simultaneously for the rest of this function's duration (used at
         // multiple later pipeline stages, not just as reconstruct()'s
         // input) -- so they MUST be the compact UInt8/bit-packed types
         // (RGBBuffer8/PackedMaskFrame), never the Float32 RGBBuffer/[Bool]
-        // MaskBuffer. This was the actual root cause of a real on-device
-        // jetsam kill on a 300-frame/1280x1280 clip (2026-07-31): an
-        // earlier fix narrowed BackgroundReconstructor's INTERNAL aligned-
-        // frame copy to UInt8, but this array -- the thing that fix's
-        // input actually pointed at -- was still N full Float32
-        // RGBBuffers. See PixelBuffer.swift's RGBBuffer8/PackedMaskFrame
-        // doc comments for the full before/after memory math (~5.9GB ->
-        // ~1.47GB for colorBuffers alone at 300 frames/1280x1280).
-        appendLog("[diag] converting frames to RGB/mask buffers...")
-        let framesToConvert = Array(maskedVideo.frames[0..<n])
-        let masksToConvert = Array(maskVideo.frames[0..<n])
-        let (colorBuffers, maskBuffers) = await Task.detached(priority: .userInitiated) {
-            (framesToConvert.map { RGBBuffer8.from(cgImage: $0) }, masksToConvert.map { PackedMaskFrame.from(cgImage: $0) })
-        }.value
+        // MaskBuffer. This was a previously-fixed root cause of a real
+        // on-device jetsam kill on a 300-frame/1280x1280 clip: an earlier
+        // fix narrowed BackgroundReconstructor's INTERNAL aligned-frame
+        // copy to UInt8, but this array -- the thing that fix's input
+        // actually pointed at -- was still N full Float32 RGBBuffers. See
+        // PixelBuffer.swift's RGBBuffer8/PackedMaskFrame doc comments for
+        // the full before/after memory math (~5.9GB -> ~1.47GB for
+        // colorBuffers alone at 300 frames/1280x1280). The loader above now
+        // produces these arrays directly (no [CGImage] -> map{} step), so
+        // trim to the shared frame count n.
+        let colorBuffers = n == maskedVideo.frames.count ? maskedVideo.frames : Array(maskedVideo.frames[0..<n])
+        let maskBuffers = n == maskVideo.frames.count ? maskVideo.frames : Array(maskVideo.frames[0..<n])
+
+        addPreview("Input frame 0\n(masked_video)", maskedVideo.previews[0])
+        addPreview("Input mask 0\n(mask.mp4)", maskVideo.previews[0])
+        addPreview("Input frame \(n/2)\n(mid-clip)", colorBuffers[n / 2].toFloatRGBBuffer().toCGImage())
         setStage("Load & Align", status: .done, timings: [("load", loadMs)], detail: ["\(n) frames @ \(maskedVideo.width)x\(maskedVideo.height)"])
 
         setStage("Background Reconstruction", status: .running)
