@@ -302,11 +302,24 @@ struct BenchmarkView: View {
         addPreview("Input mask 0\n(mask.mp4)", maskVideo.frames[0])
         addPreview("Input frame \(n/2)\n(mid-clip)", maskedVideo.frames[n / 2])
 
+        // colorBuffers/maskBuffers hold EVERY frame of the clip
+        // simultaneously for the rest of this function's duration (used at
+        // multiple later pipeline stages, not just as reconstruct()'s
+        // input) -- so they MUST be the compact UInt8/bit-packed types
+        // (RGBBuffer8/PackedMaskFrame), never the Float32 RGBBuffer/[Bool]
+        // MaskBuffer. This was the actual root cause of a real on-device
+        // jetsam kill on a 300-frame/1280x1280 clip (2026-07-31): an
+        // earlier fix narrowed BackgroundReconstructor's INTERNAL aligned-
+        // frame copy to UInt8, but this array -- the thing that fix's
+        // input actually pointed at -- was still N full Float32
+        // RGBBuffers. See PixelBuffer.swift's RGBBuffer8/PackedMaskFrame
+        // doc comments for the full before/after memory math (~5.9GB ->
+        // ~1.47GB for colorBuffers alone at 300 frames/1280x1280).
         appendLog("[diag] converting frames to RGB/mask buffers...")
         let framesToConvert = Array(maskedVideo.frames[0..<n])
         let masksToConvert = Array(maskVideo.frames[0..<n])
         let (colorBuffers, maskBuffers) = await Task.detached(priority: .userInitiated) {
-            (framesToConvert.map { RGBBuffer.from(cgImage: $0) }, masksToConvert.map { MaskBuffer.from(cgImage: $0) })
+            (framesToConvert.map { RGBBuffer8.from(cgImage: $0) }, masksToConvert.map { PackedMaskFrame.from(cgImage: $0) })
         }.value
         setStage("Load & Align", status: .done, timings: [("load", loadMs)], detail: ["\(n) frames @ \(maskedVideo.width)x\(maskedVideo.height)"])
 
@@ -380,8 +393,14 @@ struct BenchmarkView: View {
             reconstructedBgFrames = await Task.detached(priority: .userInitiated) {
                 var frames: [CGImage] = []
                 for i in 0..<n {
-                    var outR = colorBuffers[i].r, outG = colorBuffers[i].g, outB = colorBuffers[i].b
-                    let frameMask = maskBuffers[i].isPerson
+                    // Promote just THIS frame's UInt8 color to Float32 for
+                    // pasting against backgroundFinal (already Float32) --
+                    // discarded at the end of this iteration, never
+                    // retained alongside the other N-1 frames.
+                    var outR = colorBuffers[i].r.map { Float($0) }
+                    var outG = colorBuffers[i].g.map { Float($0) }
+                    var outB = colorBuffers[i].b.map { Float($0) }
+                    let frameMask = maskBuffers[i].unpacked().isPerson
                     for p in 0..<(backgroundFinal.width * backgroundFinal.height) where frameMask[p] {
                         outR[p] = backgroundFinal.r[p]
                         outG[p] = backgroundFinal.g[p]
@@ -418,7 +437,12 @@ struct BenchmarkView: View {
             reconstructedBgFrames = await Task.detached(priority: .userInitiated) {
                 var frames: [CGImage] = []
                 for i in 0..<n {
-                    let composited = BackgroundReconstructor.compositeFrame(colorBuffers[i], mask: maskBuffers[i], frameIndex: i, windows: windows)
+                    // Per-frame Float32/[Bool] promotion, scoped to this
+                    // loop iteration only -- compositeFrame operates on
+                    // ONE frame at a time by design, so there is no reason
+                    // for its input to be anything but the existing
+                    // Float32 RGBBuffer/MaskBuffer API.
+                    let composited = BackgroundReconstructor.compositeFrame(colorBuffers[i].toFloatRGBBuffer(), mask: maskBuffers[i].unpacked(), frameIndex: i, windows: windows)
                     if let cg = composited.toCGImage() { frames.append(cg) }
                 }
                 return frames
@@ -464,8 +488,8 @@ struct BenchmarkView: View {
         let silhouetteOnLightmapFrames: [CGImage] = await Task.detached(priority: .userInitiated) {
             var frames: [CGImage] = []
             for i in 0..<n {
-                let alpha = maskBuffers[i].isPerson.map { $0 ? Float(1) : Float(0) }
-                let result = Compositor.compositeOnly(background: lightmapForComposite, character: colorBuffers[i], alpha: alpha)
+                let alpha = maskBuffers[i].unpacked().isPerson.map { $0 ? Float(1) : Float(0) }
+                let result = Compositor.compositeOnly(background: lightmapForComposite, character: colorBuffers[i].toFloatRGBBuffer(), alpha: alpha)
                 if let cg = result.composited.toCGImage() { frames.append(cg) }
             }
             return frames

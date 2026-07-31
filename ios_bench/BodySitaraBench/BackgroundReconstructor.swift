@@ -74,6 +74,32 @@ import CoreML
 /// pixel, per frame) for numerical precision during aggregation -- only
 /// the AT-REST storage moved to UInt8, matching the task's guidance to
 /// keep accumulation precision while cutting resident footprint.
+///
+/// SECOND MEMORY GAP FIXED 2026-07-31 (this fix was INCOMPLETE the first
+/// time): the rewrite above narrowed the INTERNAL aligned-frame copy this
+/// file builds inside `reconstructStatic`/`reconstructDynamic`, but never
+/// touched the INPUT to `reconstruct()`. `colorFrames` was still typed
+/// `[RGBBuffer]` -- i.e. the CALLER (BenchmarkView.swift's
+/// `colorBuffers`) had to build and hold N full-resolution Float32
+/// RGBBuffers simultaneously just to call this function at all, before a
+/// single byte of the (now-fixed) UInt8 stack existed. At 300 frames,
+/// 1280x1280: 300 * 1280*1280*4 bytes/channel*3 channels = ~5.9GB for
+/// THAT array alone -- comfortably larger than the ~1.5GB internal fix
+/// this header already documented, which is why a real 300-frame on-
+/// device run still jetsam-killed even after the earlier fix landed.
+///
+/// FIX: `reconstruct()` (and everything it calls: `computeTrajectory`,
+/// `reconstructStatic`, `reconstructDynamic`, `buildWindow`,
+/// `compositeFrame`) now takes `[RGBBuffer8]` (UInt8-native, see
+/// PixelBuffer.swift) instead of `[RGBBuffer]`, and `[PackedMaskFrame]`
+/// (bit-packed, reusing `PackedBoolPlane` below) instead of
+/// `[MaskBuffer]`. Every call site that needs one FRAME's Float32/`[Bool]`
+/// data converts that ONE frame on the fly (`.toFloatRGBBuffer()`/
+/// `.unpacked()`), uses it for that frame's alignment/gain/trajectory
+/// math, and lets it fall out of scope -- never retaining a second
+/// N-length Float32/`[Bool]` array alongside the UInt8/packed one. See
+/// PixelBuffer.swift's `RGBBuffer8`/`PackedMaskFrame` doc comments for the
+/// full before/after memory math at this input-loading layer.
 enum BackgroundReconstructor {
     /// px: dilate the person mask OUT before sampling, so codec-bleed /
     /// silhouette-edge pixels never contaminate the plate -- matches
@@ -479,7 +505,13 @@ enum BackgroundReconstructor {
     /// (computeTrajectory), mirroring Android's
     /// `if (traj.needsWindowing) { ...windowed... } else { ...static... }`
     /// structure (BackgroundInpaint.kt).
-    static func reconstruct(colorFrames: [RGBBuffer], masks: [MaskBuffer]) -> Result {
+    ///
+    /// `colorFrames`/`masks` are UInt8-native/bit-packed (`RGBBuffer8`/
+    /// `PackedMaskFrame`), NOT the Float32 `RGBBuffer`/`MaskBuffer` this
+    /// function used before 2026-07-31 -- see the enum's header doc for
+    /// why (this is the fix for the input-layer OOM gap the previous
+    /// UInt8-stack rewrite missed).
+    static func reconstruct(colorFrames: [RGBBuffer8], masks: [PackedMaskFrame]) -> Result {
         precondition(!colorFrames.isEmpty, "need at least 1 frame")
         let width = colorFrames[0].width
         let height = colorFrames[0].height
@@ -501,27 +533,37 @@ enum BackgroundReconstructor {
     /// trimmed-mean-aggregates all channels -- via the bounded-memory
     /// `AlignedFrameStack` (UInt8 storage, see the type's/enum's memory-
     /// model doc comments) rather than the old `[[Float]]` design.
-    private static func reconstructStatic(colorFrames: [RGBBuffer], masks: [MaskBuffer], width: Int, height: Int, traj: Traj) -> Result {
+    ///
+    /// `colorFrames`/`masks` arrive as `RGBBuffer8`/`PackedMaskFrame` (see
+    /// enum header) -- each frame is promoted to Float32/`[Bool]` via
+    /// `.toFloatRGBBuffer()`/`.unpacked()` ONLY for the duration of that
+    /// frame's own loop iteration (`frame0`, and `colorFrames[i]`
+    /// per-iteration below), so at most 1-2 Float32 frames (reference +
+    /// current) are resident at once, never all N.
+    private static func reconstructStatic(colorFrames: [RGBBuffer8], masks: [PackedMaskFrame], width: Int, height: Int, traj: Traj) -> Result {
         let n = colorFrames.count
         let pixCount = width * height
 
         let tAlignStart = CFAbsoluteTimeGetCurrent()
-        let refGray = colorFrames[0].grayscale()
-        let refHole0 = dilate(masks[0].isPerson, width: width, height: height, radius: maskDilate)
-        let refMeanLuma = meanLuma(colorFrames[0], hole: refHole0)
+        let frame0 = colorFrames[0].toFloatRGBBuffer()
+        let mask0 = masks[0].unpacked()
+        let refGray = frame0.grayscale()
+        let refHole0 = dilate(mask0.isPerson, width: width, height: height, radius: maskDilate)
+        let refMeanLuma = meanLuma(frame0, hole: refHole0)
 
         let stack = AlignedFrameStack(width: width, height: height)
-        stack.append(r: colorFrames[0].r, g: colorFrames[0].g, b: colorFrames[0].b, hole: refHole0)
+        stack.append(r: frame0.r, g: frame0.g, b: frame0.b, hole: refHole0)
         var union = refHole0
 
         for i in 1..<n {
             // Dilate this frame's mask, align, exposure-gain, and pack
             // straight into the UInt8 stack -- the source frame's Float32
-            // `RGBBuffer` (owned by the caller's `colorFrames` array, not
-            // copied here beyond this loop iteration's locals) is never
-            // additionally retained by this function once packed.
-            let hole = dilate(masks[i].isPerson, width: width, height: height, radius: maskDilate)
-            let tgtGray = colorFrames[i].grayscale()
+            // promotion (`frameI`, a LOCAL to this iteration only) is
+            // never additionally retained by this function once packed;
+            // the caller's `colorFrames[i]` stays UInt8 the whole time.
+            let frameI = colorFrames[i].toFloatRGBBuffer()
+            let hole = dilate(masks[i].unpacked().isPerson, width: width, height: height, radius: maskDilate)
+            let tgtGray = frameI.grayscale()
             let (dx, dy) = alignPyramid(ref: refGray, tgt: tgtGray, width: width, height: height)
 
             // Exposure-normalize this frame's samples to the reference's
@@ -529,11 +571,11 @@ enum BackgroundReconstructor {
             // auto-exposure drift across frames blurs/smears the trimmed-
             // mean plate even with perfect alignment (matches Android's
             // per-frame gain in aggregatePlate(), clamped [0.85, 1.18]).
-            let frameMeanLuma = meanLuma(colorFrames[i], hole: hole)
+            let frameMeanLuma = meanLuma(frameI, hole: hole)
             let gain = Float(min(1.18, max(0.85, refMeanLuma / max(1.0, frameMeanLuma))))
-            let gainedR = colorFrames[i].r.map { min(255, max(0, $0 * gain)) }
-            let gainedG = colorFrames[i].g.map { min(255, max(0, $0 * gain)) }
-            let gainedB = colorFrames[i].b.map { min(255, max(0, $0 * gain)) }
+            let gainedR = frameI.r.map { min(255, max(0, $0 * gain)) }
+            let gainedG = frameI.g.map { min(255, max(0, $0 * gain)) }
+            let gainedB = frameI.b.map { min(255, max(0, $0 * gain)) }
 
             let warpedR = warpTranslate(gainedR, width: width, height: height, dx: dx, dy: dy, nearest: false)
             let warpedG = warpTranslate(gainedG, width: width, height: height, dx: dx, dy: dy, nearest: false)
@@ -577,11 +619,14 @@ enum BackgroundReconstructor {
         // confirmed by the same fix in the Python reference
         // (reveal_and_fill_static.py) producing a clean, sharp result on
         // the same clip once applied.
-        let needsReconstruction = masks[0].isPerson
+        // Reuses `mask0`/`frame0` (already promoted above for the
+        // reference-frame alignment/luma math) rather than re-deriving
+        // from `masks[0]`/`colorFrames[0]` a second time.
+        let needsReconstruction = mask0.isPerson
         for p in 0..<pixCount where !needsReconstruction[p] {
-            rPlateOut[p] = colorFrames[0].r[p]
-            gPlateOut[p] = colorFrames[0].g[p]
-            bPlateOut[p] = colorFrames[0].b[p]
+            rPlateOut[p] = frame0.r[p]
+            gPlateOut[p] = frame0.g[p]
+            bPlateOut[p] = frame0.b[p]
             neverRevealed[p] = false
             core[p] = false
             union[p] = false
@@ -632,7 +677,15 @@ enum BackgroundReconstructor {
     /// the trajectory's bbox center; > R_MAX(w) means one aligned plate
     /// can't cover it -> windowing. Ported from Android's
     /// computeTrajectory() (BackgroundInpaint.kt).
-    static func computeTrajectory(colorFrames: [RGBBuffer], masks: [MaskBuffer], width: Int, height: Int) -> Traj {
+    ///
+    /// Only ever touches at most 16 SAMPLED frames (`idxs`, evenly spread
+    /// across the clip) out of the full N -- each one is promoted to
+    /// Float32/`[Bool]` via `.toFloatRGBBuffer()`/`.unpacked()`,
+    /// immediately downscaled to `(dw, dh)` (`coarseDim`=100px) by
+    /// `downGrayValid`, and the full-res Float32 promotion is discarded
+    /// right after -- so this pre-pass never holds more than 16 small
+    /// downscaled planes resident, regardless of N.
+    static func computeTrajectory(colorFrames: [RGBBuffer8], masks: [PackedMaskFrame], width: Int, height: Int) -> Traj {
         let n = colorFrames.count
         guard n >= 3 else { return Traj(devC: 0, needsWindowing: false) }
 
@@ -643,7 +696,7 @@ enum BackgroundReconstructor {
         var grays: [[Float]] = []
         var valids: [[Bool]] = []
         for t in idxs {
-            let (g, v) = downGrayValid(color: colorFrames[t], mask: masks[t], dw: dw, dh: dh)
+            let (g, v) = downGrayValid(color: colorFrames[t].toFloatRGBBuffer(), mask: masks[t].unpacked(), dw: dw, dh: dh)
             grays.append(g); valids.append(v)
         }
         let m = grays.count
@@ -792,7 +845,19 @@ enum BackgroundReconstructor {
         n > 1 ? (2.0 * devC / Double(n - 1)) : 0.0
     }
 
-    private static func reconstructDynamic(colorFrames: [RGBBuffer], masks: [MaskBuffer], width: Int, height: Int, traj: Traj) -> Result {
+    /// Builds and tears down each window's `AlignedFrameStack` ONE AT A
+    /// TIME inside `buildWindow` (called from the loop below) -- so this
+    /// function's own peak resident aligned-frame memory is bounded by a
+    /// SINGLE window's worth of frames (WINDOW_MAX=96) at any instant, not
+    /// O(N) or O(K*window) across however many windows the clip needs.
+    /// `colorFrames`/`masks` themselves stay UInt8/bit-packed for the
+    /// full clip the whole time this function runs (only passed BY
+    /// REFERENCE into `buildWindow`, which does its own per-frame,
+    /// per-window Float32/`[Bool]` promotion) -- so this input-layer fix
+    /// doesn't undermine DYNAMIC mode's existing per-window boundedness,
+    /// it just shrinks what "the whole clip" costs to keep resident
+    /// alongside any one window's stack.
+    private static func reconstructDynamic(colorFrames: [RGBBuffer8], masks: [PackedMaskFrame], width: Int, height: Int, traj: Traj) -> Result {
         let n = colorFrames.count
         let pixCount = width * height
 
@@ -862,7 +927,7 @@ enum BackgroundReconstructor {
         // `compositeFrame(frameIndex:)` over ALL windows, not a single
         // global plate (a single plate is exactly what STATIC mode has and
         // DYNAMIC mode does NOT, by construction).
-        let previewPlate = windows.first?.plate ?? colorFrames[0]
+        let previewPlate = windows.first?.plate ?? colorFrames[0].toFloatRGBBuffer()
         let detail = "devC=\(String(format: "%.1f", traj.devC))px > R_MAX=\(String(format: "%.1f", rMaxW))px -- \(windows.count) window(s), len=\(len) overlap=\(overlap) hop=\(hop)"
         return Result(plateBeforeLama: previewPlate, core: coreAll, union: unionAll, neverRevealed: coreAll, alignMs: alignMs, trimmedMeanMs: trimmedMeanMs, method: .dynamicWindowed, methodDetail: detail, dynamicWindows: windows)
     }
@@ -877,33 +942,41 @@ enum BackgroundReconstructor {
     /// `fillWindowCores(_:lamaRunner:)` (see its doc comment for why it's
     /// a separate call) -- matches Android's per-window body of
     /// buildWindowedPlates() up to (but not including) its fillCore() call.
-    private static func buildWindow(colorFrames: [RGBBuffer], masks: [MaskBuffer], width: Int, height: Int, start: Int, end: Int, refIndex: Int) -> WindowPlate {
+    private static func buildWindow(colorFrames: [RGBBuffer8], masks: [PackedMaskFrame], width: Int, height: Int, start: Int, end: Int, refIndex: Int) -> WindowPlate {
         let pixCount = width * height
-        let refGray = colorFrames[refIndex].grayscale()
+        let refFrame = colorFrames[refIndex].toFloatRGBBuffer()
+        let refMask = masks[refIndex].unpacked()
+        let refGray = refFrame.grayscale()
         let aligner = Aligner(refIndex: refIndex, refGray: refGray, width: width, height: height)
 
-        let refHole = dilate(masks[refIndex].isPerson, width: width, height: height, radius: maskDilate)
-        let refMeanLuma = meanLuma(colorFrames[refIndex], hole: refHole)
+        let refHole = dilate(refMask.isPerson, width: width, height: height, radius: maskDilate)
+        let refMeanLuma = meanLuma(refFrame, hole: refHole)
 
         let stack = AlignedFrameStack(width: width, height: height)
         var union = [Bool](repeating: false, count: pixCount)
 
         for i in start..<end {
-            let hole = dilate(masks[i].isPerson, width: width, height: height, radius: maskDilate)
+            // Per-frame Float32/[Bool] promotion, scoped to this loop
+            // iteration only (same pattern as reconstructStatic) -- keeps
+            // this window's peak Float32 residency at O(1) frames, not
+            // O(window length).
+            let frameI = (i == refIndex) ? refFrame : colorFrames[i].toFloatRGBBuffer()
+            let maskI = (i == refIndex) ? refMask : masks[i].unpacked()
+            let hole = dilate(maskI.isPerson, width: width, height: height, radius: maskDilate)
             let dx: Double, dy: Double
             if i == refIndex {
                 dx = 0; dy = 0
             } else {
-                let tgtGray = colorFrames[i].grayscale()
+                let tgtGray = frameI.grayscale()
                 (dx, dy) = alignPyramid(ref: refGray, tgt: tgtGray, width: width, height: height, levels: windowPyramidLevels)
             }
             aligner.setShift(i, dx: dx, dy: dy)
 
-            let frameMeanLuma = meanLuma(colorFrames[i], hole: hole)
+            let frameMeanLuma = meanLuma(frameI, hole: hole)
             let gain = Float(min(1.18, max(0.85, refMeanLuma / max(1.0, frameMeanLuma))))
-            let gainedR = colorFrames[i].r.map { min(255, max(0, $0 * gain)) }
-            let gainedG = colorFrames[i].g.map { min(255, max(0, $0 * gain)) }
-            let gainedB = colorFrames[i].b.map { min(255, max(0, $0 * gain)) }
+            let gainedR = frameI.r.map { min(255, max(0, $0 * gain)) }
+            let gainedG = frameI.g.map { min(255, max(0, $0 * gain)) }
+            let gainedB = frameI.b.map { min(255, max(0, $0 * gain)) }
 
             let isIdentity = (dx == 0 && dy == 0)
             let warpedR = isIdentity ? gainedR : warpTranslate(gainedR, width: width, height: height, dx: dx, dy: dy, nearest: false)
@@ -934,12 +1007,15 @@ enum BackgroundReconstructor {
         }
 
         // Same "only the window's own reference-frame hole needs
-        // reconstruction" restriction as STATIC, scoped to refIndex's mask.
-        let needsReconstruction = masks[refIndex].isPerson
+        // reconstruction" restriction as STATIC, scoped to refIndex's
+        // mask. Reuses `refMask`/`refFrame` (already promoted above)
+        // rather than re-deriving from `masks[refIndex]`/
+        // `colorFrames[refIndex]` a second time.
+        let needsReconstruction = refMask.isPerson
         for p in 0..<pixCount where !needsReconstruction[p] {
-            rPlateOut[p] = colorFrames[refIndex].r[p]
-            gPlateOut[p] = colorFrames[refIndex].g[p]
-            bPlateOut[p] = colorFrames[refIndex].b[p]
+            rPlateOut[p] = refFrame.r[p]
+            gPlateOut[p] = refFrame.g[p]
+            bPlateOut[p] = refFrame.b[p]
             core[p] = false
             union[p] = false
         }
