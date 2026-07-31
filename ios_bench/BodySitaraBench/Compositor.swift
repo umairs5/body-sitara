@@ -144,13 +144,37 @@ enum Compositor {
     /// WanAnimate render per explicit scope decision, just to exercise the
     /// composite+relight math cost on a real background size.
     static func placeholderCharacter(width: Int, height: Int) -> (character: RGBBuffer, alpha: [Float]) {
+        placeholderCharacter(width: width, height: height, frameIndex: 0, totalFrames: 1)
+    }
+
+    /// Per-frame placeholder character: the same soft-edged ellipse cutout
+    /// as `placeholderCharacter(width:height:)`, but with a small per-frame
+    /// horizontal sway and a breathing vertical-radius pulse driven by
+    /// `frameIndex`/`totalFrames` -- so a per-frame Final Compositing loop
+    /// (BenchmarkView) actually recomputes a DIFFERENT character each call,
+    /// like Android's real WanAnimate output would (a moving generated
+    /// character, not one static frame reused N times). This does NOT
+    /// stand in for real character content/appearance -- it exists solely
+    /// so Compositing's timing is measured against realistic PER-FRAME
+    /// data volume/variation, not a single cached alpha mask. See
+    /// BenchmarkView's Final Compositing stage for how this is invoked.
+    static func placeholderCharacter(width: Int, height: Int, frameIndex: Int, totalFrames: Int) -> (character: RGBBuffer, alpha: [Float]) {
         var r = [Float](repeating: 160, count: width * height)
         var g = [Float](repeating: 140, count: width * height)
         var b = [Float](repeating: 120, count: width * height)
         var alpha = [Float](repeating: 0, count: width * height)
 
-        let cx = Double(width) / 2, cy = Double(height) / 2
-        let rx = Double(width) * 0.18, ry = Double(height) * 0.38
+        // Slow horizontal sway (+-6% of width) and a gentle vertical-radius
+        // breathing pulse (+-4%), phased over the clip so consecutive
+        // frames differ but the motion stays smooth -- enough per-frame
+        // variation that compositeOnly() can't shortcut on identical input,
+        // without pretending to be a real character animation.
+        let t = totalFrames > 1 ? Double(frameIndex) / Double(totalFrames - 1) : 0.0
+        let sway = sin(t * 2.0 * .pi) * Double(width) * 0.06
+        let breathe = 1.0 + 0.04 * sin(t * 4.0 * .pi)
+
+        let cx = Double(width) / 2 + sway, cy = Double(height) / 2
+        let rx = Double(width) * 0.18, ry = Double(height) * 0.38 * breathe
         let featherPx = 6.0
 
         for y in 0..<height {

@@ -482,8 +482,7 @@ struct BenchmarkView: View {
         // RECONSTRUCTED background (not the lightmap) to produce the
         // final video.
         setStage("Final Compositing", status: .running)
-        appendLog("[diag] simulating server response (PLACEHOLDER avatar, no real WanAnimate call)...")
-        let (placeholderChar, placeholderAlpha) = Compositor.placeholderCharacter(width: backgroundFinal.width, height: backgroundFinal.height)
+        appendLog("[diag] simulating server response (PLACEHOLDER avatar, no real WanAnimate call -- a DIFFERENT synthetic frame is generated per source frame, not one cached still, so Compositing's timing reflects real per-frame data volume)...")
 
         appendLog("[diag] running Final Compositing: placeholder avatar onto per-frame reconstructed background (relight EXCLUDED per scope decision)...")
         let (finalFrames, totalCompositeMs): ([CGImage], Double) = await Task.detached(priority: .userInitiated) {
@@ -491,7 +490,8 @@ struct BenchmarkView: View {
             var totalMs = 0.0
             for i in 0..<n {
                 let frameBg = RGBBuffer.from(cgImage: reconstructedBgFrames[i])
-                let result = Compositor.compositeOnly(background: frameBg, character: placeholderChar, alpha: placeholderAlpha)
+                let (character, alpha) = Compositor.placeholderCharacter(width: backgroundFinal.width, height: backgroundFinal.height, frameIndex: i, totalFrames: n)
+                let result = Compositor.compositeOnly(background: frameBg, character: character, alpha: alpha)
                 totalMs += result.compositeMs
                 if let cg = result.composited.toCGImage() { frames.append(cg) }
             }

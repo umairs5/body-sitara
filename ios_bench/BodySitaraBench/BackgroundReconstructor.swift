@@ -805,7 +805,19 @@ enum BackgroundReconstructor {
         let overlap = max(4, len / 6)
         var hop = max(1, len - overlap)
         if n > len {
-            hop = max(hop, (n - len + MAX_WINDOWS - 2) / (MAX_WINDOWS - 1))
+            // Widen the hop to cap the window count at MAX_WINDOWS on long
+            // clips (bounds retained memory + per-window LaMa/align cost).
+            // MUST stay <= len: a hop > len would skip frames entirely --
+            // windowWeight() returns 0 for any frame outside every window's
+            // [start,end), so a gap here silently drops those frames to the
+            // PushPullFill fallback instead of the intended windowed
+            // reconstruction, with no error or log signal (caught in
+            // review, 2026-07-31: verified numerically at len=96, n=1000,
+            // the uncapped formula produced hop=130 > len=96). Clamping to
+            // len means windows can butt up edge-to-edge (zero overlap) in
+            // the worst case, but every frame stays covered by at least one
+            // window.
+            hop = min(len, max(hop, (n - len + MAX_WINDOWS - 2) / (MAX_WINDOWS - 1)))
         }
 
         var windows: [WindowPlate] = []
