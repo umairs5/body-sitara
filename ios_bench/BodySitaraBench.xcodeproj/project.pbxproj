@@ -25,6 +25,12 @@
 		3B3C4D5E6F708192A3B4C6D3 /* VideoEncoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3B3C4D5E6F708192A3B4C6D4 /* VideoEncoder.swift */; };
 		B6E1DFC371A4495881382798 /* PushPullFill.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3F09D4B875AF40C7991D7625 /* PushPullFill.swift */; };
 		A02C3569B651453588E681AE /* GrainMatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = F16D47FBD3094138A5755CA3 /* GrainMatcher.swift */; };
+		F840ADA280F94D77A95B277D /* ClipLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = 82D3F5F26E124C49B9A327E9 /* ClipLibrary.swift */; };
+		8B0769E3585646319CA31D08 /* LoopingVideoPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 166807B8EC5943DF86D28997 /* LoopingVideoPlayer.swift */; };
+		AA508FA7A44B461D9EDC7CB4 /* DesignSystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = E29768809F2542809205E1FC /* DesignSystem.swift */; };
+		5D3C6A460A4B43E29F6F8A5F /* ClipPickerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1E4250AB70AD42B4A6D944E0 /* ClipPickerView.swift */; };
+		A16204BE6C92469C8E2CC192 /* PipelineStageView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9C8E14B913046DAAC4DC592 /* PipelineStageView.swift */; };
+		72684FCF875040A782EE8901 /* CompareView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CA3743112814DCFA4FA43DB /* CompareView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -48,6 +54,12 @@
 		3B3C4D5E6F708192A3B4C6D4 /* VideoEncoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoEncoder.swift; sourceTree = "<group>"; };
 		3F09D4B875AF40C7991D7625 /* PushPullFill.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PushPullFill.swift; sourceTree = "<group>"; };
 		F16D47FBD3094138A5755CA3 /* GrainMatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GrainMatcher.swift; sourceTree = "<group>"; };
+		82D3F5F26E124C49B9A327E9 /* ClipLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClipLibrary.swift; sourceTree = "<group>"; };
+		166807B8EC5943DF86D28997 /* LoopingVideoPlayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LoopingVideoPlayer.swift; sourceTree = "<group>"; };
+		E29768809F2542809205E1FC /* DesignSystem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesignSystem.swift; sourceTree = "<group>"; };
+		1E4250AB70AD42B4A6D944E0 /* ClipPickerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClipPickerView.swift; sourceTree = "<group>"; };
+		A9C8E14B913046DAAC4DC592 /* PipelineStageView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PipelineStageView.swift; sourceTree = "<group>"; };
+		1CA3743112814DCFA4FA43DB /* CompareView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompareView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -88,6 +100,12 @@
 				3B3C4D5E6F708192A3B4C6D4 /* VideoEncoder.swift */,
 				3F09D4B875AF40C7991D7625 /* PushPullFill.swift */,
 				F16D47FBD3094138A5755CA3 /* GrainMatcher.swift */,
+				82D3F5F26E124C49B9A327E9 /* ClipLibrary.swift */,
+				166807B8EC5943DF86D28997 /* LoopingVideoPlayer.swift */,
+				E29768809F2542809205E1FC /* DesignSystem.swift */,
+				1E4250AB70AD42B4A6D944E0 /* ClipPickerView.swift */,
+				A9C8E14B913046DAAC4DC592 /* PipelineStageView.swift */,
+				1CA3743112814DCFA4FA43DB /* CompareView.swift */,
 				24D1D2B0591D41058A313829 /* Info.plist */,
 			);
 			path = BodySitaraBench;
@@ -205,6 +223,12 @@
 				3B3C4D5E6F708192A3B4C6D3 /* VideoEncoder.swift in Sources */,
 				B6E1DFC371A4495881382798 /* PushPullFill.swift in Sources */,
 				A02C3569B651453588E681AE /* GrainMatcher.swift in Sources */,
+				F840ADA280F94D77A95B277D /* ClipLibrary.swift in Sources */,
+				8B0769E3585646319CA31D08 /* LoopingVideoPlayer.swift in Sources */,
+				AA508FA7A44B461D9EDC7CB4 /* DesignSystem.swift in Sources */,
+				5D3C6A460A4B43E29F6F8A5F /* ClipPickerView.swift in Sources */,
+				A16204BE6C92469C8E2CC192 /* PipelineStageView.swift in Sources */,
+				72684FCF875040A782EE8901 /* CompareView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

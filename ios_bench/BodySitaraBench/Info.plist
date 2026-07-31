@@ -22,6 +22,8 @@
 	<true/>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Saves the reconstructed background, silhouette-on-lightmap, and final composited pipeline outputs so you can view them in Photos.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Lets you pick your own masked-video and mask clips from Photos to stage as test clips for the benchmark.</string>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>

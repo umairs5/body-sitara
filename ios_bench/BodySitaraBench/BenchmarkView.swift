@@ -1,65 +1,216 @@
 import SwiftUI
 import CoreML
 
-/// Benchmark harness UI: runs RIFE + big-LaMa inference N times each,
-/// reports per-stage timing (build/run/postprocess) and the requested/
-/// available compute-unit info from ComputePlanInspector. NOTE: this is a
-/// weaker check than true per-operation ANE attribution (see
-/// ComputePlanInspector.swift's docstring for why -- MLComputePlan's
+/// Benchmark dashboard: pick/stage real test clips (ClipLibrary +
+/// ClipPickerView), run the Tier2-mobile pipeline port, watch live
+/// per-stage progress (PipelineTimelineView), inspect every stage's
+/// output as a playable video (not just a static thumbnail), and compare
+/// input vs. final result side-by-side. The raw diagnostic log from the
+/// original harness is preserved in full, just demoted to a collapsible
+/// panel instead of dominating the screen.
+///
+/// NOTE: this is a weaker check than true per-operation ANE attribution
+/// (see ComputePlanInspector.swift's docstring for why -- MLComputePlan's
 /// exact Swift API couldn't be pinned down without real Apple docs
 /// access) -- report benchmark numbers with that caveat explicit, not as
 /// confirmed ANE-only timing.
 struct BenchmarkView: View {
+    @StateObject private var clipLibrary = ClipLibrary()
+
     @State private var log: [String] = []
     @State private var isRunning = false
     @State private var previewImages: [(label: String, image: UIImage)] = []
+    @State private var outputVideos: [(label: String, url: URL)] = []
+    @State private var stages: [PipelineStage] = Self.initialStages
+    @State private var isLogExpanded = false
+    @State private var viewerClip: (title: String, url: URL)?
+    @State private var showCompare = false
+    @State private var lastRunSummary: String?
+
     static let repetitions = 5 // matches Table 8's 5-repetition methodology
+
+    static let initialStages: [PipelineStage] = [
+        PipelineStage(name: "Load & Align", icon: "align.horizontal.left"),
+        PipelineStage(name: "Background Reconstruction", icon: "photo.on.rectangle"),
+        PipelineStage(name: "Illumination Extraction", icon: "sun.max"),
+        PipelineStage(name: "Final Compositing", icon: "square.stack.3d.up"),
+        PipelineStage(name: "Export", icon: "square.and.arrow.down"),
+    ]
 
     var body: some View {
         NavigationView {
-            VStack {
-                Button(isRunning ? "Running..." : "Run Benchmark") {
-                    Task { await runBenchmark() }
-                }
-                .disabled(isRunning)
-                .padding()
+            ScrollView {
+                VStack(spacing: 16) {
+                    ClipPickerView(library: clipLibrary)
 
-                // Visual sanity-check gallery: input frame, reconstructed
-                // background (before/after LaMa), lightmap, and final
-                // composite -- added so the pipeline's OUTPUT can be
-                // visually confirmed correct on-device, not just its
-                // timing. A fast benchmark number is meaningless if the
-                // stage it's timing produced garbage.
-                if !previewImages.isEmpty {
-                    ScrollView(.horizontal) {
-                        HStack(alignment: .top) {
-                            ForEach(previewImages, id: \.label) { item in
-                                VStack {
-                                    Text(item.label)
-                                        .font(.caption)
-                                    Image(uiImage: item.image)
-                                        .resizable()
-                                        .scaledToFit()
-                                        .frame(width: 160, height: 160)
-                                        .border(Color.gray)
-                                }
-                                .padding(.horizontal, 4)
-                            }
-                        }
-                        .padding()
+                    runControlCard
+
+                    if stages.contains(where: { $0.status != .pending }) {
+                        PipelineTimelineView(stages: stages)
                     }
-                    .frame(height: 220)
-                }
 
-                ScrollView {
-                    Text(log.joined(separator: "\n"))
-                        .font(.system(.footnote, design: .monospaced))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding()
+                    if !previewImages.isEmpty {
+                        galleryCard
+                    }
+
+                    if outputVideos.count >= 2 {
+                        compareCard
+                    }
+
+                    logCard
+                }
+                .padding(16)
+            }
+            .background(Theme.pageBackground)
+            .navigationTitle("bodySITARA Bench")
+        }
+        .fullScreenCover(item: Binding(
+            get: { viewerClip.map { IdentifiableURL(title: $0.title, url: $0.url) } },
+            set: { if $0 == nil { viewerClip = nil } }
+        )) { clip in
+            VideoViewerSheet(title: clip.title, url: clip.url)
+        }
+        .fullScreenCover(isPresented: $showCompare) {
+            if let before = outputVideos.first(where: { $0.label.contains("Masked") }) ?? outputVideos.first,
+               let after = outputVideos.first(where: { $0.label.contains("Final") }) ?? outputVideos.last {
+                CompareView(beforeTitle: before.label, beforeURL: before.url, afterTitle: after.label, afterURL: after.url)
+            }
+        }
+    }
+
+    // MARK: - Run control
+
+    private var runControlCard: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 12) {
+                SectionHeader(icon: "play.circle", title: "Run")
+
+                Button {
+                    Task { await runBenchmark() }
+                } label: {
+                    HStack {
+                        if isRunning {
+                            ProgressView().controlSize(.small).tint(.white)
+                        } else {
+                            Image(systemName: "play.fill")
+                        }
+                        Text(isRunning ? "Running…" : "Run Benchmark")
+                            .fontWeight(.semibold)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(isRunning)
+
+                HStack(spacing: 12) {
+                    Label("\(Self.repetitions) reps", systemImage: "arrow.triangle.2.circlepath")
+                    Label(clipLibrary.activePreset?.name ?? "Bundled sample", systemImage: "film")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                if let lastRunSummary {
+                    Divider()
+                    Text(lastRunSummary)
+                        .font(.system(.caption, design: .rounded))
+                        .foregroundStyle(.secondary)
                 }
             }
-            .navigationTitle("bodySITARA iOS Bench")
         }
+    }
+
+    // MARK: - Gallery
+
+    private var galleryCard: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 12) {
+                SectionHeader(icon: "photo.stack", title: "Visual Check")
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(alignment: .top, spacing: 12) {
+                        ForEach(Array(previewImages.enumerated()), id: \.offset) { _, item in
+                            GalleryTile(label: item.label, image: item.image)
+                        }
+                    }
+                }
+                if !outputVideos.isEmpty {
+                    Text("Exported videos")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 10) {
+                            ForEach(outputVideos, id: \.label) { item in
+                                Button {
+                                    viewerClip = (item.label, item.url)
+                                } label: {
+                                    Label(item.label, systemImage: "play.circle.fill")
+                                        .font(.caption)
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var compareCard: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 10) {
+                SectionHeader(icon: "rectangle.split.2x1", title: "Compare")
+                Text("Play the input clip and the final result side-by-side.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button {
+                    showCompare = true
+                } label: {
+                    Label("Open Compare View", systemImage: "play.rectangle.on.rectangle")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+    }
+
+    // MARK: - Log
+
+    private var logCard: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 8) {
+                Button {
+                    withAnimation(.snappy) { isLogExpanded.toggle() }
+                } label: {
+                    HStack {
+                        SectionHeader(icon: "terminal", title: "Diagnostic Log (\(log.count) lines)")
+                        Image(systemName: isLogExpanded ? "chevron.up" : "chevron.down")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .buttonStyle(.plain)
+
+                if isLogExpanded {
+                    ScrollView {
+                        Text(log.joined(separator: "\n"))
+                            .font(.system(.caption2, design: .monospaced))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                    }
+                    .frame(maxHeight: 320)
+                }
+            }
+        }
+    }
+
+    // MARK: - Stage helpers
+
+    private func setStage(_ name: String, status: StageStatus, timings: [(String, Double)] = [], method: (String, Bool)? = nil, detail: [String] = []) {
+        guard let idx = stages.firstIndex(where: { $0.name == name }) else { return }
+        stages[idx].status = status
+        if !timings.isEmpty { stages[idx].timings = timings }
+        if let method { stages[idx].methodBadge = (method.0, method.1) }
+        if !detail.isEmpty { stages[idx].detailLines.append(contentsOf: detail) }
     }
 
     private func appendLog(_ line: String) {
@@ -75,8 +226,13 @@ struct BenchmarkView: View {
     private func runBenchmark() async {
         isRunning = true
         log = []
+        previewImages = []
+        outputVideos = []
+        lastRunSummary = nil
+        stages = Self.initialStages
         appendLog("=== bodySITARA iOS Benchmark (iPhone 15 Pro Max target) ===")
         appendLog("Repetitions: \(Self.repetitions)")
+        appendLog("Clip: \(clipLibrary.activePreset?.name ?? "bundled sample")")
 
         let config = MLModelConfiguration()
         config.computeUnits = .all // let CoreML pick ANE/GPU/CPU; verified below, not assumed
@@ -95,6 +251,9 @@ struct BenchmarkView: View {
             try await runTier2MobileSystemCostBenchmark(config: config)
         } catch {
             appendLog("Tier2-mobile system cost benchmark FAILED: \(error)")
+            if let running = stages.first(where: { $0.status == .running })?.name {
+                setStage(running, status: .failed(error.localizedDescription))
+            }
         }
 
         isRunning = false
@@ -112,13 +271,25 @@ struct BenchmarkView: View {
     /// measurements at the same granularity.
     private func runTier2MobileSystemCostBenchmark(config: MLModelConfiguration) async throws {
         appendLog("\n--- Tier2-Mobile System Cost (Bg Recon + Illum Extraction + Compositing, RIFE excluded) ---")
-        previewImages = []
 
-        guard let maskedURL = Bundle.main.url(forResource: "masked_video", withExtension: "mp4"),
-              let maskURL = Bundle.main.url(forResource: "mask", withExtension: "mp4") else {
-            appendLog("masked_video.mp4 / mask.mp4 not found in bundle -- skipping (see ios_bench/TestAssets/README)")
+        // Prefer a staged clip preset; fall back to the bundled sample
+        // clip, matching the app's original behavior when nothing has
+        // been staged yet.
+        let maskedURL: URL
+        let maskURL: URL
+        if let active = clipLibrary.activeClip {
+            maskedURL = active.masked
+            maskURL = active.mask
+        } else if let bundledMasked = Bundle.main.url(forResource: "masked_video", withExtension: "mp4"),
+                  let bundledMask = Bundle.main.url(forResource: "mask", withExtension: "mp4") {
+            maskedURL = bundledMasked
+            maskURL = bundledMask
+        } else {
+            appendLog("No clip staged and no bundled sample found -- pick a clip in Test Clips above.")
             return
         }
+
+        setStage("Load & Align", status: .running)
         appendLog("[diag] loading real clip frames...")
         let tLoadStart = CFAbsoluteTimeGetCurrent()
         let maskedVideo = try VideoFrameLoader.loadFrames(url: maskedURL)
@@ -134,7 +305,9 @@ struct BenchmarkView: View {
         appendLog("[diag] converting frames to RGB/mask buffers...")
         let colorBuffers = maskedVideo.frames[0..<n].map { RGBBuffer.from(cgImage: $0) }
         let maskBuffers = maskVideo.frames[0..<n].map { MaskBuffer.from(cgImage: $0) }
+        setStage("Load & Align", status: .done, timings: [("load", loadMs)], detail: ["\(n) frames @ \(maskedVideo.width)x\(maskedVideo.height)"])
 
+        setStage("Background Reconstruction", status: .running)
         appendLog("[diag] running Background Reconstruction (align pyramid + trimmed-mean, on-device)...")
         let reconResult = BackgroundReconstructor.reconstruct(colorFrames: colorBuffers, masks: maskBuffers)
         let corePctPreview = 100.0 * Double(reconResult.core.filter { $0 }.count) / Double(reconResult.core.count)
@@ -152,6 +325,7 @@ struct BenchmarkView: View {
         let lamaTiming = coreFillResult.timing
         let lamaStageMs = (lamaTiming?.buildMs ?? 0) + (lamaTiming?.runMs ?? 0) + (lamaTiming?.postprocessMs ?? 0)
         let bgReconTotalMs = reconResult.alignMs + reconResult.trimmedMeanMs + lamaStageMs
+        let usedPushPull = coreFillResult.method.hasPrefix("push-pull")
         if let t = lamaTiming {
             appendLog("  core-fill (\(coreFillResult.method)): build=\(String(format: "%.1f", t.buildMs))ms run=\(String(format: "%.1f", t.runMs))ms post=\(String(format: "%.1f", t.postprocessMs))ms")
         } else {
@@ -159,6 +333,10 @@ struct BenchmarkView: View {
         }
         appendLog("  Background Reconstruction TOTAL: \(String(format: "%.0f", bgReconTotalMs))ms (\(n) frames, \(maskedVideo.width)x\(maskedVideo.height))")
         addPreview("Background FINAL\n(after core-fill)", backgroundFinal.toCGImage())
+        setStage("Background Reconstruction", status: .done,
+                  timings: [("align", reconResult.alignMs), ("trim", reconResult.trimmedMeanMs), ("fill", lamaStageMs)],
+                  method: (usedPushPull ? "push-pull ⚠" : "lama-crop", usedPushPull),
+                  detail: [coreFillResult.method, "core: \(String(format: "%.1f", coreFillResult.corePct))% of frame"])
 
         // Real per-frame background VIDEO: for EACH frame i, the hole that
         // needs filling is THAT FRAME's own mask (maskBuffers[i]), not
@@ -187,10 +365,12 @@ struct BenchmarkView: View {
         }
         appendLog("  reconstructed-background video: \(reconstructedBgFrames.count) frames, each using its OWN mask for the fill region")
 
+        setStage("Illumination Extraction", status: .running)
         appendLog("[diag] running Illumination Extraction (lightmap)...")
         let lightmapResult = LightmapExtractor.extract(from: backgroundFinal)
         appendLog("  Illumination Extraction: \(String(format: "%.1f", lightmapResult.totalMs))ms")
         addPreview("Lightmap", lightmapResult.lightmap.toCGImage())
+        setStage("Illumination Extraction", status: .done, timings: [("total", lightmapResult.totalMs)])
 
         // Step 4: composite the ORIGINAL grey silhouette (per-frame, real
         // clip content) onto the lightmap -- this is the actual
@@ -218,6 +398,7 @@ struct BenchmarkView: View {
         // response. Step 6 composites that returned avatar onto the
         // RECONSTRUCTED background (not the lightmap) to produce the
         // final video.
+        setStage("Final Compositing", status: .running)
         appendLog("[diag] simulating server response (PLACEHOLDER avatar, no real WanAnimate call)...")
         let (placeholderChar, placeholderAlpha) = Compositor.placeholderCharacter(width: backgroundFinal.width, height: backgroundFinal.height)
 
@@ -234,18 +415,25 @@ struct BenchmarkView: View {
         if let mid = finalFrames[safe: n / 2] {
             addPreview("FINAL\n(avatar on reconstructed bg, no relight)", mid)
         }
+        setStage("Final Compositing", status: .done, timings: [("composite", totalCompositeMs)])
 
         // Video export: save the real pipeline stages as .mp4 files so
         // they can be viewed/scrubbed on-device via Photos, not just
-        // inspected as single still frames.
+        // inspected as single still frames. Also kept in-memory (via
+        // outputVideos) so the Gallery/Compare cards can play them
+        // in-app immediately, without a round-trip through Photos.
+        setStage("Export", status: .running)
         appendLog("\n[diag] encoding output videos (\(n) real frames each, not repeated stills)...")
         do {
             let tmpDir = FileManager.default.temporaryDirectory
             let fps: Int32 = 10 // matches the bundled clip's ~10fps sampling
 
+            outputVideos.append((label: "Masked Input", url: maskedURL))
+
             if !reconstructedBgFrames.isEmpty {
                 let bgURL = tmpDir.appendingPathComponent("reconstructed_background.mp4")
                 try VideoEncoder.encode(frames: reconstructedBgFrames, fps: fps, outputURL: bgURL)
+                outputVideos.append((label: "Reconstructed Background", url: bgURL))
                 try await VideoEncoder.saveToPhotoLibrary(url: bgURL)
                 appendLog("  Saved reconstructed_background.mp4 to Photos (\(reconstructedBgFrames.count) frames)")
             }
@@ -253,6 +441,7 @@ struct BenchmarkView: View {
             if !silhouetteOnLightmapFrames.isEmpty {
                 let silURL = tmpDir.appendingPathComponent("silhouette_on_lightmap.mp4")
                 try VideoEncoder.encode(frames: silhouetteOnLightmapFrames, fps: fps, outputURL: silURL)
+                outputVideos.append((label: "Silhouette on Lightmap", url: silURL))
                 try await VideoEncoder.saveToPhotoLibrary(url: silURL)
                 appendLog("  Saved silhouette_on_lightmap.mp4 to Photos (\(silhouetteOnLightmapFrames.count) frames)")
             }
@@ -260,12 +449,15 @@ struct BenchmarkView: View {
             if !finalFrames.isEmpty {
                 let finalURL = tmpDir.appendingPathComponent("final_output.mp4")
                 try VideoEncoder.encode(frames: finalFrames, fps: fps, outputURL: finalURL)
+                outputVideos.append((label: "Final Output", url: finalURL))
                 try await VideoEncoder.saveToPhotoLibrary(url: finalURL)
                 appendLog("  Saved final_output.mp4 to Photos (\(finalFrames.count) frames)")
                 appendLog("  NOTE: avatar itself is a static PLACEHOLDER cutout (no per-frame motion) -- background behind it is real per-frame video; a real WanAnimate avatar would also move per-frame.")
             }
+            setStage("Export", status: .done, detail: outputVideos.map { $0.label })
         } catch {
             appendLog("  Video export/save FAILED: \(error)")
+            setStage("Export", status: .failed(error.localizedDescription))
         }
 
         appendLog("\n  SUMMARY (RIFE + relight excluded, per scope decision):")
@@ -276,6 +468,8 @@ struct BenchmarkView: View {
         appendLog("    TOTAL (3 stages):          \(String(format: "%.0f", totalMs))ms for \(n) src frames")
         appendLog("  NOTE: Final Compositing uses a PLACEHOLDER character cutout, not a real WanAnimate render -- tests compositing MATH cost only, not visual fidelity.")
         appendLog("  Scroll the image strip above to visually verify each stage's output before trusting these numbers.")
+
+        lastRunSummary = "Total \(String(format: "%.0f", totalMs))ms for \(n) frames · core-fill: \(coreFillResult.method)"
     }
 
     private static func maskPreviewImage(_ mask: [Bool], width: Int, height: Int) -> CGImage? {
@@ -400,6 +594,62 @@ struct BenchmarkView: View {
         }
 
         appendLog("  avg: build=\(String(format: "%.1f", buildTimes.average))ms run=\(String(format: "%.1f", runTimes.average))ms post=\(String(format: "%.1f", postTimes.average))ms")
+    }
+}
+
+private struct IdentifiableURL: Identifiable {
+    let title: String
+    let url: URL
+    var id: String { url.path }
+}
+
+private struct GalleryTile: View {
+    let label: String
+    let image: UIImage
+    @State private var isZoomed = false
+
+    var body: some View {
+        VStack(spacing: 6) {
+            Image(uiImage: image)
+                .resizable()
+                .scaledToFill()
+                .frame(width: 150, height: 150)
+                .clipShape(RoundedRectangle(cornerRadius: Theme.smallCornerRadius, style: .continuous))
+                .onTapGesture { isZoomed = true }
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .lineLimit(2)
+        }
+        .frame(width: 150)
+        .sheet(isPresented: $isZoomed) {
+            ZoomedImageView(label: label, image: image)
+        }
+    }
+}
+
+private struct ZoomedImageView: View {
+    let label: String
+    let image: UIImage
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationView {
+            ScrollView([.horizontal, .vertical]) {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxWidth: .infinity)
+            }
+            .navigationTitle(label.replacingOccurrences(of: "\n", with: " "))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
     }
 }
 
