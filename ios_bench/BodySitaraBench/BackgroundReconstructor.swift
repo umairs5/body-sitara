@@ -1,18 +1,79 @@
 import CoreGraphics
 import Accelerate
 import UIKit
+import CoreML
 
-/// Swift port of the STATIC/JITTER path of Danial's Android Reveal-and-Fill
-/// (BackgroundInpaint.kt), matching this project's own validated Python
-/// reference (scripts/reveal_and_fill_static.py) line-for-line in
-/// algorithm structure -- NOT the DYNAMIC/windowed cross-window-borrowing
-/// path (out of scope, per explicit instruction to port STATIC/JITTER
-/// only, matching what's already been validated).
+/// Swift port of Danial's Android Reveal-and-Fill (BackgroundInpaint.kt),
+/// matching this project's own validated Python reference
+/// (scripts/reveal_and_fill_static.py) line-for-line in algorithm
+/// structure for the STATIC/JITTER path, and BackgroundInpaint.kt's
+/// windowed DYNAMIC path (computeTrajectory / buildWindowedPlates /
+/// borrowAcrossWindows) for clips with real camera motion.
 ///
 /// Runs fully on-device (no precomputed alignment) so the reported
 /// Background Reconstruction latency is a real, honest end-to-end number,
 /// comparable to Android's measured 33.59s/34.1s figures at the same
 /// pipeline stage -- not just the LaMa call in isolation.
+///
+/// MEMORY MODEL (rewritten 2026-07-31 to fix a real OOM crash -- see
+/// commit 7cefad6 "Shrink Tier2-mobile test clip to 50 frames/~10fps --
+/// fixes on-device OOM crash"):
+///
+/// The ORIGINAL implementation held `alignedR`/`alignedG`/`alignedB`/
+/// `alignedValid` as `[[Float]]` (one full-resolution Float32 plane PER
+/// FRAME, for all N frames simultaneously) so `trimmedMean` could sort
+/// each pixel's full temporal sample set. At 1264x1264, one Float32 RGB
+/// frame is 1264*1264*3*4 bytes = ~19.17MB. A real 300-frame clip (10s at
+/// 30fps) needs 300 * 19.17MB = ~5.75GB for the aligned RGB stack ALONE
+/// (before the ~480MB for masks, and before the still-resident original
+/// decoded `colorFrames` this function receives as a parameter) --
+/// comfortably in jetsam-kill territory on a real device, confirmed by
+/// the July crash: even the interim 300-frame attempt failed at
+/// frame-loading time on an iPhone 15 Pro Max.
+///
+/// FIX: aligned per-frame planes are now stored as `[UInt8]` (one byte
+/// per channel per pixel -- lossless for the purpose, since every source
+/// pixel is already an 8-bit 0-255 value; sub-pixel precision only
+/// matters DURING warping/gain, not in the at-rest stack) via
+/// `AlignedFrameStack`, a 4x reduction vs Float32:
+///   300 frames * 1264*1264*3*1 byte = ~1.44GB for the aligned RGB stack.
+/// The per-pixel "valid" flags are packed into a bitset (`PackedBoolPlane`,
+/// 1 bit/pixel instead of Swift's 1 BYTE/Bool), an 8x reduction on that
+/// side: 300 * 1264*1264/8 bytes = ~60MB (was ~480MB as `[[Bool]]`).
+/// Combined resident footprint for a 300-frame native-res clip:
+/// ~1.44GB + ~60MB = ~1.5GB -- still substantial, but a documented,
+/// bounded, ~4x-under-the-known-failure-threshold number instead of the
+/// ~6.2GB the old Float32 design needed, and comfortably below the
+/// multi-GB range that produced the confirmed jetsam kill.
+///
+/// `trimmedMean` fundamentally needs every valid sample for a pixel
+/// gathered before it can sort and trim (a bounded reservoir would bias
+/// the trim toward whichever samples happened to survive eviction, which
+/// is not the same statistic Android computes) -- so this is NOT
+/// restructured into a fully streaming single-pass accumulator. Instead,
+/// `trimmedMean` now processes the frame in horizontal ROW BANDS
+/// (`trimBandRows`), so the only per-call scratch allocation
+/// (`samples: [Float]`) is a single small buffer reused across every
+/// pixel/band rather than the caller needing a second full-frame-sized
+/// scratch array -- this keeps the aggregation step's PEAK additional
+/// memory small and predictable on top of the resident UInt8 stack,
+/// rather than adding another full-resolution Float32 array (the
+/// `plate`/`neverRevealed` outputs are still one full-res array each,
+/// which is unavoidable -- they ARE the output).
+///
+/// In DYNAMIC mode, each window only holds its OWN frame range's
+/// `AlignedFrameStack` (WINDOW_MAX=96 frames at most, not the whole
+/// clip), and windows are built and torn down one at a time inside
+/// `buildWindow` -- so DYNAMIC mode's peak resident aligned-stack memory
+/// is bounded by one window's worth of frames, not O(N) or O(K*window),
+/// even though the clip may need several windows to cover its full
+/// length.
+///
+/// Exposure-gain and the trimmed-mean's sort/trim math still run in
+/// Float32 (converted from the resident UInt8 sample on the fly, per
+/// pixel, per frame) for numerical precision during aggregation -- only
+/// the AT-REST storage moved to UInt8, matching the task's guidance to
+/// keep accumulation precision while cutting resident footprint.
 enum BackgroundReconstructor {
     /// px: dilate the person mask OUT before sampling, so codec-bleed /
     /// silhouette-edge pixels never contaminate the plate -- matches
@@ -25,6 +86,17 @@ enum BackgroundReconstructor {
     /// sliver of alignment error), so it's still routed to the neural/
     /// push-pull core if it was EVER part of the hole union.
     static func minCoverage(sampledFrames: Int) -> Int { max(3, sampledFrames / 20) }
+
+    /// Row-band size for trimmed-mean's per-pixel sample gathering -- keeps
+    /// the scratch `samples` buffer's peak size bounded (band width) rather
+    /// than needing a separate full-frame-sized scratch array. Purely a
+    /// loop-structuring constant, doesn't change the result.
+    static let trimBandRows = 64
+
+    enum Method: String {
+        case staticJitter = "STATIC/JITTER"
+        case dynamicWindowed = "DYNAMIC (windowed)"
+    }
 
     struct Result {
         let plateBeforeLama: RGBBuffer
@@ -39,17 +111,109 @@ enum BackgroundReconstructor {
         let neverRevealed: [Bool]
         let alignMs: Double
         let trimmedMeanMs: Double
+        /// Which branch actually ran -- Android self-decides STATIC/JITTER
+        /// vs DYNAMIC windowed based on measured camera motion
+        /// (computeTrajectory); surfaced here so the benchmark dashboard
+        /// can show a method badge confirming which path executed on a
+        /// given clip, the same way LaMa vs push-pull is already surfaced.
+        let method: Method
+        /// Diagnostic detail for the method badge/log (e.g. motion
+        /// deviation, window count) -- empty for the STATIC path.
+        let methodDetail: String
+        /// Non-nil only in DYNAMIC mode: the built windows, needed by the
+        /// caller to render each frame's own windowed composite via
+        /// `BackgroundReconstructor.compositeFrame`. STATIC mode's callers
+        /// instead paste `plateBeforeLama`-after-core-fill into each
+        /// frame's own mask region directly (existing BenchmarkView logic).
+        let dynamicWindows: [WindowPlate]?
+    }
+
+    // MARK: - Packed / compact storage
+
+    /// 1 bit per pixel instead of Swift's 1 BYTE per `Bool` -- an 8x
+    /// reduction for the per-frame "valid" (not-hole) plane, which is the
+    /// second-largest resident allocation after the UInt8 RGB stack (see
+    /// the memory-model doc comment above).
+    struct PackedBoolPlane {
+        private(set) var words: [UInt64]
+        let count: Int
+
+        init(_ src: [Bool]) {
+            count = src.count
+            var w = [UInt64](repeating: 0, count: (count + 63) / 64)
+            for i in 0..<count where src[i] {
+                w[i >> 6] |= (1 << UInt64(i & 63))
+            }
+            words = w
+        }
+
+        @inline(__always) func get(_ i: Int) -> Bool {
+            (words[i >> 6] >> UInt64(i & 63)) & 1 != 0
+        }
+    }
+
+    /// A single frame's aligned color data, stored at 1 byte/channel/pixel
+    /// (UInt8) instead of the original 4 bytes/channel/pixel (Float32) --
+    /// the core of the memory fix. `valid` is bit-packed (see
+    /// PackedBoolPlane). Exposure gain is already baked into `r`/`g`/`b`
+    /// at construction time (applied once, in Float32, then rounded/
+    /// clamped down to UInt8) -- matches the original code's per-frame
+    /// gain-then-store order, just narrowing the "at rest" representation.
+    struct AlignedFrame {
+        var r: [UInt8]
+        var g: [UInt8]
+        var b: [UInt8]
+        var valid: PackedBoolPlane
+    }
+
+    /// Bounded-footprint stack of aligned frames for one aggregation pass
+    /// (either the whole clip in STATIC mode, or one window's frame range
+    /// in DYNAMIC mode). Frames are appended one at a time as they're
+    /// aligned, so the original full-resolution Float32 `RGBBuffer` for
+    /// frame i is never retained past the point where frame i has been
+    /// warped+gained+packed into this stack.
+    final class AlignedFrameStack {
+        private(set) var frames: [AlignedFrame] = []
+        let width: Int
+        let height: Int
+
+        init(width: Int, height: Int) {
+            self.width = width
+            self.height = height
+        }
+
+        func append(r: [Float], g: [Float], b: [Float], hole: [Bool]) {
+            let n = width * height
+            var r8 = [UInt8](repeating: 0, count: n)
+            var g8 = [UInt8](repeating: 0, count: n)
+            var b8 = [UInt8](repeating: 0, count: n)
+            for i in 0..<n {
+                r8[i] = UInt8(min(255, max(0, r[i].rounded())))
+                g8[i] = UInt8(min(255, max(0, g[i].rounded())))
+                b8[i] = UInt8(min(255, max(0, b[i].rounded())))
+            }
+            let validBools = hole.map { !$0 }
+            frames.append(AlignedFrame(r: r8, g: g8, b: b8, valid: PackedBoolPlane(validBools)))
+        }
     }
 
     /// 3-level coarse->fine->native alignment pyramid, per the documented
     /// levels: (100px, +-16px), (300px, +-4px), (native, +-3px). Returns
     /// (dx, dy) subpixel shift of `tgt` relative to `ref`.
     static func alignPyramid(ref: [Float], tgt: [Float], width: Int, height: Int) -> (dx: Double, dy: Double) {
+        alignPyramid(ref: ref, tgt: tgt, width: width, height: height, levels: [(100, 16), (300, 4), (max(width, height), 3)])
+    }
+
+    /// Generalized pyramid entry used by both the STATIC path's 3-level
+    /// pyramid and the DYNAMIC path's lighter 2-level WINDOW_PYRAMID
+    /// (no native-resolution level -- windows are aligned ref-to-ref and
+    /// frame-to-ref far more often than the single STATIC plate, so the
+    /// per-alignment cost is kept down by skipping the expensive
+    /// native-res refinement step, matching Android's WINDOW_PYRAMID).
+    static func alignPyramid(ref: [Float], tgt: [Float], width: Int, height: Int, levels: [(targetDim: Int, radius: Int)]) -> (dx: Double, dy: Double) {
         var totalDx = 0.0
         var totalDy = 0.0
         var curTgt = tgt
-
-        let levels: [(targetDim: Int, radius: Int)] = [(100, 16), (300, 4), (max(width, height), 3)]
 
         for (targetDim, radius) in levels {
             let scale = min(1.0, Double(targetDim) / Double(max(width, height)))
@@ -194,6 +358,19 @@ enum BackgroundReconstructor {
         return top * (1 - fy) + bottom * fy
     }
 
+    /// Bilinear sample of a full RGBBuffer plate at fractional (x, y) --
+    /// used by cross-window borrowing and per-frame windowed compositing
+    /// to pull a real pixel from a (possibly different) plate at a
+    /// shifted world coordinate.
+    static func bilinearRGB(_ plate: RGBBuffer, x: Double, y: Double) -> (r: Float, g: Float, b: Float) {
+        let w = plate.width, h = plate.height
+        return (
+            sampleBilinearReplicate(plate.r, width: w, height: h, x: x, y: y),
+            sampleBilinearReplicate(plate.g, width: w, height: h, x: x, y: y),
+            sampleBilinearReplicate(plate.b, width: w, height: h, x: x, y: y)
+        )
+    }
+
     /// In-place binary dilation by radius `r` (separable max-filter over a
     /// [Bool] plane) -- matches Android's dilateInPlace(). Only ever adds
     /// `true` pixels, never removes them.
@@ -242,19 +419,23 @@ enum BackgroundReconstructor {
         return count > 0 ? sum / Double(count) : 128.0
     }
 
-    /// Per-pixel temporal trimmed-mean across all aligned frames: for each
-    /// pixel, gather values from every frame where it's real background
-    /// (not person-hole), sort, and mean the middle 60% (drop lowest/
-    /// highest 20% of the VALID samples, matching robustCenter() /
-    /// trimmed_mean_vectorized()'s per-pixel-n_valid semantics -- not a
-    /// fixed global trim count). Runs once per color channel. Returns the
-    /// aggregated plate channel plus `neverRevealed` (zero real samples)
-    /// and `lowCoverage` (some samples, but fewer than minCov -- still
-    /// routed to the core if part of the hole union at the call site).
-    /// Matches Android's per-pixel k>=minCov / 0<k<minCov / k==0 three-way
-    /// split (aggregatePlate() line 422-426).
-    static func trimmedMean(channelStack: [[Float]], validStack: [[Bool]], width: Int, height: Int, trimFrac: Float = 0.20) -> (plate: [Float], neverRevealed: [Bool], lowCoverage: [Bool]) {
-        let n = channelStack.count
+    /// Per-pixel temporal trimmed-mean across all aligned frames in
+    /// `stack`: for each pixel, gather values from every frame where it's
+    /// real background (not person-hole), sort, and mean the middle 60%
+    /// (drop lowest/highest 20% of the VALID samples, matching
+    /// robustCenter() / trimmed_mean_vectorized()'s per-pixel-n_valid
+    /// semantics -- not a fixed global trim count). Runs once per color
+    /// channel, in horizontal row bands (`trimBandRows`) purely to keep
+    /// the loop structure friendly to a bounded scratch buffer -- the
+    /// result is identical to a single flat loop over all pixels. Returns
+    /// the aggregated plate channel plus `neverRevealed` (zero real
+    /// samples) and `lowCoverage` (some samples, but fewer than minCov --
+    /// still routed to the core if part of the hole union at the call
+    /// site). Matches Android's per-pixel k>=minCov / 0<k<minCov / k==0
+    /// three-way split (aggregatePlate() line 422-426).
+    static func trimmedMean(stack: AlignedFrameStack, channel: KeyPath<AlignedFrame, [UInt8]>, trimFrac: Float = 0.20) -> (plate: [Float], neverRevealed: [Bool], lowCoverage: [Bool]) {
+        let n = stack.frames.count
+        let width = stack.width, height = stack.height
         let pixCount = width * height
         let minCov = minCoverage(sampledFrames: n)
         var plate = [Float](repeating: 0, count: pixCount)
@@ -262,60 +443,84 @@ enum BackgroundReconstructor {
         var lowCoverage = [Bool](repeating: false, count: pixCount)
 
         var samples = [Float](repeating: 0, count: n)
-        for p in 0..<pixCount {
-            var count = 0
-            for f in 0..<n where validStack[f][p] {
-                samples[count] = channelStack[f][p]
-                count += 1
-            }
-            guard count > 0 else { continue }
-            neverRevealed[p] = false
-            lowCoverage[p] = count < minCov
+        var band = 0
+        while band < height {
+            let bandEnd = min(band + trimBandRows, height)
+            for y in band..<bandEnd {
+                for x in 0..<width {
+                    let p = y * width + x
+                    var count = 0
+                    for f in 0..<n where stack.frames[f].valid.get(p) {
+                        samples[count] = Float(stack.frames[f][keyPath: channel][p])
+                        count += 1
+                    }
+                    guard count > 0 else { continue }
+                    neverRevealed[p] = false
+                    lowCoverage[p] = count < minCov
 
-            let validSlice = samples[0..<count].sorted()
-            let lo = Int(Float(count) * trimFrac)
-            let hi = count - lo
-            if hi <= lo {
-                plate[p] = validSlice.reduce(0, +) / Float(count)
-            } else {
-                let kept = validSlice[lo..<hi]
-                plate[p] = kept.reduce(0, +) / Float(kept.count)
+                    let validSlice = samples[0..<count].sorted()
+                    let lo = Int(Float(count) * trimFrac)
+                    let hi = count - lo
+                    if hi <= lo {
+                        plate[p] = validSlice.reduce(0, +) / Float(count)
+                    } else {
+                        let kept = validSlice[lo..<hi]
+                        plate[p] = kept.reduce(0, +) / Float(kept.count)
+                    }
+                }
             }
+            band = bandEnd
         }
         return (plate, neverRevealed, lowCoverage)
     }
 
-    /// Full stage: align every frame to frame 0, dilate each frame's mask
-    /// (keeps codec-bleed/silhouette-edge pixels out of the plate samples,
-    /// matching MASK_DILATE), exposure-normalize each frame's samples to
-    /// the reference frame's mean luma before aggregating, then
-    /// trimmed-mean-aggregate all channels. Does NOT run LaMa/push-pull
-    /// (caller does that separately via LamaRunner, matching the existing
-    /// per-stage timing discipline).
+    /// Full stage: self-decides between the STATIC/JITTER single-plate
+    /// path and the DYNAMIC windowed path based on measured camera motion
+    /// (computeTrajectory), mirroring Android's
+    /// `if (traj.needsWindowing) { ...windowed... } else { ...static... }`
+    /// structure (BackgroundInpaint.kt).
     static func reconstruct(colorFrames: [RGBBuffer], masks: [MaskBuffer]) -> Result {
         precondition(!colorFrames.isEmpty, "need at least 1 frame")
         let width = colorFrames[0].width
         let height = colorFrames[0].height
         let n = colorFrames.count
+
+        let traj = computeTrajectory(colorFrames: colorFrames, masks: masks, width: width, height: height)
+        if traj.needsWindowing && n >= WINDOW_MIN {
+            return reconstructDynamic(colorFrames: colorFrames, masks: masks, width: width, height: height, traj: traj)
+        }
+        return reconstructStatic(colorFrames: colorFrames, masks: masks, width: width, height: height, traj: traj)
+    }
+
+    // MARK: - STATIC/JITTER path
+
+    /// Aligns every frame to frame 0, dilates each frame's mask (keeps
+    /// codec-bleed/silhouette-edge pixels out of the plate samples,
+    /// matching MASK_DILATE), exposure-normalizes each frame's samples to
+    /// the reference frame's mean luma before aggregating, then
+    /// trimmed-mean-aggregates all channels -- via the bounded-memory
+    /// `AlignedFrameStack` (UInt8 storage, see the type's/enum's memory-
+    /// model doc comments) rather than the old `[[Float]]` design.
+    private static func reconstructStatic(colorFrames: [RGBBuffer], masks: [MaskBuffer], width: Int, height: Int, traj: Traj) -> Result {
+        let n = colorFrames.count
         let pixCount = width * height
 
         let tAlignStart = CFAbsoluteTimeGetCurrent()
         let refGray = colorFrames[0].grayscale()
+        let refHole0 = dilate(masks[0].isPerson, width: width, height: height, radius: maskDilate)
+        let refMeanLuma = meanLuma(colorFrames[0], hole: refHole0)
 
-        // Dilate every frame's hole mask BEFORE alignment/sampling so the
-        // person's silhouette edge (and any codec-bleed bordering it)
-        // never counts as "real background" -- matches Android sampling
-        // person-holes dilated by MASK_DILATE ahead of aggregatePlate().
-        let dilatedHoles = masks.map { dilate($0.isPerson, width: width, height: height, radius: maskDilate) }
-        let refMeanLuma = meanLuma(colorFrames[0], hole: dilatedHoles[0])
-
-        var alignedR = [colorFrames[0].r]
-        var alignedG = [colorFrames[0].g]
-        var alignedB = [colorFrames[0].b]
-        var alignedValid = [dilatedHoles[0].map { !$0 }]
-        var union = dilatedHoles[0]
+        let stack = AlignedFrameStack(width: width, height: height)
+        stack.append(r: colorFrames[0].r, g: colorFrames[0].g, b: colorFrames[0].b, hole: refHole0)
+        var union = refHole0
 
         for i in 1..<n {
+            // Dilate this frame's mask, align, exposure-gain, and pack
+            // straight into the UInt8 stack -- the source frame's Float32
+            // `RGBBuffer` (owned by the caller's `colorFrames` array, not
+            // copied here beyond this loop iteration's locals) is never
+            // additionally retained by this function once packed.
+            let hole = dilate(masks[i].isPerson, width: width, height: height, radius: maskDilate)
             let tgtGray = colorFrames[i].grayscale()
             let (dx, dy) = alignPyramid(ref: refGray, tgt: tgtGray, width: width, height: height)
 
@@ -324,27 +529,28 @@ enum BackgroundReconstructor {
             // auto-exposure drift across frames blurs/smears the trimmed-
             // mean plate even with perfect alignment (matches Android's
             // per-frame gain in aggregatePlate(), clamped [0.85, 1.18]).
-            let frameMeanLuma = meanLuma(colorFrames[i], hole: dilatedHoles[i])
+            let frameMeanLuma = meanLuma(colorFrames[i], hole: hole)
             let gain = Float(min(1.18, max(0.85, refMeanLuma / max(1.0, frameMeanLuma))))
             let gainedR = colorFrames[i].r.map { min(255, max(0, $0 * gain)) }
             let gainedG = colorFrames[i].g.map { min(255, max(0, $0 * gain)) }
             let gainedB = colorFrames[i].b.map { min(255, max(0, $0 * gain)) }
 
-            alignedR.append(warpTranslate(gainedR, width: width, height: height, dx: dx, dy: dy, nearest: false))
-            alignedG.append(warpTranslate(gainedG, width: width, height: height, dx: dx, dy: dy, nearest: false))
-            alignedB.append(warpTranslate(gainedB, width: width, height: height, dx: dx, dy: dy, nearest: false))
-            let maskF = dilatedHoles[i].map { $0 ? Float(1) : Float(0) }
+            let warpedR = warpTranslate(gainedR, width: width, height: height, dx: dx, dy: dy, nearest: false)
+            let warpedG = warpTranslate(gainedG, width: width, height: height, dx: dx, dy: dy, nearest: false)
+            let warpedB = warpTranslate(gainedB, width: width, height: height, dx: dx, dy: dy, nearest: false)
+            let maskF = hole.map { $0 ? Float(1) : Float(0) }
             let warpedMaskF = warpTranslate(maskF, width: width, height: height, dx: dx, dy: dy, nearest: true)
             let warpedHole = warpedMaskF.map { $0 >= 0.5 }
-            alignedValid.append(warpedHole.map { !$0 })
+
+            stack.append(r: warpedR, g: warpedG, b: warpedB, hole: warpedHole)
             for p in 0..<pixCount where warpedHole[p] { union[p] = true }
         }
         let alignMs = (CFAbsoluteTimeGetCurrent() - tAlignStart) * 1000
 
         let tTrimStart = CFAbsoluteTimeGetCurrent()
-        let (rPlate, neverRevealedR, lowCovR) = trimmedMean(channelStack: alignedR, validStack: alignedValid, width: width, height: height)
-        let (gPlate, _, _) = trimmedMean(channelStack: alignedG, validStack: alignedValid, width: width, height: height)
-        let (bPlate, _, _) = trimmedMean(channelStack: alignedB, validStack: alignedValid, width: width, height: height)
+        let (rPlate, neverRevealedR, lowCovR) = trimmedMean(stack: stack, channel: \.r)
+        let (gPlate, _, _) = trimmedMean(stack: stack, channel: \.g)
+        let (bPlate, _, _) = trimmedMean(stack: stack, channel: \.b)
         var rPlateOut = rPlate, gPlateOut = gPlate, bPlateOut = bPlate
         var neverRevealed = neverRevealedR
 
@@ -383,6 +589,511 @@ enum BackgroundReconstructor {
         let trimmedMeanMs = (CFAbsoluteTimeGetCurrent() - tTrimStart) * 1000
 
         let plate = RGBBuffer(r: rPlateOut, g: gPlateOut, b: bPlateOut, width: width, height: height)
-        return Result(plateBeforeLama: plate, core: core, union: union, neverRevealed: neverRevealed, alignMs: alignMs, trimmedMeanMs: trimmedMeanMs)
+        let detail = String(format: "devC=%.1fpx (R_MAX=%.1fpx) -- single plate covers the clip's motion", traj.devC, rMax(width: width))
+        return Result(plateBeforeLama: plate, core: core, union: union, neverRevealed: neverRevealed, alignMs: alignMs, trimmedMeanMs: trimmedMeanMs, method: .staticJitter, methodDetail: detail, dynamicWindows: nil)
+    }
+
+    // MARK: - Motion detection (STATIC vs DYNAMIC self-decision)
+
+    private static let coarseDim = 100
+    private static let coarseSearch = 16
+    private static let rMaxBase = 60.0
+
+    struct Traj {
+        let devC: Double
+        let needsWindowing: Bool
+    }
+
+    private static func rMax(width: Int) -> Double { rMaxBase * Double(width) / 640.0 }
+
+    private static func dimsFor(width: Int, height: Int, target: Int) -> (dw: Int, dh: Int) {
+        let s = min(1.0, Double(target) / Double(max(width, height)))
+        return (max(2, Int(Double(width) * s)), max(2, Int(Double(height) * s)))
+    }
+
+    /// Downscales a color frame + its person mask to (dw, dh) and returns
+    /// (grayscale, valid) -- valid = NOT the (undilated) person-hole,
+    /// matching Android's downGrayValid() used by the coarse motion
+    /// pre-pass. Deliberately cheap: area resize via the existing vImage
+    /// helper, no alignment/gain applied (this is only for the motion
+    /// PRE-PASS, not the real aggregation).
+    private static func downGrayValid(color: RGBBuffer, mask: MaskBuffer, dw: Int, dh: Int) -> (gray: [Float], valid: [Bool]) {
+        let gray = color.grayscale()
+        let grayDown = resizeArea(gray, width: color.width, height: color.height, newW: dw, newH: dh)
+        let holeF = mask.isPerson.map { $0 ? Float(1) : Float(0) }
+        let holeDown = resizeArea(holeF, width: color.width, height: color.height, newW: dw, newH: dh)
+        let valid = holeDown.map { $0 < 0.5 }
+        return (grayDown, valid)
+    }
+
+    /// CHAINED global-motion trajectory: consecutive-pair shifts SUMMED, so
+    /// the measurable range is UNBOUNDED (a frame-0-anchored detector
+    /// saturates + aliases on a smooth pan). devC = worst deviation from
+    /// the trajectory's bbox center; > R_MAX(w) means one aligned plate
+    /// can't cover it -> windowing. Ported from Android's
+    /// computeTrajectory() (BackgroundInpaint.kt).
+    static func computeTrajectory(colorFrames: [RGBBuffer], masks: [MaskBuffer], width: Int, height: Int) -> Traj {
+        let n = colorFrames.count
+        guard n >= 3 else { return Traj(devC: 0, needsWindowing: false) }
+
+        let cnt = min(n, 16)
+        let idxs: [Int] = (0..<cnt).map { cnt > 1 ? $0 * (n - 1) / (cnt - 1) : 0 }
+        let (dw, dh) = dimsFor(width: width, height: height, target: coarseDim)
+
+        var grays: [[Float]] = []
+        var valids: [[Bool]] = []
+        for t in idxs {
+            let (g, v) = downGrayValid(color: colorFrames[t], mask: masks[t], dw: dw, dh: dh)
+            grays.append(g); valids.append(v)
+        }
+        let m = grays.count
+        guard m >= 2 else { return Traj(devC: 0, needsWindowing: false) }
+
+        let up = Double(width) / Double(dw)
+        var tx = [Double](repeating: 0, count: m)
+        var ty = [Double](repeating: 0, count: m)
+        for k in 1..<m {
+            let (sdx, sdy) = alignTranslationMasked(refGray: grays[k - 1], refValid: valids[k - 1], tgtGray: grays[k], tgtValid: valids[k], width: dw, height: dh, searchRadius: coarseSearch)
+            tx[k] = tx[k - 1] + sdx * up
+            ty[k] = ty[k - 1] + sdy * up
+        }
+        var mnx = tx[0], mxx = tx[0], mny = ty[0], mxy = ty[0]
+        for k in 1..<m {
+            mnx = min(mnx, tx[k]); mxx = max(mxx, tx[k])
+            mny = min(mny, ty[k]); mxy = max(mxy, ty[k])
+        }
+        let cx = (mnx + mxx) / 2, cy = (mny + mxy) / 2
+        var devC = 0.0
+        for k in 0..<m {
+            let d = hypot(tx[k] - cx, ty[k] - cy)
+            if d > devC { devC = d }
+        }
+        return Traj(devC: devC, needsWindowing: devC > rMax(width: width))
+    }
+
+    /// Same integer-search + parabolic-subpixel `alignTranslation`, but
+    /// respecting a valid-pixel mask (person-hole excluded) in the SAD sum
+    /// -- the coarse motion pre-pass and cross-window ref-to-ref alignment
+    /// both need to ignore the moving subject, not just raw pixel
+    /// intensity, or a large/near-frame person would dominate the SAD and
+    /// masquerade as camera motion.
+    private static func alignTranslationMasked(refGray: [Float], refValid: [Bool], tgtGray: [Float], tgtValid: [Bool], width: Int, height: Int, searchRadius: Int) -> (Double, Double) {
+        let cy0 = height / 2
+        let cx0 = width / 2
+        let half = min(height, width) / 4
+        guard half > 0 else { return (0, 0) }
+
+        func sadAt(_ ddx: Int, _ ddy: Int, fallback: Double) -> Double {
+            let y0 = cy0 - half + ddy
+            let x0 = cx0 - half + ddx
+            guard y0 >= 0, x0 >= 0, y0 + 2 * half <= height, x0 + 2 * half <= width else { return fallback }
+            var sum = 0.0
+            for y in 0..<(2 * half) {
+                let refRowBase = (cy0 - half + y) * width + (cx0 - half)
+                let tgtRowBase = (y0 + y) * width + x0
+                for x in 0..<(2 * half) {
+                    let ri = refRowBase + x, ti = tgtRowBase + x
+                    guard refValid[ri], tgtValid[ti] else { continue }
+                    sum += abs(Double(refGray[ri]) - Double(tgtGray[ti]))
+                }
+            }
+            return sum
+        }
+
+        var bestSad = Double.infinity
+        var bestDx = 0
+        var bestDy = 0
+        for dy in -searchRadius...searchRadius {
+            for dx in -searchRadius...searchRadius {
+                let s = sadAt(dx, dy, fallback: .infinity)
+                if s < bestSad {
+                    bestSad = s
+                    bestDx = dx
+                    bestDy = dy
+                }
+            }
+        }
+
+        func parabolic(_ m1: Double, _ zero: Double, _ p1: Double) -> Double {
+            let denom = m1 - 2 * zero + p1
+            guard abs(denom) >= 1e-6 else { return 0.0 }
+            return 0.5 * (m1 - p1) / denom
+        }
+
+        let sxLeft = sadAt(bestDx - 1, bestDy, fallback: bestSad)
+        let sxRight = sadAt(bestDx + 1, bestDy, fallback: bestSad)
+        let syUp = sadAt(bestDx, bestDy - 1, fallback: bestSad)
+        let syDown = sadAt(bestDx, bestDy + 1, fallback: bestSad)
+        let sx = parabolic(sxLeft, bestSad, sxRight)
+        let sy = parabolic(syUp, bestSad, syDown)
+
+        return (Double(bestDx) + sx, Double(bestDy) + sy)
+    }
+
+    // MARK: - DYNAMIC windowed path
+
+    private static let WINDOW_MIN = 16
+    private static let WINDOW_MAX = 96
+    private static let MAX_WINDOWS = 8
+    private static let windowPyramidLevels: [(targetDim: Int, radius: Int)] = [(100, 16), (300, 4)]
+
+    /// One window's aggregated plate + bookkeeping needed for cross-window
+    /// borrowing and per-frame compositing. `refIndex` is the source-frame
+    /// index this window aligned everything to (the MIDDLE frame of the
+    /// window, per Android, not frame 0) -- kept so `Aligner` can compute
+    /// ref-to-ref shifts against other windows without re-deriving it.
+    final class WindowPlate {
+        var plate: RGBBuffer
+        var core: [Bool]
+        let union: [Bool]
+        let aligner: Aligner
+        let start: Int
+        let end: Int
+        let overlap: Int
+
+        init(plate: RGBBuffer, core: [Bool], union: [Bool], aligner: Aligner, start: Int, end: Int, overlap: Int) {
+            self.plate = plate; self.core = core; self.union = union
+            self.aligner = aligner; self.start = start; self.end = end; self.overlap = overlap
+        }
+    }
+
+    /// Per-window alignment context: the window's reference-frame grayscale
+    /// (kept, small: one grayscale plane) plus per-frame shifts relative to
+    /// that reference, so `shiftOf(frame:)` (per-frame compositing) and
+    /// `refShiftTo(other:)` (cross-window borrowing) don't need to re-run
+    /// the SAD search from scratch every time they're queried.
+    final class Aligner {
+        let refIndex: Int
+        let refGray: [Float]
+        private var shifts: [Int: (dx: Double, dy: Double)] = [:]
+        let width: Int
+        let height: Int
+
+        init(refIndex: Int, refGray: [Float], width: Int, height: Int) {
+            self.refIndex = refIndex; self.refGray = refGray
+            self.width = width; self.height = height
+        }
+
+        func setShift(_ frame: Int, dx: Double, dy: Double) { shifts[frame] = (dx, dy) }
+        func shiftOf(_ frame: Int) -> (dx: Double, dy: Double) { shifts[frame] ?? (0, 0) }
+
+        /// Shift (dx, dy) such that `other.ref(x+dx, y+dy) ~= self.ref(x,y)`
+        /// -- computed via the same multi-level SAD+parabolic search as the
+        /// main aligner, between the two windows' reference-frame grayscale
+        /// planes (both already resident, one plane each -- cheap).
+        func refShiftTo(_ other: Aligner) -> (dx: Double, dy: Double) {
+            BackgroundReconstructor.alignPyramid(ref: refGray, tgt: other.refGray, width: width, height: height, levels: BackgroundReconstructor.windowPyramidLevels)
+        }
+    }
+
+    /// v (px/frame) estimate driving the window-length formula in
+    /// buildWindowedPlates -- matches Android's `vPerFrame` local.
+    private static func perFrameVelocity(devC: Double, n: Int) -> Double {
+        n > 1 ? (2.0 * devC / Double(n - 1)) : 0.0
+    }
+
+    private static func reconstructDynamic(colorFrames: [RGBBuffer], masks: [MaskBuffer], width: Int, height: Int, traj: Traj) -> Result {
+        let n = colorFrames.count
+        let pixCount = width * height
+
+        let tAlignStart = CFAbsoluteTimeGetCurrent()
+
+        let rMaxW = rMax(width: width)
+        let vPerFrame = perFrameVelocity(devC: traj.devC, n: n)
+        let lenRaw = vPerFrame > 0.01 ? Int(2.0 * rMaxW / vPerFrame) : WINDOW_MAX
+        let len = max(WINDOW_MIN, min(WINDOW_MAX, lenRaw))
+        let overlap = max(4, len / 6)
+        var hop = max(1, len - overlap)
+        if n > len {
+            hop = max(hop, (n - len + MAX_WINDOWS - 2) / (MAX_WINDOWS - 1))
+        }
+
+        var windows: [WindowPlate] = []
+        var start = 0
+        while start < n {
+            let end = min(start + len, n)
+            let refT = (start + end) / 2
+            let win = buildWindow(colorFrames: colorFrames, masks: masks, width: width, height: height, start: start, end: end, refIndex: refT)
+            windows.append(win)
+            if end >= n { break }
+            start += hop
+        }
+        let alignMs = (CFAbsoluteTimeGetCurrent() - tAlignStart) * 1000
+
+        let tTrimStart = CFAbsoluteTimeGetCurrent()
+        borrowAcrossWindows(windows, width: width, height: height)
+
+        // Union/core reported at the top level are the OR across all
+        // windows -- matches "the full region that ever needed
+        // reconstruction" semantics from the STATIC path, generalized to
+        // however many windows contributed. Any remaining core pixel here
+        // (a window's hole no neighbor could donate a real pixel for) still
+        // needs a neural/push-pull fill -- the caller does that via
+        // `fillWindowCores(_:lamaRunner:)` on `dynamicWindows` after this
+        // function returns (same "reconstruct() hands back core, caller
+        // fills it" split the STATIC path already uses), kept as a
+        // per-window operation since a core pixel's neural fill only makes
+        // sense in that window's own aligned coordinate frame.
+        var unionAll = [Bool](repeating: false, count: pixCount)
+        var coreAll = [Bool](repeating: false, count: pixCount)
+        for w in windows {
+            for p in 0..<pixCount {
+                if w.union[p] { unionAll[p] = true }
+                if w.core[p] { coreAll[p] = true }
+            }
+        }
+        let trimmedMeanMs = (CFAbsoluteTimeGetCurrent() - tTrimStart) * 1000
+
+        // `plateBeforeLama` reports the FIRST window's plate as a
+        // representative preview image for the dashboard gallery --
+        // DYNAMIC mode's real per-frame output comes from
+        // `compositeFrame(frameIndex:)` over ALL windows, not a single
+        // global plate (a single plate is exactly what STATIC mode has and
+        // DYNAMIC mode does NOT, by construction).
+        let previewPlate = windows.first?.plate ?? colorFrames[0]
+        let detail = "devC=\(String(format: "%.1f", traj.devC))px > R_MAX=\(String(format: "%.1f", rMaxW))px -- \(windows.count) window(s), len=\(len) overlap=\(overlap) hop=\(hop)"
+        return Result(plateBeforeLama: previewPlate, core: coreAll, union: unionAll, neverRevealed: coreAll, alignMs: alignMs, trimmedMeanMs: trimmedMeanMs, method: .dynamicWindowed, methodDetail: detail, dynamicWindows: windows)
+    }
+
+    /// Aligns every frame within [start, end) to the window's MIDDLE frame
+    /// (refIndex) and aggregates via the same trimmed-mean logic as the
+    /// STATIC path, scoped to just this window's frames, via a fresh
+    /// AlignedFrameStack that's released once this function returns --
+    /// keeping DYNAMIC mode's peak resident aligned-frame memory bounded
+    /// by ONE window's worth of frames, not the whole clip. Neural/push-
+    /// pull core-fill for the window happens later, via
+    /// `fillWindowCores(_:lamaRunner:)` (see its doc comment for why it's
+    /// a separate call) -- matches Android's per-window body of
+    /// buildWindowedPlates() up to (but not including) its fillCore() call.
+    private static func buildWindow(colorFrames: [RGBBuffer], masks: [MaskBuffer], width: Int, height: Int, start: Int, end: Int, refIndex: Int) -> WindowPlate {
+        let pixCount = width * height
+        let refGray = colorFrames[refIndex].grayscale()
+        let aligner = Aligner(refIndex: refIndex, refGray: refGray, width: width, height: height)
+
+        let refHole = dilate(masks[refIndex].isPerson, width: width, height: height, radius: maskDilate)
+        let refMeanLuma = meanLuma(colorFrames[refIndex], hole: refHole)
+
+        let stack = AlignedFrameStack(width: width, height: height)
+        var union = [Bool](repeating: false, count: pixCount)
+
+        for i in start..<end {
+            let hole = dilate(masks[i].isPerson, width: width, height: height, radius: maskDilate)
+            let dx: Double, dy: Double
+            if i == refIndex {
+                dx = 0; dy = 0
+            } else {
+                let tgtGray = colorFrames[i].grayscale()
+                (dx, dy) = alignPyramid(ref: refGray, tgt: tgtGray, width: width, height: height, levels: windowPyramidLevels)
+            }
+            aligner.setShift(i, dx: dx, dy: dy)
+
+            let frameMeanLuma = meanLuma(colorFrames[i], hole: hole)
+            let gain = Float(min(1.18, max(0.85, refMeanLuma / max(1.0, frameMeanLuma))))
+            let gainedR = colorFrames[i].r.map { min(255, max(0, $0 * gain)) }
+            let gainedG = colorFrames[i].g.map { min(255, max(0, $0 * gain)) }
+            let gainedB = colorFrames[i].b.map { min(255, max(0, $0 * gain)) }
+
+            let isIdentity = (dx == 0 && dy == 0)
+            let warpedR = isIdentity ? gainedR : warpTranslate(gainedR, width: width, height: height, dx: dx, dy: dy, nearest: false)
+            let warpedG = isIdentity ? gainedG : warpTranslate(gainedG, width: width, height: height, dx: dx, dy: dy, nearest: false)
+            let warpedB = isIdentity ? gainedB : warpTranslate(gainedB, width: width, height: height, dx: dx, dy: dy, nearest: false)
+            let warpedHole: [Bool]
+            if isIdentity {
+                warpedHole = hole
+            } else {
+                let maskF = hole.map { $0 ? Float(1) : Float(0) }
+                let warpedMaskF = warpTranslate(maskF, width: width, height: height, dx: dx, dy: dy, nearest: true)
+                warpedHole = warpedMaskF.map { $0 >= 0.5 }
+            }
+
+            stack.append(r: warpedR, g: warpedG, b: warpedB, hole: warpedHole)
+            for p in 0..<pixCount where warpedHole[p] { union[p] = true }
+        }
+
+        let (rPlate, neverRevealedR, lowCovR) = trimmedMean(stack: stack, channel: \.r)
+        let (gPlate, _, _) = trimmedMean(stack: stack, channel: \.g)
+        let (bPlate, _, _) = trimmedMean(stack: stack, channel: \.b)
+        var rPlateOut = rPlate, gPlateOut = gPlate, bPlateOut = bPlate
+
+        var core = [Bool](repeating: false, count: pixCount)
+        for p in 0..<pixCount {
+            if neverRevealedR[p] { core[p] = true }
+            else if lowCovR[p] && union[p] { core[p] = true }
+        }
+
+        // Same "only the window's own reference-frame hole needs
+        // reconstruction" restriction as STATIC, scoped to refIndex's mask.
+        let needsReconstruction = masks[refIndex].isPerson
+        for p in 0..<pixCount where !needsReconstruction[p] {
+            rPlateOut[p] = colorFrames[refIndex].r[p]
+            gPlateOut[p] = colorFrames[refIndex].g[p]
+            bPlateOut[p] = colorFrames[refIndex].b[p]
+            core[p] = false
+            union[p] = false
+        }
+
+        let plate = RGBBuffer(r: rPlateOut, g: gPlateOut, b: bPlateOut, width: width, height: height)
+        let overlap = max(4, (end - start) / 6)
+        return WindowPlate(plate: plate, core: core, union: union, aligner: aligner, start: start, end: end, overlap: overlap)
+    }
+
+    /// For each window's never-revealed core pixel, if an adjacent window
+    /// (+-1, +-2) holds a REAL pixel at that world point (found via the
+    /// ref->ref shift between the two windows' Aligners), copy it in and
+    /// clear the core flag. Two rounds let reveals propagate across
+    /// windows -- matches Android's borrowAcrossWindows().
+    static func borrowAcrossWindows(_ windows: [WindowPlate], width: Int, height: Int) {
+        guard windows.count >= 2 else { return }
+        for _ in 0..<2 {
+            for ki in windows.indices {
+                let k = windows[ki]
+                if !k.core.contains(true) { continue }
+                for jd in [-1, 1, -2, 2] {
+                    let ji = ki + jd
+                    guard ji >= 0, ji < windows.count else { continue }
+                    let j = windows[ji]
+                    let shift = k.aligner.refShiftTo(j.aligner)
+                    let dx = shift.dx, dy = shift.dy
+                    for y in 0..<height {
+                        for x in 0..<width {
+                            let p = y * width + x
+                            guard k.core[p] else { continue }
+                            let sx = Double(x) + dx
+                            let sy = Double(y) + dy
+                            let ix = Int(sx.rounded()), iy = Int(sy.rounded())
+                            guard ix >= 0, ix < width, iy >= 0, iy < height else { continue }
+                            let jp = iy * width + ix
+                            guard !j.core[jp] else { continue }
+                            let (r, g, b) = bilinearRGB(j.plate, x: sx, y: sy)
+                            k.plate.r[p] = r; k.plate.g[p] = g; k.plate.b[p] = b
+                            k.core[p] = false
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fills whatever core remains in each window AFTER cross-window
+    /// borrowing (pixels no neighboring window could donate a real pixel
+    /// for -- typically small slivers at the very start/end of the clip,
+    /// or clips with only one window) via the SAME per-clip LamaRunner
+    /// core-fill used by the STATIC path (bbox-cropped LaMa, or push-pull
+    /// if a window's core exceeds 35% of the frame). Kept as an explicit
+    /// post-`reconstruct()` step, NOT run inside `reconstruct()` itself,
+    /// so `BackgroundReconstructor` (CoreGraphics/Accelerate/UIKit only)
+    /// doesn't need to import CoreML / depend on LamaRunner's model-load
+    /// lifecycle -- mirrors the existing STATIC-path call pattern in
+    /// BenchmarkView.swift (`reconstruct()` returns `core`/`plateBeforeLama`,
+    /// caller invokes `lamaRunner.fillCore` separately, off the main actor).
+    /// Mutates each `WindowPlate.plate`/`core` in place and returns the
+    /// per-window method strings (matching Android's per-window fillCore()
+    /// log lines) for the caller to fold into a single method badge/log.
+    static func fillWindowCores(_ windows: [WindowPlate], lamaRunner: LamaRunner) -> [String] {
+        var methods: [String] = []
+        for win in windows {
+            guard win.core.contains(true) else {
+                methods.append("none (no core)")
+                continue
+            }
+            do {
+                let result = try lamaRunner.fillCore(plate: win.plate, core: win.core)
+                win.plate = result.filled
+                methods.append(result.method)
+            } catch {
+                methods.append("FAILED: \(error.localizedDescription)")
+            }
+        }
+        return methods
+    }
+
+    /// Trapezoidal window weight in [0,1]: full inside the window,
+    /// smoothstep-ramped only in the overlap zones so adjacent windows
+    /// crossfade -- every frame covered at weight ~1. Matches Android's
+    /// windowWeight().
+    static func windowWeight(_ win: WindowPlate, t: Int, isFirst: Bool, isLast: Bool) -> Float {
+        guard t >= win.start, t < win.end else { return 0 }
+        var wgt = 1.0
+        let o = win.overlap
+        if !isFirst, t < win.start + o {
+            wgt = smoothstep((Double(t - win.start) + 0.5) / Double(o))
+        }
+        if !isLast, t >= win.end - o {
+            wgt = min(wgt, smoothstep((Double(win.end - t) - 0.5) / Double(o)))
+        }
+        return Float(max(0, min(1, wgt)))
+    }
+
+    private static func smoothstep(_ x: Double) -> Double {
+        let c = max(0, min(1, x))
+        return c * c * (3 - 2 * c)
+    }
+
+    /// Per-frame windowed composite: for frame `t`, blends every covering
+    /// window's plate (warped into frame t's coords via that window's
+    /// Aligner.shiftOf(t), exposure-matched by meanLuma gain against the
+    /// frame itself) weighted by `windowWeight`, normalizes by total
+    /// weight, and alpha-blends into the frame's own (dilated) hole
+    /// region. Falls back to PushPullFill for any hole pixel no window
+    /// covers (rare, at clip edges). Caller (BenchmarkView) invokes this
+    /// once per frame off the main actor, matching the existing
+    /// Task.detached pattern for heavy per-frame work.
+    static func compositeFrame(_ frame: RGBBuffer, mask: MaskBuffer, frameIndex: Int, windows: [WindowPlate]) -> RGBBuffer {
+        let w = frame.width, h = frame.height
+        let pixCount = w * h
+        let hole = dilate(mask.isPerson, width: w, height: h, radius: maskDilate)
+        guard hole.contains(true) else { return frame }
+
+        var accumR = [Float](repeating: 0, count: pixCount)
+        var accumG = [Float](repeating: 0, count: pixCount)
+        var accumB = [Float](repeating: 0, count: pixCount)
+        var accumW = [Float](repeating: 0, count: pixCount)
+
+        let frameMeanLuma = meanLuma(frame, hole: hole)
+        let emptyHole = [Bool](repeating: false, count: pixCount)
+
+        for (idx, win) in windows.enumerated() {
+            let wgt = windowWeight(win, t: frameIndex, isFirst: idx == 0, isLast: idx == windows.count - 1)
+            guard wgt > 0 else { continue }
+            let shift = win.aligner.shiftOf(frameIndex)
+            let planeMeanLuma = meanLuma(win.plate, hole: emptyHole)
+            let gain = Float(min(1.18, max(0.85, frameMeanLuma / max(1.0, planeMeanLuma))))
+            // Sample the WINDOW's plate at (x - dx, y - dy) to land on the
+            // same world point frame t's pixel (x,y) shows -- inverse of
+            // the forward warp used when frames were aligned INTO the
+            // window (see warpTranslate's SIGN CONVENTION doc comment:
+            // dst(x,y) = src(x+dx, y+dy) forward, so recovering the
+            // window-plate sample for a given frame pixel is src(x-dx,y-dy)).
+            for y in 0..<h {
+                for x in 0..<w {
+                    let p = y * w + x
+                    guard hole[p] else { continue }
+                    let sx = Double(x) - shift.dx
+                    let sy = Double(y) - shift.dy
+                    let (r, g, b) = bilinearRGB(win.plate, x: sx, y: sy)
+                    accumR[p] += r * gain * wgt
+                    accumG[p] += g * gain * wgt
+                    accumB[p] += b * gain * wgt
+                    accumW[p] += wgt
+                }
+            }
+        }
+
+        var outR = frame.r, outG = frame.g, outB = frame.b
+        var uncovered = [Bool](repeating: false, count: pixCount)
+        for p in 0..<pixCount where hole[p] {
+            if accumW[p] > 0 {
+                outR[p] = min(255, max(0, accumR[p] / accumW[p]))
+                outG[p] = min(255, max(0, accumG[p] / accumW[p]))
+                outB[p] = min(255, max(0, accumB[p] / accumW[p]))
+            } else {
+                uncovered[p] = true
+            }
+        }
+        var result = RGBBuffer(r: outR, g: outG, b: outB, width: w, height: h)
+        if uncovered.contains(true) {
+            result = PushPullFill.fill(plate: result, hole: uncovered)
+        }
+        return result
     }
 }

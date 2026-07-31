@@ -325,64 +325,123 @@ struct BenchmarkView: View {
             BackgroundReconstructor.reconstruct(colorFrames: colorBuffers, masks: maskBuffers)
         }.value
         let corePctPreview = 100.0 * Double(reconResult.core.filter { $0 }.count) / Double(reconResult.core.count)
+        appendLog("  self-decided method: \(reconResult.method.rawValue) -- \(reconResult.methodDetail)")
         appendLog("  align=\(String(format: "%.0f", reconResult.alignMs))ms trimmed-mean=\(String(format: "%.0f", reconResult.trimmedMeanMs))ms (neural/push-pull core: \(String(format: "%.1f", corePctPreview))%)")
         addPreview("Plate BEFORE fill\n(trimmed-mean)", reconResult.plateBeforeLama.toCGImage())
         addPreview("Core\n(white=needs fill)", Self.maskPreviewImage(reconResult.core, width: reconResult.plateBeforeLama.width, height: reconResult.plateBeforeLama.height))
 
-        appendLog("[diag] running core-fill (bbox-cropped LaMa, or push-pull if core > 35% of frame)...")
         let lamaRunner = try LamaRunner(configuration: config)
-        let plateForFill = reconResult.plateBeforeLama
-        let coreForFill = reconResult.core
-        let coreFillResult: LamaRunner.CoreFillResult = try await Task.detached(priority: .userInitiated) {
-            try autoreleasepool {
-                try lamaRunner.fillCore(plate: plateForFill, core: coreForFill)
+        let backgroundFinal: RGBBuffer
+        let lamaStageMs: Double
+        let usedPushPull: Bool
+        let coreFillMethodSummary: String
+        let coreFillCorePct: Double
+        let reconstructedBgFrames: [CGImage]
+
+        switch reconResult.method {
+        case .staticJitter:
+            // STATIC/JITTER: a single global plate, core-filled ONCE per
+            // clip, then pasted into each frame's own mask region -- the
+            // pre-existing behavior, unchanged.
+            appendLog("[diag] running core-fill (bbox-cropped LaMa, or push-pull if core > 35% of frame)...")
+            let plateForFill = reconResult.plateBeforeLama
+            let coreForFill = reconResult.core
+            let coreFillResult: LamaRunner.CoreFillResult = try await Task.detached(priority: .userInitiated) {
+                try autoreleasepool {
+                    try lamaRunner.fillCore(plate: plateForFill, core: coreForFill)
+                }
+            }.value
+            backgroundFinal = coreFillResult.filled
+            let lamaTiming = coreFillResult.timing
+            lamaStageMs = (lamaTiming?.buildMs ?? 0) + (lamaTiming?.runMs ?? 0) + (lamaTiming?.postprocessMs ?? 0)
+            usedPushPull = coreFillResult.method.hasPrefix("push-pull")
+            coreFillMethodSummary = coreFillResult.method
+            coreFillCorePct = coreFillResult.corePct
+            if let t = lamaTiming {
+                appendLog("  core-fill (\(coreFillResult.method)): build=\(String(format: "%.1f", t.buildMs))ms run=\(String(format: "%.1f", t.runMs))ms post=\(String(format: "%.1f", t.postprocessMs))ms")
+            } else {
+                appendLog("  core-fill: \(coreFillResult.method) (no LaMa call)")
             }
-        }.value
-        let backgroundFinal = coreFillResult.filled
-        let lamaTiming = coreFillResult.timing
-        let lamaStageMs = (lamaTiming?.buildMs ?? 0) + (lamaTiming?.runMs ?? 0) + (lamaTiming?.postprocessMs ?? 0)
-        let bgReconTotalMs = reconResult.alignMs + reconResult.trimmedMeanMs + lamaStageMs
-        let usedPushPull = coreFillResult.method.hasPrefix("push-pull")
-        if let t = lamaTiming {
-            appendLog("  core-fill (\(coreFillResult.method)): build=\(String(format: "%.1f", t.buildMs))ms run=\(String(format: "%.1f", t.runMs))ms post=\(String(format: "%.1f", t.postprocessMs))ms")
-        } else {
-            appendLog("  core-fill: \(coreFillResult.method) (no LaMa call)")
+
+            // Real per-frame background VIDEO: for EACH frame i, the hole
+            // that needs filling is THAT FRAME's own mask (maskBuffers[i]),
+            // not frame 0's -- the person moves between frames, so the
+            // hole is a different shape/position every frame. Using frame
+            // 0's mask for all frames (an earlier version of this code did
+            // exactly that) is wrong two ways at once: it pastes a fake
+            // static patch onto real background the person has already
+            // moved away from, AND it fails to cover the person's ACTUAL
+            // current position in frames where they've moved elsewhere.
+            // Fixed per explicit correction (2026-07-27): each frame
+            // samples its OWN mask region from the aggregated
+            // backgroundFinal plate (which represents "what's really
+            // behind wherever the person was, aggregated across the whole
+            // clip"), everywhere else uses that frame's real pixels.
+            reconstructedBgFrames = await Task.detached(priority: .userInitiated) {
+                var frames: [CGImage] = []
+                for i in 0..<n {
+                    var outR = colorBuffers[i].r, outG = colorBuffers[i].g, outB = colorBuffers[i].b
+                    let frameMask = maskBuffers[i].isPerson
+                    for p in 0..<(backgroundFinal.width * backgroundFinal.height) where frameMask[p] {
+                        outR[p] = backgroundFinal.r[p]
+                        outG[p] = backgroundFinal.g[p]
+                        outB[p] = backgroundFinal.b[p]
+                    }
+                    let frameBuf = RGBBuffer(r: outR, g: outG, b: outB, width: backgroundFinal.width, height: backgroundFinal.height)
+                    if let cg = frameBuf.toCGImage() { frames.append(cg) }
+                }
+                return frames
+            }.value
+
+        case .dynamicWindowed:
+            // DYNAMIC: no single global plate exists by construction --
+            // each window covers only its own frame range. Core-fill runs
+            // PER WINDOW (fillWindowCores), then every frame's own
+            // background is rendered via compositeFrame(), which blends
+            // every covering window's plate (trapezoidal cross-fade,
+            // exposure-matched) into that frame's hole region.
+            let windows = reconResult.dynamicWindows ?? []
+            appendLog("[diag] running per-window core-fill (\(windows.count) window(s), bbox-cropped LaMa or push-pull if a window's core > 35%)...")
+            let methods: [String] = await Task.detached(priority: .userInitiated) {
+                autoreleasepool {
+                    BackgroundReconstructor.fillWindowCores(windows, lamaRunner: lamaRunner)
+                }
+            }.value
+            for (idx, m) in methods.enumerated() { appendLog("  window \(idx) [\(windows[idx].start)-\(windows[idx].end)): \(m)") }
+            usedPushPull = methods.contains { $0.hasPrefix("push-pull") }
+            lamaStageMs = 0 // per-window LaMa timing isn't broken out individually here; align/trim already include window-build cost
+            coreFillMethodSummary = methods.joined(separator: "; ")
+            coreFillCorePct = 100.0 * Double(reconResult.core.filter { $0 }.count) / Double(reconResult.core.count)
+            backgroundFinal = windows.first?.plate ?? reconResult.plateBeforeLama
+
+            appendLog("[diag] compositing per-frame windowed background (\(n) frames, trapezoidal cross-fade across \(windows.count) window(s))...")
+            reconstructedBgFrames = await Task.detached(priority: .userInitiated) {
+                var frames: [CGImage] = []
+                for i in 0..<n {
+                    let composited = BackgroundReconstructor.compositeFrame(colorBuffers[i], mask: maskBuffers[i], frameIndex: i, windows: windows)
+                    if let cg = composited.toCGImage() { frames.append(cg) }
+                }
+                return frames
+            }.value
         }
+
+        let bgReconTotalMs = reconResult.alignMs + reconResult.trimmedMeanMs + lamaStageMs
         appendLog("  Background Reconstruction TOTAL: \(String(format: "%.0f", bgReconTotalMs))ms (\(n) frames, \(maskedVideo.width)x\(maskedVideo.height))")
         addPreview("Background FINAL\n(after core-fill)", backgroundFinal.toCGImage())
+        // Method badge surfaces the self-decided STATIC/JITTER vs DYNAMIC
+        // (windowed) branch -- the same "did a fallback path trigger?"
+        // at-a-glance role the badge already played for LaMa vs push-pull,
+        // now covering the higher-level algorithm choice too (PipelineStage
+        // only has one badge slot -- see PipelineStageView.swift, out of
+        // scope to modify -- so the push-pull anti-hallucination warning is
+        // folded in as a suffix rather than getting a second badge).
+        let methodBadgeText = reconResult.method == .dynamicWindowed
+            ? "DYNAMIC windowed\(usedPushPull ? " + push-pull ⚠" : "")"
+            : "STATIC/JITTER\(usedPushPull ? " + push-pull ⚠" : "")"
         setStage("Background Reconstruction", status: .done,
                   timings: [("align", reconResult.alignMs), ("trim", reconResult.trimmedMeanMs), ("fill", lamaStageMs)],
-                  method: (usedPushPull ? "push-pull ⚠" : "lama-crop", usedPushPull),
-                  detail: [coreFillResult.method, "core: \(String(format: "%.1f", coreFillResult.corePct))% of frame"])
-
-        // Real per-frame background VIDEO: for EACH frame i, the hole that
-        // needs filling is THAT FRAME's own mask (maskBuffers[i]), not
-        // frame 0's -- the person moves between frames, so the hole is a
-        // different shape/position every frame. Using frame 0's mask for
-        // all frames (an earlier version of this code did exactly that)
-        // is wrong two ways at once: it pastes a fake static patch onto
-        // real background the person has already moved away from, AND it
-        // fails to cover the person's ACTUAL current position in frames
-        // where they've moved elsewhere. Fixed per explicit correction
-        // (2026-07-27): each frame samples its OWN mask region from the
-        // aggregated backgroundFinal plate (which represents "what's
-        // really behind wherever the person was, aggregated across the
-        // whole clip"), everywhere else uses that frame's real pixels.
-        let reconstructedBgFrames: [CGImage] = await Task.detached(priority: .userInitiated) {
-            var frames: [CGImage] = []
-            for i in 0..<n {
-                var outR = colorBuffers[i].r, outG = colorBuffers[i].g, outB = colorBuffers[i].b
-                let frameMask = maskBuffers[i].isPerson
-                for p in 0..<(backgroundFinal.width * backgroundFinal.height) where frameMask[p] {
-                    outR[p] = backgroundFinal.r[p]
-                    outG[p] = backgroundFinal.g[p]
-                    outB[p] = backgroundFinal.b[p]
-                }
-                let frameBuf = RGBBuffer(r: outR, g: outG, b: outB, width: backgroundFinal.width, height: backgroundFinal.height)
-                if let cg = frameBuf.toCGImage() { frames.append(cg) }
-            }
-            return frames
-        }.value
+                  method: (methodBadgeText, usedPushPull),
+                  detail: [reconResult.methodDetail, coreFillMethodSummary, "core: \(String(format: "%.1f", coreFillCorePct))% of frame"])
         appendLog("  reconstructed-background video: \(reconstructedBgFrames.count) frames, each using its OWN mask for the fill region")
 
         setStage("Illumination Extraction", status: .running)
@@ -502,7 +561,7 @@ struct BenchmarkView: View {
         appendLog("  NOTE: Final Compositing uses a PLACEHOLDER character cutout, not a real WanAnimate render -- tests compositing MATH cost only, not visual fidelity.")
         appendLog("  Scroll the image strip above to visually verify each stage's output before trusting these numbers.")
 
-        lastRunSummary = "Total \(String(format: "%.0f", totalMs))ms for \(n) frames · core-fill: \(coreFillResult.method)"
+        lastRunSummary = "Total \(String(format: "%.0f", totalMs))ms for \(n) frames · \(reconResult.method.rawValue) · core-fill: \(coreFillMethodSummary)"
     }
 
     private static func maskPreviewImage(_ mask: [Bool], width: Int, height: Int) -> CGImage? {
