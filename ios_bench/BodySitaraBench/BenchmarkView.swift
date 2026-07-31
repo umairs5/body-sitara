@@ -303,13 +303,27 @@ struct BenchmarkView: View {
         addPreview("Input frame \(n/2)\n(mid-clip)", maskedVideo.frames[n / 2])
 
         appendLog("[diag] converting frames to RGB/mask buffers...")
-        let colorBuffers = maskedVideo.frames[0..<n].map { RGBBuffer.from(cgImage: $0) }
-        let maskBuffers = maskVideo.frames[0..<n].map { MaskBuffer.from(cgImage: $0) }
+        let framesToConvert = Array(maskedVideo.frames[0..<n])
+        let masksToConvert = Array(maskVideo.frames[0..<n])
+        let (colorBuffers, maskBuffers) = await Task.detached(priority: .userInitiated) {
+            (framesToConvert.map { RGBBuffer.from(cgImage: $0) }, masksToConvert.map { MaskBuffer.from(cgImage: $0) })
+        }.value
         setStage("Load & Align", status: .done, timings: [("load", loadMs)], detail: ["\(n) frames @ \(maskedVideo.width)x\(maskedVideo.height)"])
 
         setStage("Background Reconstruction", status: .running)
         appendLog("[diag] running Background Reconstruction (align pyramid + trimmed-mean, on-device)...")
-        let reconResult = BackgroundReconstructor.reconstruct(colorFrames: colorBuffers, masks: maskBuffers)
+        // The alignment pyramid + per-pixel trimmed-mean aggregation is the
+        // single most expensive step in this pipeline (multi-second on a
+        // 1264x1264 clip) and BenchmarkView's methods are implicitly
+        // @MainActor (it's a SwiftUI View) -- calling it directly here
+        // would run all of that math on the main thread despite the outer
+        // Task{}, freezing the UI for the full duration (observed on-device
+        // 2026-07-31: the app appeared "stuck" during a ~13s run). Hop to a
+        // detached background task for the actual compute; only the
+        // appendLog/setStage/addPreview calls that follow need the main actor.
+        let reconResult = await Task.detached(priority: .userInitiated) {
+            BackgroundReconstructor.reconstruct(colorFrames: colorBuffers, masks: maskBuffers)
+        }.value
         let corePctPreview = 100.0 * Double(reconResult.core.filter { $0 }.count) / Double(reconResult.core.count)
         appendLog("  align=\(String(format: "%.0f", reconResult.alignMs))ms trimmed-mean=\(String(format: "%.0f", reconResult.trimmedMeanMs))ms (neural/push-pull core: \(String(format: "%.1f", corePctPreview))%)")
         addPreview("Plate BEFORE fill\n(trimmed-mean)", reconResult.plateBeforeLama.toCGImage())
@@ -317,10 +331,13 @@ struct BenchmarkView: View {
 
         appendLog("[diag] running core-fill (bbox-cropped LaMa, or push-pull if core > 35% of frame)...")
         let lamaRunner = try LamaRunner(configuration: config)
-        var coreFillResult: LamaRunner.CoreFillResult!
-        try autoreleasepool {
-            coreFillResult = try lamaRunner.fillCore(plate: reconResult.plateBeforeLama, core: reconResult.core)
-        }
+        let plateForFill = reconResult.plateBeforeLama
+        let coreForFill = reconResult.core
+        let coreFillResult: LamaRunner.CoreFillResult = try await Task.detached(priority: .userInitiated) {
+            try autoreleasepool {
+                try lamaRunner.fillCore(plate: plateForFill, core: coreForFill)
+            }
+        }.value
         let backgroundFinal = coreFillResult.filled
         let lamaTiming = coreFillResult.timing
         let lamaStageMs = (lamaTiming?.buildMs ?? 0) + (lamaTiming?.runMs ?? 0) + (lamaTiming?.postprocessMs ?? 0)
@@ -351,18 +368,21 @@ struct BenchmarkView: View {
         // aggregated backgroundFinal plate (which represents "what's
         // really behind wherever the person was, aggregated across the
         // whole clip"), everywhere else uses that frame's real pixels.
-        var reconstructedBgFrames: [CGImage] = []
-        for i in 0..<n {
-            var outR = colorBuffers[i].r, outG = colorBuffers[i].g, outB = colorBuffers[i].b
-            let frameMask = maskBuffers[i].isPerson
-            for p in 0..<(backgroundFinal.width * backgroundFinal.height) where frameMask[p] {
-                outR[p] = backgroundFinal.r[p]
-                outG[p] = backgroundFinal.g[p]
-                outB[p] = backgroundFinal.b[p]
+        let reconstructedBgFrames: [CGImage] = await Task.detached(priority: .userInitiated) {
+            var frames: [CGImage] = []
+            for i in 0..<n {
+                var outR = colorBuffers[i].r, outG = colorBuffers[i].g, outB = colorBuffers[i].b
+                let frameMask = maskBuffers[i].isPerson
+                for p in 0..<(backgroundFinal.width * backgroundFinal.height) where frameMask[p] {
+                    outR[p] = backgroundFinal.r[p]
+                    outG[p] = backgroundFinal.g[p]
+                    outB[p] = backgroundFinal.b[p]
+                }
+                let frameBuf = RGBBuffer(r: outR, g: outG, b: outB, width: backgroundFinal.width, height: backgroundFinal.height)
+                if let cg = frameBuf.toCGImage() { frames.append(cg) }
             }
-            let frameBuf = RGBBuffer(r: outR, g: outG, b: outB, width: backgroundFinal.width, height: backgroundFinal.height)
-            if let cg = frameBuf.toCGImage() { reconstructedBgFrames.append(cg) }
-        }
+            return frames
+        }.value
         appendLog("  reconstructed-background video: \(reconstructedBgFrames.count) frames, each using its OWN mask for the fill region")
 
         setStage("Illumination Extraction", status: .running)
@@ -381,12 +401,16 @@ struct BenchmarkView: View {
         // itself needs to reach the server, not the reconstructed
         // background around it).
         appendLog("[diag] compositing original silhouette onto lightmap (outbound-to-server signal, all \(n) frames)...")
-        var silhouetteOnLightmapFrames: [CGImage] = []
-        for i in 0..<n {
-            let alpha = maskBuffers[i].isPerson.map { $0 ? Float(1) : Float(0) }
-            let result = Compositor.compositeOnly(background: lightmapResult.lightmap, character: colorBuffers[i], alpha: alpha)
-            if let cg = result.composited.toCGImage() { silhouetteOnLightmapFrames.append(cg) }
-        }
+        let lightmapForComposite = lightmapResult.lightmap
+        let silhouetteOnLightmapFrames: [CGImage] = await Task.detached(priority: .userInitiated) {
+            var frames: [CGImage] = []
+            for i in 0..<n {
+                let alpha = maskBuffers[i].isPerson.map { $0 ? Float(1) : Float(0) }
+                let result = Compositor.compositeOnly(background: lightmapForComposite, character: colorBuffers[i], alpha: alpha)
+                if let cg = result.composited.toCGImage() { frames.append(cg) }
+            }
+            return frames
+        }.value
         appendLog("  silhouette-on-lightmap: \(silhouetteOnLightmapFrames.count) frames composited")
         if let mid = silhouetteOnLightmapFrames[safe: n / 2] {
             addPreview("Silhouette-on-Lightmap\n(TO SERVER)", mid)
@@ -403,14 +427,17 @@ struct BenchmarkView: View {
         let (placeholderChar, placeholderAlpha) = Compositor.placeholderCharacter(width: backgroundFinal.width, height: backgroundFinal.height)
 
         appendLog("[diag] running Final Compositing: placeholder avatar onto per-frame reconstructed background (relight EXCLUDED per scope decision)...")
-        var finalFrames: [CGImage] = []
-        var totalCompositeMs = 0.0
-        for i in 0..<n {
-            let frameBg = RGBBuffer.from(cgImage: reconstructedBgFrames[i])
-            let result = Compositor.compositeOnly(background: frameBg, character: placeholderChar, alpha: placeholderAlpha)
-            totalCompositeMs += result.compositeMs
-            if let cg = result.composited.toCGImage() { finalFrames.append(cg) }
-        }
+        let (finalFrames, totalCompositeMs): ([CGImage], Double) = await Task.detached(priority: .userInitiated) {
+            var frames: [CGImage] = []
+            var totalMs = 0.0
+            for i in 0..<n {
+                let frameBg = RGBBuffer.from(cgImage: reconstructedBgFrames[i])
+                let result = Compositor.compositeOnly(background: frameBg, character: placeholderChar, alpha: placeholderAlpha)
+                totalMs += result.compositeMs
+                if let cg = result.composited.toCGImage() { frames.append(cg) }
+            }
+            return (frames, totalMs)
+        }.value
         appendLog("  Final Compositing: \(finalFrames.count) frames, composite total=\(String(format: "%.1f", totalCompositeMs))ms")
         if let mid = finalFrames[safe: n / 2] {
             addPreview("FINAL\n(avatar on reconstructed bg, no relight)", mid)
@@ -432,7 +459,9 @@ struct BenchmarkView: View {
 
             if !reconstructedBgFrames.isEmpty {
                 let bgURL = tmpDir.appendingPathComponent("reconstructed_background.mp4")
-                try VideoEncoder.encode(frames: reconstructedBgFrames, fps: fps, outputURL: bgURL)
+                try await Task.detached(priority: .userInitiated) {
+                    try VideoEncoder.encode(frames: reconstructedBgFrames, fps: fps, outputURL: bgURL)
+                }.value
                 outputVideos.append((label: "Reconstructed Background", url: bgURL))
                 try await VideoEncoder.saveToPhotoLibrary(url: bgURL)
                 appendLog("  Saved reconstructed_background.mp4 to Photos (\(reconstructedBgFrames.count) frames)")
@@ -440,7 +469,9 @@ struct BenchmarkView: View {
 
             if !silhouetteOnLightmapFrames.isEmpty {
                 let silURL = tmpDir.appendingPathComponent("silhouette_on_lightmap.mp4")
-                try VideoEncoder.encode(frames: silhouetteOnLightmapFrames, fps: fps, outputURL: silURL)
+                try await Task.detached(priority: .userInitiated) {
+                    try VideoEncoder.encode(frames: silhouetteOnLightmapFrames, fps: fps, outputURL: silURL)
+                }.value
                 outputVideos.append((label: "Silhouette on Lightmap", url: silURL))
                 try await VideoEncoder.saveToPhotoLibrary(url: silURL)
                 appendLog("  Saved silhouette_on_lightmap.mp4 to Photos (\(silhouetteOnLightmapFrames.count) frames)")
@@ -448,7 +479,9 @@ struct BenchmarkView: View {
 
             if !finalFrames.isEmpty {
                 let finalURL = tmpDir.appendingPathComponent("final_output.mp4")
-                try VideoEncoder.encode(frames: finalFrames, fps: fps, outputURL: finalURL)
+                try await Task.detached(priority: .userInitiated) {
+                    try VideoEncoder.encode(frames: finalFrames, fps: fps, outputURL: finalURL)
+                }.value
                 outputVideos.append((label: "Final Output", url: finalURL))
                 try await VideoEncoder.saveToPhotoLibrary(url: finalURL)
                 appendLog("  Saved final_output.mp4 to Photos (\(finalFrames.count) frames)")
