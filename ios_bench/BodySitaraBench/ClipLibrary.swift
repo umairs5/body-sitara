@@ -17,13 +17,27 @@ struct ClipPreset: Identifiable, Codable, Equatable {
     var name: String
     let createdAt: Date
 
-    var maskedVideoURL: URL { ClipLibrary.presetDir(id).appendingPathComponent("masked_video.mp4") }
-    var maskURL: URL { ClipLibrary.presetDir(id).appendingPathComponent("mask.mp4") }
+    var maskedVideoURL: URL { clipPresetDir(id).appendingPathComponent("masked_video.mp4") }
+    var maskURL: URL { clipPresetDir(id).appendingPathComponent("mask.mp4") }
 
     var isComplete: Bool {
         FileManager.default.fileExists(atPath: maskedVideoURL.path) &&
         FileManager.default.fileExists(atPath: maskURL.path)
     }
+}
+
+/// Free function (NOT a ClipLibrary static method): ClipPreset's computed
+/// URL properties are nonisolated (plain struct, no actor), so this must
+/// stay nonisolated too, or every URL access from a nonisolated context
+/// (e.g. FileManager checks off the main actor) fails to compile with
+/// "call to main actor-isolated static method in a synchronous
+/// nonisolated context" -- hit for real in CI (2026-07-31) when this used
+/// to be a `@MainActor`-inherited static method on ClipLibrary. Pure path
+/// math, no actor-isolated state involved, so nonisolated is correct.
+func clipPresetDir(_ id: UUID) -> URL {
+    FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("ClipPresets", isDirectory: true)
+        .appendingPathComponent(id.uuidString, isDirectory: true)
 }
 
 @MainActor
@@ -42,13 +56,6 @@ final class ClipLibrary: ObservableObject {
 
     private var presetsRootDir: URL { documentsDir.appendingPathComponent("ClipPresets", isDirectory: true) }
     private var indexURL: URL { presetsRootDir.appendingPathComponent(Self.indexFile) }
-
-    /// Static so ClipPreset's computed URLs don't need an instance.
-    fileprivate static func presetDir(_ id: UUID) -> URL {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("ClipPresets", isDirectory: true)
-            .appendingPathComponent(id.uuidString, isDirectory: true)
-    }
 
     init() {
         load()
@@ -72,14 +79,14 @@ final class ClipLibrary: ObservableObject {
 
     func createPreset(named name: String) -> ClipPreset {
         let preset = ClipPreset(id: UUID(), name: name, createdAt: Date())
-        try? FileManager.default.createDirectory(at: Self.presetDir(preset.id), withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: clipPresetDir(preset.id), withIntermediateDirectories: true)
         presets.append(preset)
         save()
         return preset
     }
 
     func delete(_ preset: ClipPreset) {
-        try? FileManager.default.removeItem(at: Self.presetDir(preset.id))
+        try? FileManager.default.removeItem(at: clipPresetDir(preset.id))
         presets.removeAll { $0.id == preset.id }
         if activePresetID == preset.id { activePresetID = nil }
         save()
