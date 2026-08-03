@@ -379,7 +379,24 @@ struct BenchmarkView: View {
         addPreview("Plate BEFORE fill\n(trimmed-mean)", reconResult.plateBeforeLama.toCGImage())
         addPreview("Core\n(white=needs fill)", Self.maskPreviewImage(reconResult.core, width: reconResult.plateBeforeLama.width, height: reconResult.plateBeforeLama.height))
 
-        let lamaRunner = try LamaRunner(configuration: config)
+        // `var ... Optional`, not `let`: this codebase's loaded CoreML
+        // model (`LamaRunner.model`) is only ever CALLED during core-fill
+        // (STATIC: one `fillCore`; DYNAMIC: up to MAX_WINDOWS=8
+        // `fillCore` calls via `fillWindowCores`) -- nothing after
+        // core-fill finishes in either branch ever calls into
+        // `lamaRunner` again, yet as a plain `let` it would stay resident
+        // (unreleased CoreML MLModel + its internal buffers/compute plan)
+        // all the way through Illumination Extraction, the silhouette-on-
+        // lightmap composite, and Final Compositing, purely because it's
+        // a local declared once at function scope. Explicitly nil'd right
+        // after its last call in each branch below (see `lamaRunner = nil`)
+        // so ARC can actually reclaim the model the moment core-fill is
+        // done, instead of only when this whole function returns --
+        // same "release as soon as truly unused, not merely finished
+        // with" principle as `Aligner.dropRefGray()` in
+        // BackgroundReconstructor.swift (see that file for the sibling
+        // fix found in this same investigation).
+        var lamaRunner: LamaRunner? = try LamaRunner(configuration: config)
         let backgroundFinal: RGBBuffer
         let lamaStageMs: Double
         let usedPushPull: Bool
@@ -440,11 +457,20 @@ struct BenchmarkView: View {
             appendLog("[diag] running core-fill (bbox-cropped LaMa, or push-pull if core > 35% of frame)...")
             let plateForFill = reconResult.plateBeforeLama
             let coreForFill = reconResult.core
+            guard let activeLamaRunner = lamaRunner else {
+                throw NSError(domain: "BenchmarkView", code: 12, userInfo: [NSLocalizedDescriptionKey: "lamaRunner unexpectedly nil before STATIC core-fill"])
+            }
             let coreFillResult: LamaRunner.CoreFillResult = try await Task.detached(priority: .userInitiated) {
                 try autoreleasepool {
-                    try lamaRunner.fillCore(plate: plateForFill, core: coreForFill)
+                    try activeLamaRunner.fillCore(plate: plateForFill, core: coreForFill)
                 }
             }.value
+            // Last use of lamaRunner in this branch -- release the loaded
+            // CoreML model now rather than holding it resident through
+            // Illumination Extraction/Final Compositing (see the `var
+            // lamaRunner: LamaRunner?` declaration above for the full
+            // reasoning).
+            lamaRunner = nil
             backgroundFinal = coreFillResult.filled
             let lamaTiming = coreFillResult.timing
             lamaStageMs = (lamaTiming?.buildMs ?? 0) + (lamaTiming?.runMs ?? 0) + (lamaTiming?.postprocessMs ?? 0)
@@ -535,9 +561,15 @@ struct BenchmarkView: View {
             // on-device crash this was rewritten to fix (see
             // fillWindowCores's doc comment for the full root-cause
             // writeup and the established bb6b3a3 precedent it matches).
+            guard let activeLamaRunner = lamaRunner else {
+                throw NSError(domain: "BenchmarkView", code: 12, userInfo: [NSLocalizedDescriptionKey: "lamaRunner unexpectedly nil before DYNAMIC per-window core-fill"])
+            }
             let methods: [String] = await Task.detached(priority: .userInitiated) {
-                BackgroundReconstructor.fillWindowCores(windows, lamaRunner: lamaRunner)
+                BackgroundReconstructor.fillWindowCores(windows, lamaRunner: activeLamaRunner)
             }.value
+            // Last use of lamaRunner in this branch -- release the loaded
+            // CoreML model now (same reasoning as the STATIC branch above).
+            lamaRunner = nil
             for (idx, m) in methods.enumerated() { appendLog("  window \(idx) [\(windows[idx].start)-\(windows[idx].end)): \(m)") }
             usedPushPull = methods.contains { $0.hasPrefix("push-pull") }
             lamaStageMs = 0 // per-window LaMa timing isn't broken out individually here; align/trim already include window-build cost

@@ -838,13 +838,38 @@ enum BackgroundReconstructor {
     }
 
     /// Per-window alignment context: the window's reference-frame grayscale
-    /// (kept, small: one grayscale plane) plus per-frame shifts relative to
-    /// that reference, so `shiftOf(frame:)` (per-frame compositing) and
-    /// `refShiftTo(other:)` (cross-window borrowing) don't need to re-run
-    /// the SAD search from scratch every time they're queried.
+    /// (kept ONLY until cross-window borrowing finishes -- see
+    /// `dropRefGray()`) plus per-frame shifts relative to that reference, so
+    /// `shiftOf(frame:)` (per-frame compositing) doesn't need to re-run the
+    /// SAD search from scratch every time it's queried.
+    ///
+    /// `refGray` MEMORY NOTE (added while tracing the 2026-08-03
+    /// silhouette-on-lightmap crash -- see BenchmarkView.swift's
+    /// `runTier2MobileSystemCostBenchmark` doc comment for the full
+    /// investigation): `refGray` (one Float32 grayscale plane, ~6.4MB at
+    /// 1264x1264) is read in exactly two places: `buildWindow` (at
+    /// construction) and `refShiftTo` (called only from
+    /// `borrowAcrossWindows`, which runs entirely inside
+    /// `reconstructDynamic` before this file ever returns a `Result` to its
+    /// caller). `shiftOf` -- the ONLY `Aligner` method BenchmarkView calls,
+    /// via `compositeFrame`, for the rest of that function's lifetime
+    /// (through Illumination Extraction, the silhouette-on-lightmap
+    /// composite, and Final Compositing) -- reads only `shifts`, never
+    /// `refGray`. So `refGray` is dead weight for the ENTIRE post-
+    /// `reconstruct()` lifetime of every `WindowPlate`/`Aligner`, on a real
+    /// device run that keeps `windows` (and therefore every `Aligner` in it)
+    /// resident that whole time because `compositeFrame`/`shiftOf` are
+    /// genuinely still needed later (confirmed by tracing -- `windows`
+    /// itself can NOT be released early without breaking Final Compositing,
+    /// which also calls `compositeFrame`). `var` (not `let`) + explicit
+    /// `dropRefGray()` right after `borrowAcrossWindows` completes in
+    /// `reconstructDynamic` frees this ~6.4MB/window (up to MAX_WINDOWS=8,
+    /// so up to ~51MB) well before Illumination Extraction, without
+    /// changing any computed pixel (borrowing has already happened by then)
+    /// and without touching BenchmarkView.swift's control flow at all.
     final class Aligner {
         let refIndex: Int
-        let refGray: [Float]
+        private(set) var refGray: [Float]
         private var shifts: [Int: (dx: Double, dy: Double)] = [:]
         let width: Int
         let height: Int
@@ -860,10 +885,20 @@ enum BackgroundReconstructor {
         /// Shift (dx, dy) such that `other.ref(x+dx, y+dy) ~= self.ref(x,y)`
         /// -- computed via the same multi-level SAD+parabolic search as the
         /// main aligner, between the two windows' reference-frame grayscale
-        /// planes (both already resident, one plane each -- cheap).
+        /// planes (both already resident, one plane each -- cheap). Only
+        /// called from `borrowAcrossWindows`, before `dropRefGray()` runs.
         func refShiftTo(_ other: Aligner) -> (dx: Double, dy: Double) {
             BackgroundReconstructor.alignPyramid(ref: refGray, tgt: other.refGray, width: width, height: height, levels: BackgroundReconstructor.windowPyramidLevels)
         }
+
+        /// Releases `refGray` once cross-window borrowing has finished with
+        /// it -- see the class doc comment above for why this is safe
+        /// (nothing after `borrowAcrossWindows` reads it) and why it
+        /// matters (it's the only genuinely dead-but-still-resident piece
+        /// of DYNAMIC-path-specific state found in this file; `shifts` and
+        /// `plate` are both still needed by `compositeFrame` for the rest
+        /// of the caller's pipeline run).
+        func dropRefGray() { refGray = [] }
     }
 
     /// v (px/frame) estimate driving the window-length formula in
@@ -936,6 +971,17 @@ enum BackgroundReconstructor {
 
         let tTrimStart = CFAbsoluteTimeGetCurrent()
         borrowAcrossWindows(windows, width: width, height: height)
+        // Every `Aligner.refShiftTo` call `borrowAcrossWindows` will ever
+        // make has now happened -- drop each window's `refGray` (~6.4MB at
+        // 1264x1264) here, BEFORE this function returns `windows` to
+        // BenchmarkView, where they'd otherwise stay resident (via the
+        // `renderReconFrame` closure and `Result.dynamicWindows`) through
+        // Illumination Extraction, the silhouette-on-lightmap composite,
+        // and Final Compositing -- none of which ever call `refShiftTo`
+        // again. See `Aligner.dropRefGray()`'s doc comment for the full
+        // trace confirming nothing downstream reads `refGray` after this
+        // point.
+        for w in windows { w.aligner.dropRefGray() }
 
         // Union/core reported at the top level are the OR across all
         // windows -- matches "the full region that ever needed
