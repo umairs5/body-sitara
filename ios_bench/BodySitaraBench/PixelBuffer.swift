@@ -220,22 +220,79 @@ struct RGBBuffer8 {
     /// quality regression versus what the cloud actually rendered -- not
     /// just an engineering shortcut.
     ///
-    /// Rather than add a new single-channel-per-pixel UInt8 type (the
-    /// task's suggested `PackedGrayFrame`), the alpha video is decoded
-    /// through the EXISTING `RGBBuffer8`/`VideoFrameLoader.
-    /// loadFramesAsRGBBuffer8` streaming path (same one-CGImage-at-a-time
-    /// discipline, same memory footprint class as the character video
-    /// itself) and this accessor reads back just the red channel as the
-    /// 0-255 alpha value. This assumes the alpha video is exported as a
-    /// grayscale-in-RGB clip (R==G==B per pixel, the standard convention
-    /// for an alpha matte baked into a normal video codec, and how
-    /// CASE1's synthetic_alpha_p1.mp4 is produced) -- reading any one
-    /// channel is equivalent and cheaper than averaging three. This adds
-    /// zero new types/pbxproj registration and zero new memory-safety
-    /// surface: it is exactly the RGBBuffer8 this codebase already knows
-    /// how to load and discard per-frame.
+    /// UPDATE (memory-budget review, 2026-08-03): the alpha matte used to be
+    /// loaded through this same `RGBBuffer8` type (3 redundant bytes/pixel,
+    /// R==G==B) purely to reuse `loadFramesAsRGBBuffer8`'s streaming decode
+    /// loop. That is still correct on precision (no bit-packing, full 0-255
+    /// range preserved) but wasteful on memory: only ONE channel's worth of
+    /// information is ever read back (via what is now `GrayBuffer8.
+    /// alphaChannel8To01()` below), so storing all three was a real 3x
+    /// avoidable cost -- at 300 frames/1264x1264 that's the difference
+    /// between ~1.44GB and ~0.48GB for the alpha array alone, a meaningful
+    /// chunk of the ~4.37GB four-array peak (colorBuffers + maskBuffers +
+    /// character + alpha) flagged before real-device testing. See
+    /// `GrayBuffer8` below and `VideoFrameLoader.loadFramesAsGrayBuffer8`
+    /// for the single-channel replacement path. This type (`RGBBuffer8`)
+    /// keeps `alphaChannel8To01` removed from here -- it now lives on
+    /// `GrayBuffer8` instead, since alpha is no longer stored as an
+    /// `RGBBuffer8` at all.
+}
+
+/// UInt8-native SINGLE-CHANNEL buffer -- 1 byte/pixel, full 0-255 precision,
+/// NOT bit-packed (bit-packing is correct for `PackedMaskFrame`'s strictly
+/// binary segmentation mask, but would hard-clip a soft alpha matte's
+/// antialiased edges -- see the ALPHA-MATTE PRECISION DECISION doc on
+/// `RGBBuffer8` above for why bit-packing was already ruled out for this
+/// data). Exists so a single-channel video (specifically: a cloud-rendered
+/// alpha matte, which is grayscale-in-RGB, R==G==B per pixel, at the source)
+/// doesn't have to pay for two redundant channels it will never read, the
+/// way loading it through `RGBBuffer8` did previously.
+///
+/// MEMORY MATH for a 300-frame, 1264x1264 clip:
+///   Before (alpha: [RGBBuffer8], 3 bytes/pixel):
+///     300 * 1264*1264 * 3 bytes = ~1.44GB
+///   After (alpha: [GrayBuffer8], 1 byte/pixel):
+///     300 * 1264*1264 * 1 byte  = ~0.48GB
+///   -> 3x reduction, lossless (the source video only ever carried 1
+///   channel's worth of real information; this just stops copying it into
+///   two extra arrays that were always going to be discarded unread).
+struct GrayBuffer8 {
+    var v: [UInt8]
+    let width: Int
+    let height: Int
+
+    /// Decodes directly to UInt8 grayscale, reading back only the red
+    /// channel of the drawn RGBA bytes -- equivalent to (and cheaper than)
+    /// averaging all three, since the source alpha video is exported
+    /// grayscale-in-RGB (R==G==B per pixel), the same assumption the
+    /// previous `RGBBuffer8`-based `alphaChannel8To01()` made.
+    static func from(cgImage: CGImage) -> GrayBuffer8 {
+        let w = cgImage.width
+        let h = cgImage.height
+        var vArr = [UInt8](repeating: 0, count: w * h)
+
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        var raw = [UInt8](repeating: 0, count: w * h * 4)
+        guard let ctx = CGContext(
+            data: &raw, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+            space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return GrayBuffer8(v: vArr, width: w, height: h)
+        }
+        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h))
+
+        for i in 0..<(w * h) {
+            vArr[i] = raw[i * 4]
+        }
+        return GrayBuffer8(v: vArr, width: w, height: h)
+    }
+
+    /// Promotes this ONE frame's alpha to a 0.0-1.0 `[Float]`, the shape
+    /// `Compositor.compositeOnly(background:character:alpha:)` expects --
+    /// same single-frame, non-retained-across-the-loop pattern as
+    /// `RGBBuffer8.toFloatRGBBuffer()`.
     func alphaChannel8To01() -> [Float] {
-        r.map { Float($0) / 255.0 }
+        v.map { Float($0) / 255.0 }
     }
 }
 

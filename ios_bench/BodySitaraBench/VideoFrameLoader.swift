@@ -2,8 +2,9 @@ import AVFoundation
 import UIKit
 
 /// Streams frames of a real video file into memory, converting each decoded
-/// `CGImage` to its compact per-frame representation (`RGBBuffer8` or
-/// `PackedMaskFrame`) INSIDE the decode loop, one frame at a time.
+/// `CGImage` to its compact per-frame representation (`RGBBuffer8`,
+/// `PackedMaskFrame`, or `GrayBuffer8`) INSIDE the decode loop, one frame at
+/// a time.
 ///
 /// This replaces an earlier design that returned `[CGImage]` for the WHOLE
 /// clip (`LoadedVideo(frames: [CGImage], ...)`) and left conversion to the
@@ -73,6 +74,20 @@ enum VideoFrameLoader {
         let previews: [Int: CGImage]
     }
 
+    /// Result of streaming-decoding a single-channel (grayscale-in-RGB)
+    /// video, e.g. a cloud-rendered alpha matte -- see `GrayBuffer8`'s doc
+    /// comment in PixelBuffer.swift for why this exists as a distinct,
+    /// non-bit-packed 1-byte/pixel type rather than reusing `RGBBuffer8`
+    /// (which the alpha matte was loaded through previously) or
+    /// `PackedMaskFrame` (which would hard-clip its soft, antialiased
+    /// edges).
+    struct LoadedGrayVideo {
+        let frames: [GrayBuffer8]
+        let width: Int
+        let height: Int
+        let previews: [Int: CGImage]
+    }
+
     /// Streams the masked/color video, converting each frame to `RGBBuffer8`
     /// as it's decoded so at most one `CGImage` is resident at a time.
     /// `previewIndices` lets the caller grab a small number of frames as
@@ -80,18 +95,13 @@ enum VideoFrameLoader {
     /// the whole clip as `CGImage`s -- those specific frames are cloned into
     /// `previews` at the moment they're decoded, alongside the normal
     /// RGBBuffer8 conversion.
-    /// Also reused, unmodified, to load TWO more clips in BenchmarkView's
-    /// Final Compositing stage, when a `ClipPreset` has
-    /// `hasCharacter == true`:
-    ///   - the real synthetic-CHARACTER video -- just another color clip,
-    ///     same decode/streaming requirements as masked_video.mp4.
-    ///   - the character's ALPHA MATTE video -- deliberately loaded through
-    ///     THIS function (not `loadFramesAsPackedMask`, which is
-    ///     1-bit-per-pixel and would hard-clip a soft matte's antialiased
-    ///     edges) so its result stays an 8-bit-per-pixel `RGBBuffer8`; see
-    ///     `RGBBuffer8.alphaChannel8To01()` in PixelBuffer.swift for the
-    ///     full reasoning and how the resulting per-pixel byte is read back
-    ///     as a 0-255 alpha value instead of a binary mask.
+    /// Also reused, unmodified, to load the real synthetic-CHARACTER video
+    /// in BenchmarkView's Final Compositing stage, when a `ClipPreset` has
+    /// `hasCharacter == true` -- just another color clip, same
+    /// decode/streaming requirements as masked_video.mp4. (The character's
+    /// ALPHA MATTE video is loaded via `loadFramesAsGrayBuffer8` below
+    /// instead, as of the 2026-08-03 memory-budget pass -- see that
+    /// function's doc comment.)
     static func loadFramesAsRGBBuffer8(url: URL, previewIndices: Set<Int> = [], maxFrames: Int? = nil) throws -> LoadedColorVideo {
         let (frames, previews, width, height) = try streamFrames(url: url, previewIndices: previewIndices, maxFrames: maxFrames) { cgImage in
             RGBBuffer8.from(cgImage: cgImage)
@@ -107,6 +117,30 @@ enum VideoFrameLoader {
             PackedMaskFrame.from(cgImage: cgImage)
         }
         return LoadedMaskVideo(frames: frames, width: width, height: height, previews: previews)
+    }
+
+    /// Streams a single-channel (grayscale-in-RGB) video, converting each
+    /// frame to a `GrayBuffer8` as it's decoded -- same one-CGImage-at-a-time
+    /// discipline as `loadFramesAsRGBBuffer8`/`loadFramesAsPackedMask`.
+    ///
+    /// Added for the character's ALPHA MATTE video specifically (real
+    /// synthetic-character compositing, memory-budget review 2026-08-03):
+    /// it used to be loaded through `loadFramesAsRGBBuffer8` purely to reuse
+    /// this same streaming decode loop, which meant paying for 3 redundant
+    /// bytes/pixel (R==G==B) when only 1 channel's worth of information is
+    /// ever read back. `loadFramesAsPackedMask` was NOT the right fix
+    /// instead -- it's 1-bit-per-pixel, correct for a strictly binary
+    /// segmentation mask but wrong for a soft, antialiased alpha matte (see
+    /// the ALPHA-MATTE PRECISION DECISION doc on `RGBBuffer8` in
+    /// PixelBuffer.swift). `GrayBuffer8` keeps the same full 0-255
+    /// precision as before, just without the two unused channels: 1
+    /// byte/pixel instead of 3, a lossless 3x reduction (~1.44GB -> ~0.48GB
+    /// at 300 frames/1264x1264).
+    static func loadFramesAsGrayBuffer8(url: URL, previewIndices: Set<Int> = [], maxFrames: Int? = nil) throws -> LoadedGrayVideo {
+        let (frames, previews, width, height) = try streamFrames(url: url, previewIndices: previewIndices, maxFrames: maxFrames) { cgImage in
+            GrayBuffer8.from(cgImage: cgImage)
+        }
+        return LoadedGrayVideo(frames: frames, width: width, height: height, previews: previews)
     }
 
     /// Shared decode loop: identical `AVAssetReader`/`CIContext` setup and

@@ -662,19 +662,24 @@ struct BenchmarkView: View {
         // realCharacterData is loaded here (once, before the per-frame
         // loop) rather than inside it -- same streaming-then-hold-compact-
         // arrays discipline as colorBuffers/maskBuffers above, NOT a
-        // per-frame re-decode. Loading via the SAME
+        // per-frame re-decode. The character video loads via the SAME
         // VideoFrameLoader.loadFramesAsRGBBuffer8 streaming path used for
-        // masked_video.mp4 means at most one CGImage is resident at a time
-        // during this load, exactly like every other video load in this
-        // function -- the character/alpha arrays that result are compact
-        // RGBBuffer8 (UInt8, 3 bytes/pixel), the same element type/memory
-        // class as colorBuffers, not a return to Float32 or [CGImage].
-        // This is the fourth video loaded into a full-clip compact array
-        // by this function (masked, mask, character, alpha) -- all four
-        // share the identical bounded-memory shape.
+        // masked_video.mp4 (compact RGBBuffer8, UInt8, 3 bytes/pixel -- same
+        // element type/memory class as colorBuffers, not a return to
+        // Float32 or [CGImage]). The alpha matte loads via
+        // loadFramesAsGrayBuffer8 instead (added in the 2026-08-03
+        // memory-budget pass): it only ever needs 1 channel's worth of
+        // information (see GrayBuffer8's doc comment in PixelBuffer.swift),
+        // so storing it as a 3-channel RGBBuffer8 like an earlier version of
+        // this code did was a real, avoidable 3x memory cost (~1.44GB ->
+        // ~0.48GB at 300 frames/1264x1264) with zero corresponding benefit --
+        // nothing ever read the redundant G/B channels. This is the fourth
+        // video loaded into a full-clip compact array by this function
+        // (masked, mask, character, alpha); all four stay bounded/compact,
+        // just not all the same element type anymore.
         struct RealCharacterData {
             let character: [RGBBuffer8]
-            let alpha: [RGBBuffer8]
+            let alpha: [GrayBuffer8]
             let width: Int
             let height: Int
         }
@@ -691,7 +696,7 @@ struct BenchmarkView: View {
             guard let realCharacter else { return nil }
             appendLog("[diag] staged character detected (\(clipLibrary.activePreset?.name ?? "preset")) -- loading REAL synthetic character + alpha matte instead of the placeholder avatar...")
             let charVideo = try VideoFrameLoader.loadFramesAsRGBBuffer8(url: realCharacter.character)
-            let alphaVideo = try VideoFrameLoader.loadFramesAsRGBBuffer8(url: realCharacter.alpha)
+            let alphaVideo = try VideoFrameLoader.loadFramesAsGrayBuffer8(url: realCharacter.alpha)
             guard charVideo.width == maskedVideo.width && charVideo.height == maskedVideo.height else {
                 throw NSError(domain: "BenchmarkView", code: 10, userInfo: [NSLocalizedDescriptionKey:
                     "character video is \(charVideo.width)x\(charVideo.height) but the masked/background clip is \(maskedVideo.width)x\(maskedVideo.height) -- refusing to composite mismatched resolutions (would silently misalign or crash mid-loop). Re-export the character video at the clip's resolution."])
