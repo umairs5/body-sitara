@@ -950,7 +950,16 @@ struct BenchmarkView: View {
         }
         appendLog("  Scroll the image strip above to visually verify each stage's output before trusting these numbers.")
 
-        lastRunSummary = "Total \(String(format: "%.0f", totalMs))ms for \(nFinal) frames · \(reconResult.method.rawValue) · core-fill: \(coreFillMethodSummary)\(realCharacterData != nil ? " · REAL character" : "")"
+        // Reuses the same `forcedSuffix` the method badge already appends
+        // (line ~712) -- this summary line is a persistent SwiftUI Text
+        // that stays on screen after the run finishes, making it exactly
+        // the kind of element someone screenshots in isolation (e.g. for
+        // a paper appendix). Without the same "(forced)" marker here, a
+        // forced STATIC run on a genuinely high-motion clip would read
+        // identically to a real self-decided STATIC classification if
+        // this summary were the only thing captured -- caught by review
+        // 2026-08-03, the log line and method badge already had it.
+        lastRunSummary = "Total \(String(format: "%.0f", totalMs))ms for \(nFinal) frames · \(reconResult.method.rawValue)\(forcedSuffix) · core-fill: \(coreFillMethodSummary)\(realCharacterData != nil ? " · REAL character" : "")"
     }
 
     private static func maskPreviewImage(_ mask: [Bool], width: Int, height: Int) -> CGImage? {
