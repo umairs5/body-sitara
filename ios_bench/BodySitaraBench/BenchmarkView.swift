@@ -26,6 +26,36 @@ struct BenchmarkView: View {
     @State private var viewerClip: (title: String, url: URL)?
     @State private var showCompare = false
     @State private var lastRunSummary: String?
+    /// Manual override for Background Reconstruction's self-decided
+    /// STATIC/JITTER-vs-DYNAMIC choice (added 2026-08-03) -- purely a
+    /// research/benchmarking convenience: e.g. CASE1_courtyard's real
+    /// footage measures devC=285.9px, well past R_MAX, so it ALWAYS
+    /// self-selects DYNAMIC; this lets the same clip be forced through
+    /// STATIC/JITTER anyway to get a direct, controlled comparison number
+    /// for a paper table, with the override clearly flagged in the
+    /// resulting log/badge (see BackgroundReconstructor.reconstruct's
+    /// `forceMode` doc comment). Defaults to `.auto`, which reproduces the
+    /// exact pre-existing self-decided behavior -- every previously
+    /// validated clip/preset run on this app used (and, left on the
+    /// default, continues to use) that path unchanged.
+    @State private var reconModeOverride: ReconModeOverride = .auto
+
+    enum ReconModeOverride: String, CaseIterable, Identifiable {
+        case auto = "Auto"
+        case forceStatic = "Force STATIC"
+        case forceDynamic = "Force DYNAMIC"
+        var id: String { rawValue }
+
+        /// nil for `.auto` (no override -- BackgroundReconstructor makes its
+        /// own self-decision exactly as before this feature existed).
+        var forcedMethod: BackgroundReconstructor.Method? {
+            switch self {
+            case .auto: return nil
+            case .forceStatic: return .staticJitter
+            case .forceDynamic: return .dynamicWindowed
+            }
+        }
+    }
 
     static let repetitions = 5 // matches Table 8's 5-repetition methodology
 
@@ -109,6 +139,29 @@ struct BenchmarkView: View {
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
+
+                // Reconstruction Mode override (2026-08-03): "Auto" (default)
+                // preserves the existing self-decided STATIC-vs-DYNAMIC
+                // behavior for every clip -- see ReconModeOverride's doc
+                // comment. "Force STATIC"/"Force DYNAMIC" are for controlled
+                // comparison runs (e.g. running CASE1_courtyard's naturally-
+                // DYNAMIC footage through STATIC anyway for a paper table).
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Reconstruction Mode")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Picker("Reconstruction Mode", selection: $reconModeOverride) {
+                        ForEach(ReconModeOverride.allCases) { mode in
+                            Text(mode.rawValue).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    if reconModeOverride != .auto {
+                        Label("Overrides the self-decided algorithm choice -- for comparison testing only", systemImage: "exclamationmark.triangle")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                    }
+                }
 
                 if let lastRunSummary {
                     Divider()
@@ -358,9 +411,25 @@ struct BenchmarkView: View {
         // 2026-07-31: the app appeared "stuck" during a ~13s run). Hop to a
         // detached background task for the actual compute; only the
         // appendLog/setStage/addPreview calls that follow need the main actor.
+        //
+        // `forcedMethod` is read from the @MainActor-isolated
+        // `reconModeOverride` @State property and captured into this plain
+        // local `let` BEFORE entering Task.detached, matching the existing
+        // colorBuffers/maskBuffers capture pattern just above --
+        // Task.detached's closure is non-isolated, so it cannot touch
+        // `self.reconModeOverride` (a main-actor-isolated var) directly
+        // without an actor-isolation compile error (this codebase has hit
+        // exactly that class of error multiple times this session; see e.g.
+        // commit 9e52e57 "Fix Swift concurrency error: realCharacterData
+        // must be let, not var"). `nil` (the `.auto` case) reproduces the
+        // exact pre-existing call -- zero behavior change when left on Auto.
+        let forcedMethod = reconModeOverride.forcedMethod
         let reconResult = await Task.detached(priority: .userInitiated) {
-            BackgroundReconstructor.reconstruct(colorFrames: colorBuffers, masks: maskBuffers)
+            BackgroundReconstructor.reconstruct(colorFrames: colorBuffers, masks: maskBuffers, forceMode: forcedMethod)
         }.value
+        if let forcedMethod {
+            appendLog("[diag] Reconstruction Mode override ACTIVE: forcing \(forcedMethod.rawValue) (self-decision bypassed -- comparison-testing mode, not a genuine self-decision)")
+        }
         let corePctPreview = 100.0 * Double(reconResult.core.filter { $0 }.count) / Double(reconResult.core.count)
         appendLog("  self-decided method: \(reconResult.method.rawValue) -- \(reconResult.methodDetail)")
         appendLog("  align=\(String(format: "%.0f", reconResult.alignMs))ms trimmed-mean=\(String(format: "%.0f", reconResult.trimmedMeanMs))ms (neural/push-pull core: \(String(format: "%.1f", corePctPreview))%)")
@@ -633,9 +702,17 @@ struct BenchmarkView: View {
         // only has one badge slot -- see PipelineStageView.swift, out of
         // scope to modify -- so the push-pull anti-hallucination warning is
         // folded in as a suffix rather than getting a second badge).
+        // "(forced)" suffix (2026-08-03): when `forcedMethod` is non-nil,
+        // this run's method was NOT a genuine self-decision -- the badge
+        // must say so, so a screenshot/log of a forced comparison run can
+        // never be mistaken for real self-decided STATIC/DYNAMIC
+        // classification (research-integrity requirement -- the paper
+        // table needs to distinguish "this clip naturally has low motion"
+        // from "we forced STATIC on a high-motion clip for comparison").
+        let forcedSuffix = forcedMethod != nil ? " (forced)" : ""
         let methodBadgeText = reconResult.method == .dynamicWindowed
-            ? "DYNAMIC windowed\(usedPushPull ? " + push-pull ⚠" : "")"
-            : "STATIC/JITTER\(usedPushPull ? " + push-pull ⚠" : "")"
+            ? "DYNAMIC windowed\(usedPushPull ? " + push-pull ⚠" : "")\(forcedSuffix)"
+            : "STATIC/JITTER\(usedPushPull ? " + push-pull ⚠" : "")\(forcedSuffix)"
         setStage("Background Reconstruction", status: .done,
                   timings: [("align", reconResult.alignMs), ("trim", reconResult.trimmedMeanMs), ("fill", lamaStageMs)],
                   method: (methodBadgeText, usedPushPull),

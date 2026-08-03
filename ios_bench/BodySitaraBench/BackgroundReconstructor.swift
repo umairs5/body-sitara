@@ -538,13 +538,51 @@ enum BackgroundReconstructor {
     /// function used before 2026-07-31 -- see the enum's header doc for
     /// why (this is the fix for the input-layer OOM gap the previous
     /// UInt8-stack rewrite missed).
-    static func reconstruct(colorFrames: [RGBBuffer8], masks: [PackedMaskFrame]) -> Result {
+    ///
+    /// `forceMode` (added 2026-08-03 for a specific research-paper need:
+    /// running CASE1_courtyard's real footage -- devC=285.9px, well past
+    /// R_MAX, so it always self-selects DYNAMIC -- through STATIC/JITTER
+    /// anyway, to get a direct controlled comparison number against the
+    /// same clip's genuine DYNAMIC result): when non-nil, SKIPS the
+    /// self-decision entirely and calls the requested path directly.
+    /// `computeTrajectory` still runs unconditionally either way (never
+    /// skipped) purely for logging/diagnostics, so a forced run's
+    /// `methodDetail` can still report the real measured devC alongside
+    /// the fact that the choice was overridden -- see the "FORCED to"
+    /// phrasing below. Defaults to nil, so every existing call site
+    /// (BenchmarkView.swift) that doesn't pass this argument keeps the
+    /// exact same self-decided behavior as before this parameter existed
+    /// -- purely additive, zero behavior change for the default path.
+    static func reconstruct(colorFrames: [RGBBuffer8], masks: [PackedMaskFrame], forceMode: Method? = nil) -> Result {
         precondition(!colorFrames.isEmpty, "need at least 1 frame")
         let width = colorFrames[0].width
         let height = colorFrames[0].height
         let n = colorFrames.count
 
         let traj = computeTrajectory(colorFrames: colorFrames, masks: masks, width: width, height: height)
+
+        if let forced = forceMode {
+            let wouldHaveSelected: Method = (traj.needsWindowing && n >= WINDOW_MIN) ? .dynamicWindowed : .staticJitter
+            let result: Result
+            switch forced {
+            case .staticJitter:
+                result = reconstructStatic(colorFrames: colorFrames, masks: masks, width: width, height: height, traj: traj)
+            case .dynamicWindowed:
+                result = reconstructDynamic(colorFrames: colorFrames, masks: masks, width: width, height: height, traj: traj)
+            }
+            // Rewrite methodDetail so a forced run's log/badge can NEVER be
+            // mistaken for a genuine self-decision -- research-integrity
+            // requirement: the paper table must be able to distinguish "this
+            // clip naturally has low motion" from "we forced STATIC on a
+            // high-motion clip for comparison." Always states what the
+            // self-decision WOULD have picked, even when forced==wouldHaveSelected
+            // (i.e. forcing the branch that would have run anyway), so the
+            // override is visible in every forced run's output, not just the
+            // ones that actually changed the outcome.
+            let detail = "devC=\(String(format: "%.1f", traj.devC))px (R_MAX=\(String(format: "%.1f", rMax(width: width)))px) -- would have selected \(wouldHaveSelected.rawValue) -- FORCED to \(forced.rawValue) for comparison testing"
+            return Result(plateBeforeLama: result.plateBeforeLama, core: result.core, union: result.union, neverRevealed: result.neverRevealed, alignMs: result.alignMs, trimmedMeanMs: result.trimmedMeanMs, method: forced, methodDetail: detail, dynamicWindows: result.dynamicWindows, perWindowAlignMs: result.perWindowAlignMs)
+        }
+
         if traj.needsWindowing && n >= WINDOW_MIN {
             return reconstructDynamic(colorFrames: colorFrames, masks: masks, width: width, height: height, traj: traj)
         }
