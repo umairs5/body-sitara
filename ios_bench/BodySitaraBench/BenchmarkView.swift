@@ -678,8 +678,17 @@ struct BenchmarkView: View {
             let width: Int
             let height: Int
         }
-        var realCharacterData: RealCharacterData?
-        if let realCharacter {
+        // `let`, not `var`: assigned exactly once via this immediately-
+        // invoked closure rather than mutated in place after a `var`
+        // declaration -- Swift 6 strict concurrency rejects a captured
+        // `var` inside the `Task.detached` closure below ("reference to
+        // captured var 'realCharacterData' in concurrently-executing
+        // code", hit for real in CI 2026-08-03) even though this function
+        // only ever reads it after this point. A `let` bound once, up
+        // front, sidesteps that check entirely and is honestly the more
+        // correct shape anyway -- nothing downstream needs to reassign it.
+        let realCharacterData: RealCharacterData? = try {
+            guard let realCharacter else { return nil }
             appendLog("[diag] staged character detected (\(clipLibrary.activePreset?.name ?? "preset")) -- loading REAL synthetic character + alpha matte instead of the placeholder avatar...")
             let charVideo = try VideoFrameLoader.loadFramesAsRGBBuffer8(url: realCharacter.character)
             let alphaVideo = try VideoFrameLoader.loadFramesAsRGBBuffer8(url: realCharacter.alpha)
@@ -691,9 +700,9 @@ struct BenchmarkView: View {
                 throw NSError(domain: "BenchmarkView", code: 11, userInfo: [NSLocalizedDescriptionKey:
                     "character alpha video is \(alphaVideo.width)x\(alphaVideo.height) but the masked/background clip is \(maskedVideo.width)x\(maskedVideo.height) -- refusing to composite mismatched resolutions. Re-export the alpha matte at the clip's resolution."])
             }
-            realCharacterData = RealCharacterData(character: charVideo.frames, alpha: alphaVideo.frames, width: charVideo.width, height: charVideo.height)
             appendLog("  loaded \(charVideo.frames.count) character frames + \(alphaVideo.frames.count) alpha frames (\(charVideo.width)x\(charVideo.height))")
-        }
+            return RealCharacterData(character: charVideo.frames, alpha: alphaVideo.frames, width: charVideo.width, height: charVideo.height)
+        }()
 
         // Frame-count policy: extend the existing n = min(maskedCount,
         // maskCount) pattern to also bound by the character/alpha frame
