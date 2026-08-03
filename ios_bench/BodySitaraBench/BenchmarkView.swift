@@ -364,6 +364,18 @@ struct BenchmarkView: View {
         let corePctPreview = 100.0 * Double(reconResult.core.filter { $0 }.count) / Double(reconResult.core.count)
         appendLog("  self-decided method: \(reconResult.method.rawValue) -- \(reconResult.methodDetail)")
         appendLog("  align=\(String(format: "%.0f", reconResult.alignMs))ms trimmed-mean=\(String(format: "%.0f", reconResult.trimmedMeanMs))ms (neural/push-pull core: \(String(format: "%.1f", corePctPreview))%)")
+        if !reconResult.perWindowAlignMs.isEmpty {
+            // Per-window breakdown -- added to diagnose the 346727ms
+            // DYNAMIC-path alignment time seen on the first real device run
+            // that exercised this path (2026-08-03): a roughly uniform
+            // per-window time here points at thermal throttling over the
+            // sustained multi-minute compute burst (no algorithmic cause
+            // was found on review -- DYNAMIC's per-frame pyramid is
+            // strictly cheaper than STATIC's), while one outlier window
+            // would instead point at that window's specific frame content.
+            let perWin = reconResult.perWindowAlignMs.map { String(format: "%.0f", $0) }.joined(separator: ", ")
+            appendLog("  per-window align: [\(perWin)]ms")
+        }
         addPreview("Plate BEFORE fill\n(trimmed-mean)", reconResult.plateBeforeLama.toCGImage())
         addPreview("Core\n(white=needs fill)", Self.maskPreviewImage(reconResult.core, width: reconResult.plateBeforeLama.width, height: reconResult.plateBeforeLama.height))
 
@@ -514,10 +526,17 @@ struct BenchmarkView: View {
             // exposure-matched) into that frame's hole region.
             let windows = reconResult.dynamicWindows ?? []
             appendLog("[diag] running per-window core-fill (\(windows.count) window(s), bbox-cropped LaMa or push-pull if a window's core > 35%)...")
+            // NOTE: the per-call autoreleasepool now lives INSIDE
+            // BackgroundReconstructor.fillWindowCores, wrapping each
+            // window's individual lamaRunner.fillCore call -- not here
+            // around the whole loop. A single pool around the entire
+            // multi-window loop only drains once, after every window's
+            // CoreML buffers have already piled up, which is the real
+            // on-device crash this was rewritten to fix (see
+            // fillWindowCores's doc comment for the full root-cause
+            // writeup and the established bb6b3a3 precedent it matches).
             let methods: [String] = await Task.detached(priority: .userInitiated) {
-                autoreleasepool {
-                    BackgroundReconstructor.fillWindowCores(windows, lamaRunner: lamaRunner)
-                }
+                BackgroundReconstructor.fillWindowCores(windows, lamaRunner: lamaRunner)
             }.value
             for (idx, m) in methods.enumerated() { appendLog("  window \(idx) [\(windows[idx].start)-\(windows[idx].end)): \(m)") }
             usedPushPull = methods.contains { $0.hasPrefix("push-pull") }

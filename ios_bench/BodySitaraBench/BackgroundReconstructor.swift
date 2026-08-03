@@ -152,6 +152,33 @@ enum BackgroundReconstructor {
         /// instead paste `plateBeforeLama`-after-core-fill into each
         /// frame's own mask region directly (existing BenchmarkView logic).
         let dynamicWindows: [WindowPlate]?
+        /// Per-window wall-clock ms for `buildWindow`, in build order --
+        /// empty for STATIC. Added 2026-08-03 after a real DYNAMIC-path
+        /// device run measured `alignMs=346727ms` for 4 windows (~87-96
+        /// frames each), a ~7x-per-frame-alignment slowdown vs. the
+        /// STATIC path's known-good ~41-45s/300-frame figures, WITHOUT any
+        /// corresponding algorithmic difference found on close review of
+        /// `buildWindow`/`alignPyramid`/`alignTranslation` (DYNAMIC's
+        /// windowPyramidLevels is a strict SUBSET of STATIC's default
+        /// levels -- 2 levels vs. 3, missing exactly the expensive native-
+        /// resolution search level -- so per-frame cost should be equal or
+        /// LOWER in DYNAMIC, not higher; total frame-alignment count across
+        /// all windows with the logged len=96/overlap=16/hop=80 params is
+        /// only ~1.15-1.3x STATIC's per-clip count, not 7-8x). No
+        /// algorithmic root cause was found despite a full trace of the
+        /// call graph -- this per-window breakdown is added so the NEXT
+        /// real device run can show whether the slowdown is roughly UNIFORM
+        /// across all 4 windows (consistent with progressive thermal
+        /// throttling over the sustained ~5.8-minute single-stage compute
+        /// burst -- plausible since this is the first clip ever to run
+        /// `buildWindow` long enough on real hardware to hit sustained
+        /// thermal pressure) or concentrated in one outlier window
+        /// (which would instead point at a content-specific issue in that
+        /// window's frame range, e.g. unusually large search-radius misses
+        /// forcing repeated fallback behavior) -- rather than guessing
+        /// which explanation is correct without the data to distinguish
+        /// them.
+        let perWindowAlignMs: [Double]
     }
 
     // MARK: - Packed / compact storage
@@ -635,7 +662,7 @@ enum BackgroundReconstructor {
 
         let plate = RGBBuffer(r: rPlateOut, g: gPlateOut, b: bPlateOut, width: width, height: height)
         let detail = String(format: "devC=%.1fpx (R_MAX=%.1fpx) -- single plate covers the clip's motion", traj.devC, rMax(width: width))
-        return Result(plateBeforeLama: plate, core: core, union: union, neverRevealed: neverRevealed, alignMs: alignMs, trimmedMeanMs: trimmedMeanMs, method: .staticJitter, methodDetail: detail, dynamicWindows: nil)
+        return Result(plateBeforeLama: plate, core: core, union: union, neverRevealed: neverRevealed, alignMs: alignMs, trimmedMeanMs: trimmedMeanMs, method: .staticJitter, methodDetail: detail, dynamicWindows: nil, perWindowAlignMs: [])
     }
 
     // MARK: - Motion detection (STATIC vs DYNAMIC self-decision)
@@ -885,12 +912,22 @@ enum BackgroundReconstructor {
             hop = min(len, max(hop, (n - len + MAX_WINDOWS - 2) / (MAX_WINDOWS - 1)))
         }
 
+        // Per-window timing (see Result.perWindowAlignMs's doc comment):
+        // recorded so a real device run can show whether a slow total
+        // alignMs is spread evenly across windows (thermal-throttling
+        // signature) or concentrated in one window (content-specific
+        // signature) -- the aggregate `alignMs` alone (as logged on the
+        // first real DYNAMIC run, 2026-08-03: align=346727ms for 4
+        // windows) can't distinguish those two cases.
         var windows: [WindowPlate] = []
+        var perWindowMs: [Double] = []
         var start = 0
         while start < n {
             let end = min(start + len, n)
             let refT = (start + end) / 2
+            let tWinStart = CFAbsoluteTimeGetCurrent()
             let win = buildWindow(colorFrames: colorFrames, masks: masks, width: width, height: height, start: start, end: end, refIndex: refT)
+            perWindowMs.append((CFAbsoluteTimeGetCurrent() - tWinStart) * 1000)
             windows.append(win)
             if end >= n { break }
             start += hop
@@ -929,7 +966,7 @@ enum BackgroundReconstructor {
         // DYNAMIC mode does NOT, by construction).
         let previewPlate = windows.first?.plate ?? colorFrames[0].toFloatRGBBuffer()
         let detail = "devC=\(String(format: "%.1f", traj.devC))px > R_MAX=\(String(format: "%.1f", rMaxW))px -- \(windows.count) window(s), len=\(len) overlap=\(overlap) hop=\(hop)"
-        return Result(plateBeforeLama: previewPlate, core: coreAll, union: unionAll, neverRevealed: coreAll, alignMs: alignMs, trimmedMeanMs: trimmedMeanMs, method: .dynamicWindowed, methodDetail: detail, dynamicWindows: windows)
+        return Result(plateBeforeLama: previewPlate, core: coreAll, union: unionAll, neverRevealed: coreAll, alignMs: alignMs, trimmedMeanMs: trimmedMeanMs, method: .dynamicWindowed, methodDetail: detail, dynamicWindows: windows, perWindowAlignMs: perWindowMs)
     }
 
     /// Aligns every frame within [start, end) to the window's MIDDLE frame
@@ -1077,6 +1114,34 @@ enum BackgroundReconstructor {
     /// Mutates each `WindowPlate.plate`/`core` in place and returns the
     /// per-window method strings (matching Android's per-window fillCore()
     /// log lines) for the caller to fold into a single method badge/log.
+    ///
+    /// PER-ITERATION `autoreleasepool` (added after the first real DYNAMIC-
+    /// path device run crashed during/after this call, 2026-08-03): this
+    /// loop calls `lamaRunner.fillCore` up to `MAX_WINDOWS` (8) times back
+    /// to back, each one a full 1280x1280 CoreML LaMa inference. The
+    /// caller (BenchmarkView.swift) wrapped the ENTIRE `fillWindowCores`
+    /// call in a single `autoreleasepool { ... }` around the whole loop --
+    /// which only drains ONCE, after all N windows' worth of
+    /// Objective-C-backed CoreML MLMultiArray buffers have already piled
+    /// up. That is exactly the crash pattern this exact codebase already
+    /// root-caused and fixed once before, in `runLamaBenchmark`/
+    /// `runRifeBenchmark` (see commit bb6b3a3, "Wrap each benchmark
+    /// repetition in autoreleasepool -- fix rep-2 crash"): a real on-device
+    /// test found LaMa's rep 1 succeeds cleanly but rep 2 (a second
+    /// back-to-back large-tensor CoreML call with no pool drain in
+    /// between) crashes hard, because large CoreML buffers can outlive
+    /// their expected scope until the next autorelease-pool drain, and
+    /// back-to-back large inferences pile up memory faster than ARC alone
+    /// reclaims it. `fillWindowCores` has the identical shape (a tight
+    /// loop of repeated large-tensor CoreML calls) but was missing the
+    /// PER-CALL pool that fix established as the standard mitigation --
+    /// the one-big-pool-around-the-whole-loop the call site had instead
+    /// only protects against a single inference's leftover buffers, not
+    /// against 4 (or up to 8) of them compounding across iterations, which
+    /// is consistent with the observed crash landing during/right after
+    /// "running per-window core-fill" on a real iPhone 15 Pro Max. Moving
+    /// the pool IN HERE (one drain per window, not one for the whole
+    /// batch) matches the established fix's granularity exactly.
     static func fillWindowCores(_ windows: [WindowPlate], lamaRunner: LamaRunner) -> [String] {
         var methods: [String] = []
         for win in windows {
@@ -1084,12 +1149,14 @@ enum BackgroundReconstructor {
                 methods.append("none (no core)")
                 continue
             }
-            do {
-                let result = try lamaRunner.fillCore(plate: win.plate, core: win.core)
-                win.plate = result.filled
-                methods.append(result.method)
-            } catch {
-                methods.append("FAILED: \(error.localizedDescription)")
+            autoreleasepool {
+                do {
+                    let result = try lamaRunner.fillCore(plate: win.plate, core: win.core)
+                    win.plate = result.filled
+                    methods.append(result.method)
+                } catch {
+                    methods.append("FAILED: \(error.localizedDescription)")
+                }
             }
         }
         return methods
