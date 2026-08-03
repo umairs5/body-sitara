@@ -644,15 +644,77 @@ struct BenchmarkView: View {
         }
 
         // Steps 5-6: the server call (WanAnimate) can't be made from this
-        // local benchmark -- per explicit scope decision, a PLACEHOLDER
-        // avatar stands in for the real synthetic-avatar-over-lightmap
-        // response. Step 6 composites that returned avatar onto the
-        // RECONSTRUCTED background (not the lightmap) to produce the
-        // final video.
+        // local benchmark. When the active preset has a real
+        // cloud-generated character staged (ClipPreset.hasCharacter --
+        // e.g. CASE1's synthetic_person_p1.mp4/synthetic_alpha_p1.mp4),
+        // use it instead of the PLACEHOLDER avatar so this stage can be
+        // visually/quantitatively compared against Android's real
+        // reference outputs. Falls back to the exact previous placeholder
+        // behavior, unchanged, whenever no character is staged (the
+        // bundled sample clip, and any preset that hasn't had a character
+        // staged) -- see ClipPreset.hasCharacter's doc comment for why a
+        // preset without one is still perfectly usable. Step 6 composites
+        // the avatar (real or placeholder) onto the RECONSTRUCTED
+        // background (not the lightmap) to produce the final video.
         setStage("Final Compositing", status: .running)
-        appendLog("[diag] simulating server response (PLACEHOLDER avatar, no real WanAnimate call -- a DIFFERENT synthetic frame is generated per source frame, not one cached still, so Compositing's timing reflects real per-frame data volume)...")
 
-        appendLog("[diag] running Final Compositing: placeholder avatar onto per-frame reconstructed background (relight EXCLUDED per scope decision)...")
+        let realCharacter = clipLibrary.activeCharacter
+        // realCharacterData is loaded here (once, before the per-frame
+        // loop) rather than inside it -- same streaming-then-hold-compact-
+        // arrays discipline as colorBuffers/maskBuffers above, NOT a
+        // per-frame re-decode. Loading via the SAME
+        // VideoFrameLoader.loadFramesAsRGBBuffer8 streaming path used for
+        // masked_video.mp4 means at most one CGImage is resident at a time
+        // during this load, exactly like every other video load in this
+        // function -- the character/alpha arrays that result are compact
+        // RGBBuffer8 (UInt8, 3 bytes/pixel), the same element type/memory
+        // class as colorBuffers, not a return to Float32 or [CGImage].
+        // This is the fourth video loaded into a full-clip compact array
+        // by this function (masked, mask, character, alpha) -- all four
+        // share the identical bounded-memory shape.
+        struct RealCharacterData {
+            let character: [RGBBuffer8]
+            let alpha: [RGBBuffer8]
+            let width: Int
+            let height: Int
+        }
+        var realCharacterData: RealCharacterData?
+        if let realCharacter {
+            appendLog("[diag] staged character detected (\(clipLibrary.activePreset?.name ?? "preset")) -- loading REAL synthetic character + alpha matte instead of the placeholder avatar...")
+            let charVideo = try VideoFrameLoader.loadFramesAsRGBBuffer8(url: realCharacter.character)
+            let alphaVideo = try VideoFrameLoader.loadFramesAsRGBBuffer8(url: realCharacter.alpha)
+            guard charVideo.width == maskedVideo.width && charVideo.height == maskedVideo.height else {
+                throw NSError(domain: "BenchmarkView", code: 10, userInfo: [NSLocalizedDescriptionKey:
+                    "character video is \(charVideo.width)x\(charVideo.height) but the masked/background clip is \(maskedVideo.width)x\(maskedVideo.height) -- refusing to composite mismatched resolutions (would silently misalign or crash mid-loop). Re-export the character video at the clip's resolution."])
+            }
+            guard alphaVideo.width == maskedVideo.width && alphaVideo.height == maskedVideo.height else {
+                throw NSError(domain: "BenchmarkView", code: 11, userInfo: [NSLocalizedDescriptionKey:
+                    "character alpha video is \(alphaVideo.width)x\(alphaVideo.height) but the masked/background clip is \(maskedVideo.width)x\(maskedVideo.height) -- refusing to composite mismatched resolutions. Re-export the alpha matte at the clip's resolution."])
+            }
+            realCharacterData = RealCharacterData(character: charVideo.frames, alpha: alphaVideo.frames, width: charVideo.width, height: charVideo.height)
+            appendLog("  loaded \(charVideo.frames.count) character frames + \(alphaVideo.frames.count) alpha frames (\(charVideo.width)x\(charVideo.height))")
+        }
+
+        // Frame-count policy: extend the existing n = min(maskedCount,
+        // maskCount) pattern to also bound by the character/alpha frame
+        // counts when a real character is staged, so a shorter
+        // character/alpha clip can't run the loop past the end of its own
+        // arrays. CASE1's 4 inputs are all exactly 300 frames, so nFinal
+        // == n there; this only matters for future clips where a
+        // generated character render came back short (a realistic cloud
+        // failure mode -- e.g. WanAnimate truncating on an error frame).
+        let nFinal: Int
+        if let rc = realCharacterData {
+            nFinal = min(n, rc.character.count, rc.alpha.count)
+            if nFinal < n {
+                appendLog("  [warn] character/alpha clip (\(rc.character.count)/\(rc.alpha.count) frames) is shorter than the masked/background clip (\(n) frames) -- truncating Final Compositing to \(nFinal) frames.")
+            }
+        } else {
+            nFinal = n
+            appendLog("[diag] simulating server response (PLACEHOLDER avatar, no real WanAnimate call -- a DIFFERENT synthetic frame is generated per source frame, not one cached still, so Compositing's timing reflects real per-frame data volume)...")
+        }
+
+        appendLog("[diag] running Final Compositing: \(realCharacterData != nil ? "REAL synthetic character" : "placeholder avatar") onto per-frame reconstructed background (relight EXCLUDED per scope decision)...")
         // Streams to final_output.mp4 exactly like Loop 1/Loop 2 above.
         // The one structural difference from before: this loop needs
         // "frame i's reconstructed-background content" as its own per-frame
@@ -670,24 +732,40 @@ struct BenchmarkView: View {
             var count = 0
             var totalMs = 0.0
             var midPreview: CGImage?
-            for i in 0..<n {
+            for i in 0..<nFinal {
                 let frameBg = renderReconFrame(i)
-                let (character, alpha) = Compositor.placeholderCharacter(width: backgroundFinal.width, height: backgroundFinal.height, frameIndex: i, totalFrames: n)
+                let character: RGBBuffer
+                let alpha: [Float]
+                if let rc = realCharacterData {
+                    // Both arrays already live fully in memory (loaded
+                    // above, bounded/compact like colorBuffers) -- indexing
+                    // frame i here does not decode or allocate a new
+                    // clip-wide array per frame, only per-frame Float32
+                    // promotion of ONE frame (same pattern as
+                    // colorBuffers[i].toFloatRGBBuffer() elsewhere in this
+                    // function).
+                    character = rc.character[i].toFloatRGBBuffer()
+                    alpha = rc.alpha[i].alphaChannel8To01()
+                } else {
+                    (character, alpha) = Compositor.placeholderCharacter(width: backgroundFinal.width, height: backgroundFinal.height, frameIndex: i, totalFrames: nFinal)
+                }
                 let result = Compositor.compositeOnly(background: frameBg, character: character, alpha: alpha)
                 totalMs += result.compositeMs
                 if let cg = result.composited.toCGImage() {
                     try finalWriter.append(cg)
                     count += 1
-                    if i == n / 2 { midPreview = cg }
+                    if i == nFinal / 2 { midPreview = cg }
                 }
             }
             return (count, totalMs, midPreview)
         }.value
         appendLog("  Final Compositing: \(finalFrameCount) frames, composite total=\(String(format: "%.1f", totalCompositeMs))ms")
         if let finalMidPreview {
-            addPreview("FINAL\n(avatar on reconstructed bg, no relight)", finalMidPreview)
+            addPreview(realCharacterData != nil ? "FINAL\n(REAL character on reconstructed bg, no relight)" : "FINAL\n(avatar on reconstructed bg, no relight)", finalMidPreview)
         }
-        setStage("Final Compositing", status: .done, timings: [("composite", totalCompositeMs)])
+        setStage("Final Compositing", status: .done,
+                  timings: [("composite", totalCompositeMs)],
+                  method: realCharacterData != nil ? ("REAL character", false) : ("placeholder", false))
 
         // Video export: reconstructed_background.mp4 and
         // silhouette_on_lightmap.mp4 were already written+saved inline,
@@ -700,13 +778,17 @@ struct BenchmarkView: View {
         // stage's own loop, since there's no longer a stage-spanning
         // [CGImage] array forcing everything to wait until the end.
         setStage("Export", status: .running)
-        appendLog("\n[diag] finishing output videos (\(n) real frames each, not repeated stills)...")
+        appendLog("\n[diag] finishing output videos (\(n) real frames each\(nFinal != n ? ", except final_output.mp4 which is truncated to \(nFinal)" : ""), not repeated stills)...")
         do {
             try await finalWriter.finish()
             outputVideos.append((label: "Final Output", url: finalURL))
             try await VideoEncoder.saveToPhotoLibrary(url: finalURL)
             appendLog("  Saved final_output.mp4 to Photos (\(finalFrameCount) frames)")
-            appendLog("  NOTE: avatar itself is a static PLACEHOLDER cutout (no per-frame motion) -- background behind it is real per-frame video; a real WanAnimate avatar would also move per-frame.")
+            if realCharacterData != nil {
+                appendLog("  NOTE: avatar is the REAL staged synthetic character + alpha matte (\(clipLibrary.activePreset?.name ?? "preset")), not the placeholder -- background behind it is real per-frame video.")
+            } else {
+                appendLog("  NOTE: avatar itself is a static PLACEHOLDER cutout (no per-frame motion) -- background behind it is real per-frame video; a real WanAnimate avatar would also move per-frame.")
+            }
             setStage("Export", status: .done, detail: outputVideos.map { $0.label })
         } catch {
             appendLog("  Video export/save FAILED: \(error)")
@@ -718,11 +800,15 @@ struct BenchmarkView: View {
         appendLog("    Illumination Extraction:   \(String(format: "%.1f", lightmapResult.totalMs))ms")
         appendLog("    Final Compositing:         \(String(format: "%.1f", totalCompositeMs))ms")
         let totalMs = bgReconTotalMs + lightmapResult.totalMs + totalCompositeMs
-        appendLog("    TOTAL (3 stages):          \(String(format: "%.0f", totalMs))ms for \(n) src frames")
-        appendLog("  NOTE: Final Compositing uses a PLACEHOLDER character cutout, not a real WanAnimate render -- tests compositing MATH cost only, not visual fidelity.")
+        appendLog("    TOTAL (3 stages):          \(String(format: "%.0f", totalMs))ms for \(nFinal) src frames")
+        if realCharacterData != nil {
+            appendLog("  NOTE: Final Compositing used the REAL staged synthetic character + alpha matte -- tests both compositing MATH cost AND visual fidelity against Android's reference outputs.")
+        } else {
+            appendLog("  NOTE: Final Compositing uses a PLACEHOLDER character cutout, not a real WanAnimate render -- tests compositing MATH cost only, not visual fidelity.")
+        }
         appendLog("  Scroll the image strip above to visually verify each stage's output before trusting these numbers.")
 
-        lastRunSummary = "Total \(String(format: "%.0f", totalMs))ms for \(n) frames · \(reconResult.method.rawValue) · core-fill: \(coreFillMethodSummary)"
+        lastRunSummary = "Total \(String(format: "%.0f", totalMs))ms for \(nFinal) frames · \(reconResult.method.rawValue) · core-fill: \(coreFillMethodSummary)\(realCharacterData != nil ? " · REAL character" : "")"
     }
 
     private static func maskPreviewImage(_ mask: [Bool], width: Int, height: Int) -> CGImage? {

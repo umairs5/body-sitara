@@ -80,6 +80,18 @@ enum VideoFrameLoader {
     /// the whole clip as `CGImage`s -- those specific frames are cloned into
     /// `previews` at the moment they're decoded, alongside the normal
     /// RGBBuffer8 conversion.
+    /// Also reused, unmodified, to load TWO more clips in BenchmarkView's
+    /// Final Compositing stage, when a `ClipPreset` has
+    /// `hasCharacter == true`:
+    ///   - the real synthetic-CHARACTER video -- just another color clip,
+    ///     same decode/streaming requirements as masked_video.mp4.
+    ///   - the character's ALPHA MATTE video -- deliberately loaded through
+    ///     THIS function (not `loadFramesAsPackedMask`, which is
+    ///     1-bit-per-pixel and would hard-clip a soft matte's antialiased
+    ///     edges) so its result stays an 8-bit-per-pixel `RGBBuffer8`; see
+    ///     `RGBBuffer8.alphaChannel8To01()` in PixelBuffer.swift for the
+    ///     full reasoning and how the resulting per-pixel byte is read back
+    ///     as a 0-255 alpha value instead of a binary mask.
     static func loadFramesAsRGBBuffer8(url: URL, previewIndices: Set<Int> = [], maxFrames: Int? = nil) throws -> LoadedColorVideo {
         let (frames, previews, width, height) = try streamFrames(url: url, previewIndices: previewIndices, maxFrames: maxFrames) { cgImage in
             RGBBuffer8.from(cgImage: cgImage)

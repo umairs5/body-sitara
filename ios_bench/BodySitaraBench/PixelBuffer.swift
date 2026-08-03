@@ -205,6 +205,38 @@ struct RGBBuffer8 {
         }
         return RGBBuffer(r: rF, g: gF, b: bF, width: width, height: height)
     }
+
+    /// ALPHA-MATTE PRECISION DECISION (real synthetic-character compositing,
+    /// added when wiring CASE1's `synthetic_alpha_p1.mp4` into Final
+    /// Compositing): a real cloud-generated alpha matte is a SOFT,
+    /// antialiased cutout -- edge pixels legitimately need values anywhere
+    /// in 0-255 (hair wisps, motion-blurred limb edges, etc.), not just
+    /// "fully in" or "fully out". `PackedMaskFrame` (see below) is a
+    /// strict 1-bit-per-pixel bitset -- correct for the person/hole
+    /// SEGMENTATION mask (mask.mp4, which really is binary: a pixel either
+    /// is or isn't part of the hole to fill), but WRONG for an alpha
+    /// matte: thresholding a soft matte to 1 bit would hard-clip every
+    /// antialiased edge to a jagged binary silhouette, a real, visible
+    /// quality regression versus what the cloud actually rendered -- not
+    /// just an engineering shortcut.
+    ///
+    /// Rather than add a new single-channel-per-pixel UInt8 type (the
+    /// task's suggested `PackedGrayFrame`), the alpha video is decoded
+    /// through the EXISTING `RGBBuffer8`/`VideoFrameLoader.
+    /// loadFramesAsRGBBuffer8` streaming path (same one-CGImage-at-a-time
+    /// discipline, same memory footprint class as the character video
+    /// itself) and this accessor reads back just the red channel as the
+    /// 0-255 alpha value. This assumes the alpha video is exported as a
+    /// grayscale-in-RGB clip (R==G==B per pixel, the standard convention
+    /// for an alpha matte baked into a normal video codec, and how
+    /// CASE1's synthetic_alpha_p1.mp4 is produced) -- reading any one
+    /// channel is equivalent and cheaper than averaging three. This adds
+    /// zero new types/pbxproj registration and zero new memory-safety
+    /// surface: it is exactly the RGBBuffer8 this codebase already knows
+    /// how to load and discard per-frame.
+    func alphaChannel8To01() -> [Float] {
+        r.map { Float($0) / 255.0 }
+    }
 }
 
 /// Bit-packed (1 bit/pixel) mask storage for the full N-frame clip-wide

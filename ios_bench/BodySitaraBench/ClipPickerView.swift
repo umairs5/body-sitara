@@ -92,6 +92,8 @@ private struct PresetRow: View {
 
     @State private var maskedPickerItem: PhotosPickerItem?
     @State private var maskPickerItem: PhotosPickerItem?
+    @State private var characterPickerItem: PhotosPickerItem?
+    @State private var characterAlphaPickerItem: PhotosPickerItem?
     @State private var isStaging = false
     @State private var stageError: String?
 
@@ -141,6 +143,37 @@ private struct PresetRow: View {
                 .font(.subheadline)
             }
 
+            // Character + character-alpha slots -- OPTIONAL, unlike the two
+            // above: a preset with only masked+mask staged is still fully
+            // usable (Final Compositing falls back to
+            // Compositor.placeholderCharacter, exactly as before this
+            // feature existed). These two rows never affect the
+            // "Ready"/"Incomplete" badge above, which is intentionally
+            // still keyed off `preset.isComplete` (masked+mask only) --
+            // see ClipPreset.isComplete/.hasCharacter in ClipLibrary.swift.
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    slotButton(label: "Character", isStaged: FileManager.default.fileExists(atPath: preset.characterVideoURL.path)) {
+                        onPlay("\(preset.name) — Character", preset.characterVideoURL)
+                    }
+                    PhotosPicker(selection: $characterPickerItem, matching: .videos) {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                    }
+                    .font(.subheadline)
+
+                    slotButton(label: "Character Alpha", isStaged: FileManager.default.fileExists(atPath: preset.characterAlphaURL.path)) {
+                        onPlay("\(preset.name) — Character Alpha", preset.characterAlphaURL)
+                    }
+                    PhotosPicker(selection: $characterAlphaPickerItem, matching: .videos) {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                    }
+                    .font(.subheadline)
+                }
+                Text("(optional — uses placeholder character if empty)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
             if isStaging {
                 ProgressView().controlSize(.small)
             }
@@ -150,8 +183,10 @@ private struct PresetRow: View {
         }
         .padding(10)
         .background(isActive ? Theme.accent.opacity(0.08) : Color.clear, in: RoundedRectangle(cornerRadius: Theme.smallCornerRadius))
-        .onChange(of: maskedPickerItem) { _, item in stage(item, asMask: false) }
-        .onChange(of: maskPickerItem) { _, item in stage(item, asMask: true) }
+        .onChange(of: maskedPickerItem) { _, item in stage(item, into: .maskedVideo) { maskedPickerItem = nil } }
+        .onChange(of: maskPickerItem) { _, item in stage(item, into: .mask) { maskPickerItem = nil } }
+        .onChange(of: characterPickerItem) { _, item in stage(item, into: .character) { characterPickerItem = nil } }
+        .onChange(of: characterAlphaPickerItem) { _, item in stage(item, into: .characterAlpha) { characterAlphaPickerItem = nil } }
     }
 
     private func slotButton(label: String, isStaged: Bool, action: @escaping () -> Void) -> some View {
@@ -167,18 +202,26 @@ private struct PresetRow: View {
         .disabled(!isStaged)
     }
 
-    private func stage(_ item: PhotosPickerItem?, asMask: Bool) {
+    /// `clearReset` resets whichever `@State` picker binding triggered this
+    /// stage back to nil once staging finishes (success or failure), so a
+    /// re-pick of the same asset still fires `.onChange` -- a plain
+    /// closure over the specific `@State` var, rather than a KeyPath, since
+    /// `@State` property-wrapper storage isn't KeyPath-addressable from a
+    /// plain struct method. Shared by all 4 slots instead of 4
+    /// near-identical copies (the old 2-slot version special-cased
+    /// `asMask` inline; that doesn't scale to 4 slots cleanly).
+    private func stage(_ item: PhotosPickerItem?, into slot: ClipSlot, clearReset: @escaping () -> Void) {
         guard let item else { return }
         isStaging = true
         stageError = nil
         Task {
             do {
-                try await library.stage(item, asMask: asMask, in: preset)
+                try await library.stage(item, into: slot, in: preset)
             } catch {
                 stageError = error.localizedDescription
             }
             isStaging = false
-            if asMask { maskPickerItem = nil } else { maskedPickerItem = nil }
+            clearReset()
         }
     }
 }

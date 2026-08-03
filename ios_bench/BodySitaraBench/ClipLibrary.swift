@@ -20,9 +20,52 @@ struct ClipPreset: Identifiable, Codable, Equatable {
     var maskedVideoURL: URL { clipPresetDir(id).appendingPathComponent("masked_video.mp4") }
     var maskURL: URL { clipPresetDir(id).appendingPathComponent("mask.mp4") }
 
+    /// OPTIONAL slots: a real cloud-generated (WanAnimate) synthetic
+    /// character video + its matching alpha matte, for testing Final
+    /// Compositing against real character content instead of the
+    /// placeholder ellipse (Compositor.placeholderCharacter). A preset
+    /// with only masked+mask staged is still `isComplete` -- these two
+    /// slots are additive and never gate that flag (see `isComplete`
+    /// below, deliberately unchanged) -- BenchmarkView falls back to the
+    /// placeholder whenever `hasCharacter` is false, exactly as it always
+    /// has.
+    var characterVideoURL: URL { clipPresetDir(id).appendingPathComponent("character.mp4") }
+    var characterAlphaURL: URL { clipPresetDir(id).appendingPathComponent("character_alpha.mp4") }
+
     var isComplete: Bool {
         FileManager.default.fileExists(atPath: maskedVideoURL.path) &&
         FileManager.default.fileExists(atPath: maskURL.path)
+    }
+
+    /// True only when BOTH the character video and its alpha matte are
+    /// staged -- one without the other can't be composited (a character
+    /// with no alpha has no valid cutout region; an alpha with no
+    /// character has nothing to cut out), so BenchmarkView treats a
+    /// partially-staged pair the same as "no character staged" and falls
+    /// back to the placeholder rather than guessing.
+    var hasCharacter: Bool {
+        FileManager.default.fileExists(atPath: characterVideoURL.path) &&
+        FileManager.default.fileExists(atPath: characterAlphaURL.path)
+    }
+}
+
+/// Which on-disk slot a picked PhotosPickerItem should be staged into.
+/// Replaces the old `asMask: Bool` (which only distinguished 2 slots) now
+/// that a preset has 4 possible slots. `asMask`-style call sites are
+/// migrated to pass `.mask`/`.maskedVideo` explicitly.
+enum ClipSlot {
+    case maskedVideo
+    case mask
+    case character
+    case characterAlpha
+
+    func url(in preset: ClipPreset) -> URL {
+        switch self {
+        case .maskedVideo: return preset.maskedVideoURL
+        case .mask: return preset.maskURL
+        case .character: return preset.characterVideoURL
+        case .characterAlpha: return preset.characterAlphaURL
+        }
     }
 }
 
@@ -73,6 +116,19 @@ final class ClipLibrary: ObservableObject {
         return (preset.maskedVideoURL, preset.maskURL)
     }
 
+    /// The real synthetic-character video + alpha matte URLs, if the
+    /// active preset has both staged. nil whenever no preset is active,
+    /// the active preset isn't `isComplete` (matches `activeClip`'s own
+    /// gate -- no point staging a character over a clip that has no
+    /// masked/mask pair to reconstruct a background from), or the
+    /// character/alpha pair isn't fully staged -- callers (BenchmarkView)
+    /// treat nil as "use the placeholder", unchanged from today's
+    /// behavior.
+    var activeCharacter: (character: URL, alpha: URL)? {
+        guard let id = activePresetID, let preset = presets.first(where: { $0.id == id }), preset.isComplete, preset.hasCharacter else { return nil }
+        return (preset.characterVideoURL, preset.characterAlphaURL)
+    }
+
     var activePreset: ClipPreset? {
         presets.first(where: { $0.id == activePresetID })
     }
@@ -98,9 +154,10 @@ final class ClipLibrary: ObservableObject {
         save()
     }
 
-    /// Copies a picked PhotosPicker video into the preset's canonical
-    /// masked-video or mask slot. Overwrites any previously staged file in
-    /// that slot -- matches Danial's "re-pick overwrites a slot" behavior.
+    /// Copies a picked PhotosPicker video into one of the preset's 4
+    /// canonical slots (masked video, mask, character, character alpha).
+    /// Overwrites any previously staged file in that slot -- matches
+    /// Danial's "re-pick overwrites a slot" behavior.
     ///
     /// Loads via VideoPickerFile (a file-URL Transferable), NOT
     /// `loadTransferable(type: Data.self)`: PhotosPicker video items don't
@@ -108,18 +165,18 @@ final class ClipLibrary: ObservableObject {
     /// multi-hundred-MB clip fully into memory as Data before writing it
     /// back out would be wasteful even if they did. The file-representation
     /// transfer streams straight to a temp file that we then move/copy.
-    func stage(_ item: PhotosPickerItem, asMask: Bool, in preset: ClipPreset) async throws {
+    func stage(_ item: PhotosPickerItem, into slot: ClipSlot, in preset: ClipPreset) async throws {
         guard let received = try await item.loadTransferable(type: VideoPickerFile.self) else {
             throw NSError(domain: "ClipLibrary", code: 1, userInfo: [NSLocalizedDescriptionKey: "could not load video from picker"])
         }
-        let dest = asMask ? preset.maskURL : preset.maskedVideoURL
+        let dest = slot.url(in: preset)
         try FileManager.default.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
         if FileManager.default.fileExists(atPath: dest.path) {
             try FileManager.default.removeItem(at: dest)
         }
         try FileManager.default.copyItem(at: received.url, to: dest)
         try? FileManager.default.removeItem(at: received.url)   // received.url is a transient temp copy owned by us
-        objectWillChange.send()   // isComplete on the struct is derived from disk state, not stored -- force a UI refresh
+        objectWillChange.send()   // isComplete/hasCharacter on the struct are derived from disk state, not stored -- force a UI refresh
     }
 
     private func load() {
