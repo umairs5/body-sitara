@@ -266,14 +266,48 @@ def process_video(
         print(f"\n[3b] Anonymizer: convexhull")
 
     # [4] Video IO
-    print("\n[4/4] Opening video...")
-    cap = cv2.VideoCapture(input_path)
+    # A bare integer (e.g. "0") means a live camera device index rather than
+    # a file path -- cv2.VideoCapture("0") would otherwise try (and fail) to
+    # open a file literally named "0". Live sources use CAP_DSHOW, not
+    # CAP_MSMF: MSMF hangs indefinitely (not just fails -- genuinely blocks
+    # forever on cap.open()) for at least one tested device (Logitech B525),
+    # a known MSMF/UVC-driver incompatibility on some older webcams. DSHOW
+    # opens instantly for the same device. Confirmed via isolated testing
+    # 2026-08-12 -- do not switch back to MSMF without re-verifying against
+    # real hardware first.
+    is_live_camera = isinstance(input_path, int) or (
+        isinstance(input_path, str) and input_path.isdigit()
+    )
+    print("\n[4/4] Opening video..." if not is_live_camera else "\n[4/4] Opening live camera...")
+    # Live capture stays at the device's native 1920x1080 (the only mode
+    # confirmed working -- see CAP_DSHOW note above); every frame is then
+    # center-cropped to a 1080x1080 square immediately after cap.read(), so
+    # width/height/scale/VideoWriter below all see 1080x1080 without needing
+    # separate square-aware branches downstream. Matches this project's
+    # existing square-clip convention (e.g. 6_single_face.mp4 @ 1264x1264).
+    live_crop_x0 = None
+    if is_live_camera:
+        cap = cv2.VideoCapture(int(input_path), cv2.CAP_DSHOW)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+    else:
+        cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
         print(f"\nError: Could not open '{input_path}'")
         return
 
-    width     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height    = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if is_live_camera:
+        _native_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        _native_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        _square   = min(_native_w, _native_h)
+        live_crop_x0 = (_native_w - _square) // 2
+        live_crop_y0 = (_native_h - _square) // 2
+        width, height = _square, _square
+        print(f"Live capture native: {_native_w}x{_native_h} -> center-cropped to {width}x{height}")
+    else:
+        width     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height    = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps_input = cap.get(cv2.CAP_PROP_FPS) or 30.0
 
     scale            = min(width, height) / BASE_RESOLUTION
@@ -460,6 +494,8 @@ def process_video(
         success, frame = cap.read()
         if not success:
             break
+        if live_crop_x0 is not None:
+            frame = frame[live_crop_y0:live_crop_y0 + height, live_crop_x0:live_crop_x0 + width]
 
         annotated     = frame.copy()
         curr_gray     = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -705,7 +741,13 @@ def process_video(
                                 else:
                                     _, face_yaw_deg = face_canonicalizer.get_canonical_face_and_yaw(crop)
                                 t_canonical_total += time.time() - tc0
-                            else:
+                            elif anonymizer == "convexhull":
+                                # face_mesh_pts only feeds blur_all_persons()'s convex-hull
+                                # region (see the blur dispatch below) -- yoloseg*/selfie_seg
+                                # anonymizers blur from their own segmentation mask and never
+                                # read face_mesh_pts, so running this MediaPipe FaceLandmarker
+                                # call for them was pure wasted cost (confirmed: ~20ms/frame
+                                # with zero effect on their output).
                                 crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
                                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=crop_rgb)
                                 result   = face_mesh.detect(mp_image)
