@@ -13,7 +13,7 @@ class PersonState:
     """Tracks one person stream across frames."""
 
     def __init__(self, rsa_public_key, enc_output_dir: str,
-                 embedder, benchmark: bool = False):
+                 embedder, benchmark: bool = False, gender_classifier=None):
 
         self.prev_nose       = None
         self.movement_tier   = "medium"
@@ -30,6 +30,12 @@ class PersonState:
         self.best_frame_idx  = -1
         self.best_bbox_face  = None
         self.best_bbox_body  = None
+        # (left_eye, right_eye, nose), each in best_face_crop-LOCAL pixel
+        # coords (not full-frame coords -- best_face_crop is the only image
+        # this state retains). None if the winning frame had no face crop.
+        # Used by gender.py's predict_from_keypoints() for proper eye-line
+        # alignment instead of the weaker bbox-center-scale fallback.
+        self.best_face_eyes_nose = None
 
         # Per-frame encrypted body-crop archive -- separate from
         # best_body_crop above (which stays best-frame-only, used only as a
@@ -43,9 +49,10 @@ class PersonState:
         # crops at once.
         self._frame_records = []  # list of (frame_idx, bbox, nonce, ciphertext)
 
-        self._embedder       = embedder
-        self._enc_output_dir = enc_output_dir
-        self._benchmark      = benchmark
+        self._embedder         = embedder
+        self._gender_classifier = gender_classifier
+        self._enc_output_dir   = enc_output_dir
+        self._benchmark        = benchmark
 
         if not benchmark:
             wrapped_key = rsa_encrypt_key(self.aes_key, rsa_public_key)
@@ -67,7 +74,7 @@ class PersonState:
 
     def update_best(self, frame_idx, confidence,
                     face_crop, face_bbox, body_crop, body_bbox,
-                    face_quality: float = 1.0):
+                    face_quality: float = 1.0, face_eyes_nose=None):
         # Ranked by confidence * face_quality, not confidence alone: raw
         # keypoint confidence comes from BODY pose (shoulders/hips/knees --
         # see pose.compute_frame_confidence), so a frame can score high on a
@@ -86,6 +93,7 @@ class PersonState:
             self.best_frame_idx  = frame_idx
             self.best_bbox_face  = face_bbox
             self.best_bbox_body  = body_bbox
+            self.best_face_eyes_nose = face_eyes_nose
 
     def flush_to_disk(self) -> tuple[float, float]:
         if self._benchmark:
@@ -104,6 +112,23 @@ class PersonState:
             embedding = self._embedder.extract(self.best_face_crop)
         embed_time = time.time() - t_emb0
 
+        # Gender classification rides the same best_face_crop the embedding
+        # uses (selected by update_best()'s confidence * face_quality
+        # ranking) rather than tracking its own best frame -- one flag per
+        # stream, not per frame, matching how the embedding is also a
+        # single best-frame value.
+        gender_label, gender_conf = None, None
+        if self._gender_classifier is not None and self.best_face_crop is not None:
+            if self.best_face_eyes_nose is not None:
+                left_eye, right_eye, nose = self.best_face_eyes_nose
+                gender_result = self._gender_classifier.predict_from_keypoints(
+                    self.best_face_crop, left_eye, right_eye, nose
+                )
+            else:
+                gender_result = self._gender_classifier.predict(self.best_face_crop)
+            if gender_result is not None:
+                gender_label, gender_conf = gender_result
+
         t_enc0 = time.time()
 
         face_bytes = encode_crop(self.best_face_crop) if self.best_face_crop is not None else b""
@@ -116,6 +141,8 @@ class PersonState:
             "bbox_face"    : self.best_bbox_face,
             "has_embedding": embedding is not None,
             "embedding_dim": 512 if embedding is not None else 0,
+            "gender"       : gender_label,
+            "gender_conf"  : round(gender_conf, 4) if gender_conf is not None else None,
         }).encode("utf-8")
         emb_bytes = embedding.astype(np.float32).tobytes() if embedding is not None else b""
 

@@ -1,9 +1,12 @@
 import cv2
+import sys
 import time
 import os
 import csv
 import json
 import uuid
+import queue
+import threading
 import urllib.request
 import numpy as np
 import mediapipe as mp
@@ -28,6 +31,7 @@ from .tracking import PersonState, propagate_bboxes
 from .export_tracking import PersonIdentityTracker
 from .encryption import fetch_ttp_public_key
 from .embedding import EmbeddingExtractor, EDGEFACE_ONNX_PATH
+from .gender import GenderClassifier, GENDER_ONNX_PATH
 from .detector_patch import apply_detector_patch
 
 BASE_RESOLUTION       = 1280.0
@@ -194,6 +198,22 @@ def process_video(
         print("\n[3/4] Benchmark mode -- skipping EdgeFace embedding model")
         embedder = None
 
+    # [3a] Gender classifier -- same graceful-degradation pattern as the
+    # embedder above; runs on the same best_face_crop selected by
+    # PersonState.update_best(), so it rides the existing confidence *
+    # face_quality best-frame selection rather than tracking its own.
+    if not benchmark:
+        print("\n[3/4] Loading gender classifier...")
+        try:
+            gender_classifier = GenderClassifier(GENDER_ONNX_PATH)
+        except FileNotFoundError as e:
+            print(f"  WARNING: {e}")
+            print("  Running WITHOUT gender classification.")
+            gender_classifier = None
+    else:
+        print("\n[3/4] Benchmark mode -- skipping gender classifier")
+        gender_classifier = None
+
     # [3b] Anonymizer backend
     selfie_seg       = None
     mobile_sam       = None
@@ -287,7 +307,24 @@ def process_video(
     # existing square-clip convention (e.g. 6_single_face.mp4 @ 1264x1264).
     live_crop_x0 = None
     if is_live_camera:
-        cap = cv2.VideoCapture(int(input_path), cv2.CAP_DSHOW)
+        # CAP_DSHOW is Windows-only (DirectShow) -- doesn't exist as a
+        # concept on Linux/the Pi. CAP_V4L2 is the Linux equivalent; picked
+        # explicitly (not left to OpenCV's default backend selection) for
+        # the same reason CAP_DSHOW was pinned on Windows -- avoid relying
+        # on whichever backend happens to be first in ELF/DLL search order.
+        _backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_V4L2
+        cap = cv2.VideoCapture(int(input_path), _backend)
+        # MJPEG must be requested BEFORE resolution/fps: this webcam (B525,
+        # confirmed via v4l2-ctl --list-formats-ext on the Pi) only offers
+        # 1920x1080 at 5fps in its raw YUYV mode -- 30fps at that resolution
+        # only exists under MJPG (compressed). Without this, V4L2 silently
+        # keeps its default format (YUYV) and cap.set(CAP_PROP_FPS, 30)
+        # below has no effect at 1920x1080 -- verified capture would
+        # silently run at 5fps with no error. FOURCC has no such trap on
+        # Windows/DSHOW (which already negotiates MJPEG at 1080p30 for this
+        # device) but setting it explicitly there too costs nothing and
+        # keeps both platforms' open sequence identical.
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
         cap.set(cv2.CAP_PROP_FPS, 30)
@@ -345,6 +382,7 @@ def process_video(
     export_valid_smiles       = None   # smile scalar from genuinely-detected (non-held-over) frames only, for the clip baseline
     export_last_face_crop     = None   # transient only: feeds extract_params() + optional diagnostic write, never itself "the" export
     export_last_face_params   = None   # last-good parametric scalars, held across brief absences (mirrors the old face-crop hold-over)
+    export_gender_votes       = None   # per-slot list of (label, confidence) samples -- see manifest write-out for how these collapse to one value
     export_slot_stream_id     = None
     export_face_canon         = None
     export_face_writers       = None   # diagnostics-only now (see export_diagnostics gating below)
@@ -365,6 +403,7 @@ def process_video(
         export_valid_smiles     = [[] for _ in range(export_people)]
         export_last_face_crop   = [None] * export_people
         export_last_face_params = [None] * export_people
+        export_gender_votes     = [[] for _ in range(export_people)]
         # Filled in per-frame from the real PersonState.stream_id occupying
         # each slot (see the slot_matches loop below) -- NOT a fresh uuid4
         # minted here. Export slots and PersonState streams are otherwise
@@ -410,6 +449,95 @@ def process_video(
                 _exp_fourcc, fps_input, (width, height))
         print(f"\n  Dense export enabled -> {export_dir}  "
               f"(slots={export_people}, diagnostics={export_diagnostics})")
+
+    def _write_export_arrays():
+        """Re-writes keypoints_p{i}.npy / bboxes_p{i}.json / face_params_p{i}.npy
+        / manifest.json from the current in-memory export_* rows. Called
+        periodically during the loop (see EXPORT_FLUSH_EVERY below) AND once
+        more at clip-end -- so a run interrupted mid-clip (e.g. a live-camera
+        session with no natural EOF, see is_live_camera) still leaves a valid,
+        current-as-of-last-flush export on disk instead of losing everything,
+        at the cost of periodically re-writing the whole array (cheap at the
+        frame counts this pipeline runs -- these aren't multi-hour clips)."""
+        manifest_slots = []
+        last_total_frames = 0
+        for i in range(export_people):
+            kp_arr = (np.stack(export_kp_rows[i], axis=0) if export_kp_rows[i]
+                      else np.zeros((0, 17, 3), dtype=np.float32))
+            np.save(os.path.join(export_dir, f"keypoints_p{i}.npy"), kp_arr)
+            with open(os.path.join(export_dir, f"bboxes_p{i}.json"), "w") as f:
+                json.dump(export_bbox_rows[i], f)
+
+            fp_arr = (np.stack(export_face_param_rows[i], axis=0) if export_face_param_rows[i]
+                      else np.zeros((0, 12), dtype=np.float32))
+            np.save(os.path.join(export_dir, f"face_params_p{i}.npy"), fp_arr)
+            last_total_frames = kp_arr.shape[0]
+
+            # Smile baseline uses only genuinely-detected frames (export_valid_smiles),
+            # never the held-over values in export_face_param_rows -- matches the
+            # two-pass approach in scripts/test_face_canon_v2.py. Downstream
+            # rendering applies this correction itself (FaceCanonicalizerV2.
+            # set_smile_baseline() + render()) -- exported params are raw/uncorrected.
+            smile_baseline = (float(np.median(export_valid_smiles[i]))
+                               if export_valid_smiles[i] else 0.0)
+
+            # Gender collapses per-frame votes to one stable slot-level value --
+            # summed confidence per label (not majority count), so a handful of
+            # high-confidence frontal frames outweigh many low-confidence
+            # profile/motion-blurred ones. None if the slot never had a frame
+            # with both a face crop and a classifier available.
+            gender_label, gender_conf = None, None
+            if export_gender_votes[i]:
+                label_conf_sum: dict[str, float] = {}
+                for lbl, conf in export_gender_votes[i]:
+                    label_conf_sum[lbl] = label_conf_sum.get(lbl, 0.0) + conf
+                gender_label = max(label_conf_sum, key=label_conf_sum.get)
+                gender_conf  = float(
+                    label_conf_sum[gender_label] / len(export_gender_votes[i])
+                )
+
+            # packet_file/key_file: the real crypto bundle (see tracking.py's
+            # PersonState.flush_to_disk / __init__) for whichever stream this
+            # slot ended up bridged to (see the slot_matches loop above).
+            # null if this slot never had a real occupant, or its stream
+            # hadn't flushed yet (e.g. still mid-clip -- flush_to_disk() only
+            # runs when a person departs or the clip ends -- or crypto
+            # disabled via benchmark=True) -- checked by real file existence,
+            # not assumed, since "a stream_id was recorded" doesn't guarantee
+            # the files were actually written yet.
+            packet_file, key_file = None, None
+            sid = export_slot_stream_id[i]
+            if sid is not None:
+                candidate_packet = os.path.join(export_crypto_dir, f"stream_{sid}.packet")
+                candidate_key    = os.path.join(export_crypto_dir, f"stream_{sid}.key")
+                if os.path.isfile(candidate_packet):
+                    packet_file = f"crypto/stream_{sid}.packet"
+                if os.path.isfile(candidate_key):
+                    key_file = f"crypto/stream_{sid}.key"
+
+            manifest_slots.append({
+                "slot": i,
+                "stream_id": export_slot_stream_id[i],
+                "face_smile_baseline": smile_baseline,
+                "frames_with_face": len(export_valid_smiles[i]),
+                "gender": gender_label,
+                "gender_confidence": gender_conf,
+                "packet_file": packet_file,
+                "key_file": key_file,
+            })
+
+        with open(os.path.join(export_dir, "manifest.json"), "w") as f:
+            json.dump({
+                "clip_id": export_clip_id,
+                "fps": fps_input,
+                "width": width,
+                "height": height,
+                "num_slots": export_people,
+                "total_frames": last_total_frames,
+                "slots": manifest_slots,
+            }, f, indent=2)
+
+    EXPORT_FLUSH_EVERY = 30  # ~1s of clip at 30fps -- bounds data loss on interruption without significant periodic I/O overhead
 
     frame_idx        = 0
     full_frame_count = 0
@@ -466,7 +594,8 @@ def process_video(
     # Thread pools for parallelism (all C++ backends release the GIL)
     _seg_pool   = ThreadPoolExecutor(max_workers=1)  # selfie seg ∥ det+pose
     _lk_pool    = ThreadPoolExecutor(max_workers=2)  # body LK ∥ face LK
-    _write_pool = ThreadPoolExecutor(max_workers=1)  # async VideoWriter
+    # Main-output VideoWriter is now a real persistent write thread (see
+    # _write_q / _write_thread below), not a ThreadPoolExecutor.
 
     streams_flushed = 0
     loop_start      = time.time()
@@ -490,12 +619,78 @@ def process_video(
     # providers=providers) with no options arg) -- doing that cleanly means
     # bypassing ultralytics' ONNX loading entirely, out of scope for this
     # change. Kept serial for now.
+    # Three-stage read / process / write pipeline, matching SITARA's own
+    # Tier-1 implementation (a read thread loads frames into a queue, a
+    # processing thread handles them and passes results to a write queue,
+    # a write thread stores them). The write thread is defined here (before
+    # the read thread) so both queues/threads exist before the main
+    # processing loop starts submitting to either.
+    #
+    # Unlike the read queue, the write queue is UNBOUNDED and NEVER drops
+    # work for either live or file input: a dropped read frame just means
+    # the pipeline worked on slightly-stale-but-still-valid input, but a
+    # dropped WRITE means a frame silently goes missing from the output
+    # video -- there is no equivalent "it's fine, we'll get the next one"
+    # for output correctness. If the write thread ever falls behind
+    # processing, the queue grows rather than losing frames; it drains
+    # fully on shutdown (queue.join() below) before the VideoWriter closes.
+    _write_q = queue.Queue()  # unbounded: (write_fn, frame) tuples, or None sentinel
+
+    def _write_worker():
+        while True:
+            item = _write_q.get()
+            if item is None:
+                _write_q.task_done()
+                return
+            write_fn, payload = item
+            write_fn(payload)
+            _write_q.task_done()
+
+    _write_thread = threading.Thread(target=_write_worker, daemon=True, name="output-write")
+    _write_thread.start()
+
+    # Dedicated read thread: cap.read() must never block on inference, so it
+    # runs on its own thread and hands frames to the main (processing) thread
+    # via a queue -- together with the write thread above, this is the full
+    # 3-stage read / process / write decoupling.
+    #
+    # Live camera vs. file input need OPPOSITE queue policies:
+    #   - Live camera: maxsize=1, and the reader DROPS the previous unread
+    #     frame rather than blocking, always keeping only the newest frame
+    #     available. Processing a backlog of stale camera frames only adds
+    #     latency -- for a live feed you want "now", not "eventually all of
+    #     them". This intentionally allows frame loss under load, exactly
+    #     like a real camera pipeline would in practice.
+    #   - File input: unbounded queue, nothing ever dropped. Every frame in
+    #     the file must still be processed for existing benchmark/export
+    #     correctness (frame counts, CSV timing, dense export) to hold.
+    _frame_q = queue.Queue(maxsize=1 if is_live_camera else 0)
+    _read_stop = threading.Event()
+
+    def _read_worker():
+        while not _read_stop.is_set():
+            ok, raw = cap.read()
+            if not ok:
+                _frame_q.put(None)  # sentinel: end of stream
+                return
+            if live_crop_x0 is not None:
+                raw = raw[live_crop_y0:live_crop_y0 + height, live_crop_x0:live_crop_x0 + width]
+            if is_live_camera:
+                # Drop the stale frame (if any) rather than block -- keeps
+                # the processing thread on the most recent camera frame.
+                try:
+                    _frame_q.get_nowait()
+                except queue.Empty:
+                    pass
+            _frame_q.put(raw)
+
+    _read_thread = threading.Thread(target=_read_worker, daemon=True, name="capture-read")
+    _read_thread.start()
+
     while cap.isOpened():
-        success, frame = cap.read()
-        if not success:
+        frame = _frame_q.get()
+        if frame is None:
             break
-        if live_crop_x0 is not None:
-            frame = frame[live_crop_y0:live_crop_y0 + height, live_crop_x0:live_crop_x0 + width]
 
         annotated     = frame.copy()
         curr_gray     = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -682,7 +877,8 @@ def process_video(
                         person_states[identity_id] = PersonState(
                             ttp_public_key,
                             export_crypto_dir if export_enabled else enc_output_dir,
-                            embedder, benchmark=benchmark
+                            embedder, benchmark=benchmark,
+                            gender_classifier=gender_classifier,
                         )
                         print(f"  [STREAM] Person {identity_id} appeared -> "
                               f"stream {person_states[identity_id].stream_id[:8]}... created")
@@ -712,6 +908,7 @@ def process_video(
                     face_crop_for_state = None
                     face_bbox_for_state = None
                     face_yaw_deg        = None  # None -> face_quality_from_yaw() not applied (see below)
+                    face_eyes_nose_local = None  # crop-local (left_eye, right_eye, nose) -- see update_best()
 
                     if state.face_size_tier != "far":
                         crop, x_off, y_off, crop_dims, _ = derive_face_crop(frame, kpts, scrs)
@@ -720,6 +917,18 @@ def process_video(
                             face_bbox_for_state = (
                                 x_off, y_off,
                                 x_off + crop_dims[0], y_off + crop_dims[1],
+                            )
+                            # Re-expressed relative to the crop's own origin
+                            # (not the full frame) since PersonState only
+                            # retains best_face_crop, not the full frame it
+                            # came from -- see tracking.py's update_best()/
+                            # flush_to_disk() and gender.py's
+                            # predict_from_keypoints() docstring for why
+                            # eye-line alignment needs these at all.
+                            face_eyes_nose_local = (
+                                (kpts[COCO_LEFT_EYE][0] - x_off, kpts[COCO_LEFT_EYE][1] - y_off),
+                                (kpts[COCO_RIGHT_EYE][0] - x_off, kpts[COCO_RIGHT_EYE][1] - y_off),
+                                (kpts[COCO_NOSE][0] - x_off, kpts[COCO_NOSE][1] - y_off),
                             )
                             if face_canonicalizer is not None:
                                 # selfie_seg mode: canonicalizer handles face detection.
@@ -798,6 +1007,7 @@ def process_video(
                         body_crop    = body_crop,
                         body_bbox    = body_bbox,
                         face_quality = face_quality,
+                        face_eyes_nose = face_eyes_nose_local,
                     )
                     # Independent of update_best()'s single "best frame"
                     # selection -- restoring the real video on Tier 3
@@ -873,6 +1083,18 @@ def process_video(
                             if params_s is not None:
                                 export_last_face_params[s] = params_s
                                 export_valid_smiles[s].append(float(params_s[P_SMILE]))
+                            if gender_classifier is not None:
+                                # predict_from_keypoints (proper eye-line
+                                # rotation alignment) over predict(crop_s)
+                                # (crude bbox-center-scale, no rotation
+                                # correction) -- see gender.py docstrings;
+                                # verified via scripts/verify_gender_100.py
+                                # to visibly fix tilted-head misalignment.
+                                gender_result = gender_classifier.predict_from_keypoints(
+                                    frame, kpts_s[COCO_LEFT_EYE], kpts_s[COCO_RIGHT_EYE], kpts_s[COCO_NOSE]
+                                )
+                                if gender_result is not None:
+                                    export_gender_votes[s].append(gender_result)
                     else:
                         export_kp_rows[s].append(np.zeros((17, 3), dtype=np.float32))
                         export_bbox_rows[s].append([])
@@ -904,6 +1126,9 @@ def process_video(
                             x1, y1, x2, y2 = [int(v) for v in bbox]
                             cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 255), 2)
                     export_bbox_overlay_writer.write(overlay)
+
+                if len(export_kp_rows[0]) % EXPORT_FLUSH_EVERY == 0:
+                    _write_export_arrays()
 
             # Collect selfie-seg result (may already be done; blocks only if det+pose faster)
             if _future_seg is not None:
@@ -1158,9 +1383,9 @@ def process_video(
                 cv2.putText(blurred_panel, "BLURRED",    (8, 24), _label, 0.6, (255, 255, 255), 2)
                 cv2.putText(canon_panel,   "EXPRESSION", (8, 24), _label, 0.6, (40,  40,  40),  2)
                 combined = np.hstack([orig_panel, blurred_panel, canon_panel])
-                _write_pool.submit(out.write, combined)
+                _write_q.put((out.write, combined))
             else:
-                _write_pool.submit(out.write, annotated.copy())
+                _write_q.put((out.write, annotated.copy()))
         t_write_total += time.time() - tw0
 
         if not headless:
@@ -1182,77 +1407,39 @@ def process_video(
               f"(enc={enc_t*1000:.1f}ms emb={emb_t*1000:.1f}ms)")
     person_states.clear()
 
-    # Flush async write queue before releasing VideoWriter
-    _write_pool.shutdown(wait=True)
     _seg_pool.shutdown(wait=False)
     _lk_pool.shutdown(wait=False)
 
+    # Stop the read thread before releasing cap -- it may still be blocked
+    # inside cap.read() (live camera) or _frame_q.put() (file, unbounded
+    # queue can't block, but be defensive); signal it and drain one sentinel
+    # slot so a live camera's already-in-flight read() call can return and
+    # the thread can observe _read_stop and exit cleanly instead of calling
+    # cap.read() on an about-to-be-released capture.
+    _read_stop.set()
+    _read_thread.join(timeout=2.0)
+
     cap.release()
+
+    # Drain the write queue fully BEFORE releasing the VideoWriter -- unlike
+    # the read queue (fine to drop stale work), every queued write must
+    # actually land on disk, so this blocks until _write_worker has consumed
+    # everything already queued, then signals it to exit via the sentinel.
+    # Runs even when out is None (save_video=False, e.g. --benchmark/--no-save)
+    # so the write thread is always shut down cleanly rather than left
+    # relying on daemon=True to be reaped at process exit.
+    _write_q.join()          # blocks until all queued frames are written
+    _write_q.put(None)       # sentinel -- tells _write_worker to exit
+    _write_thread.join(timeout=5.0)
     if out is not None:
         out.release()
 
     if export_enabled:
-        manifest_slots = []
+        _write_export_arrays()
+
         for i in range(export_people):
-            kp_arr = (np.stack(export_kp_rows[i], axis=0) if export_kp_rows[i]
-                      else np.zeros((0, 17, 3), dtype=np.float32))
-            np.save(os.path.join(export_dir, f"keypoints_p{i}.npy"), kp_arr)
-            with open(os.path.join(export_dir, f"bboxes_p{i}.json"), "w") as f:
-                json.dump(export_bbox_rows[i], f)
-
-            fp_arr = (np.stack(export_face_param_rows[i], axis=0) if export_face_param_rows[i]
-                      else np.zeros((0, 12), dtype=np.float32))
-            np.save(os.path.join(export_dir, f"face_params_p{i}.npy"), fp_arr)
-
-            # Smile baseline uses only genuinely-detected frames (export_valid_smiles),
-            # never the held-over values in export_face_param_rows -- matches the
-            # two-pass approach in scripts/test_face_canon_v2.py. Downstream
-            # rendering applies this correction itself (FaceCanonicalizerV2.
-            # set_smile_baseline() + render()) -- exported params are raw/uncorrected.
-            smile_baseline = (float(np.median(export_valid_smiles[i]))
-                               if export_valid_smiles[i] else 0.0)
-
-            # packet_file/key_file: the real crypto bundle (see tracking.py's
-            # PersonState.flush_to_disk / __init__) for whichever stream this
-            # slot ended up bridged to (see the slot_matches loop above).
-            # null if this slot never had a real occupant, or its stream
-            # hadn't flushed by clip end (e.g. crypto disabled via
-            # benchmark=True) -- checked by real file existence, not assumed,
-            # since "a stream_id was recorded" doesn't guarantee the files
-            # were actually written (benchmark mode records stream_ids but
-            # PersonState.flush_to_disk() is a no-op in that mode).
-            packet_file, key_file = None, None
-            sid = export_slot_stream_id[i]
-            if sid is not None:
-                candidate_packet = os.path.join(export_crypto_dir, f"stream_{sid}.packet")
-                candidate_key    = os.path.join(export_crypto_dir, f"stream_{sid}.key")
-                if os.path.isfile(candidate_packet):
-                    packet_file = f"crypto/stream_{sid}.packet"
-                if os.path.isfile(candidate_key):
-                    key_file = f"crypto/stream_{sid}.key"
-
-            manifest_slots.append({
-                "slot": i,
-                "stream_id": export_slot_stream_id[i],
-                "face_smile_baseline": smile_baseline,
-                "frames_with_face": len(export_valid_smiles[i]),
-                "packet_file": packet_file,
-                "key_file": key_file,
-            })
-
             if export_diagnostics:
                 export_face_writers[i].release()
-
-        with open(os.path.join(export_dir, "manifest.json"), "w") as f:
-            json.dump({
-                "clip_id": export_clip_id,
-                "fps": fps_input,
-                "width": width,
-                "height": height,
-                "num_slots": export_people,
-                "total_frames": kp_arr.shape[0],
-                "slots": manifest_slots,
-            }, f, indent=2)
 
         export_rtm_writer.release()
         export_mask_writer.release()

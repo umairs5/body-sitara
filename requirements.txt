@@ -5,3 +5,4 @@ rtmlib
 onnxruntime
 cryptography
 requests
+insightface
