@@ -13,7 +13,7 @@ import mediapipe as mp
 from concurrent.futures import ThreadPoolExecutor
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
-from rtmlib import Body, draw_skeleton
+from rtmlib import RTMPose, draw_skeleton
 
 from .pose import (
     euclidean, get_face_size_tier, get_movement_tier,
@@ -25,14 +25,14 @@ from .blur import blur_all_persons
 from .blur_seg import SelfieSegBlur, bbox_region_mask
 from .blur_mobilesam import MobileSAMBlur, bboxes_from_keypoints
 from .blur_yoloseg import YOLOSegBlur
+from .blur_yolo11n import YOLO11nBoxBlur
 from .face_canonical import FaceCanonicalizer, CANONICAL_SIZE, yaw_from_transform, face_quality_from_yaw
 from .face_canonical_v2 import FaceCanonicalizerV2, P_SMILE
-from .tracking import PersonState, propagate_bboxes
+from .tracking import PersonState
 from .export_tracking import PersonIdentityTracker
 from .encryption import fetch_ttp_public_key
 from .embedding import EmbeddingExtractor, EDGEFACE_ONNX_PATH
 from .gender import GenderClassifier, GENDER_ONNX_PATH
-from .detector_patch import apply_detector_patch
 
 BASE_RESOLUTION       = 1280.0
 BASE_FAR_THRESHOLD    = 30
@@ -58,7 +58,7 @@ DEBUG_DRAW         = True
 GATE_REGION_TTL = 5
 
 # Minimum ratio (this box's area / largest box's area in the same frame) for
-# a YOLOX detection to be treated as a trackable person, when more than one
+# a detection to be treated as a trackable person, when more than one
 # box is detected. Filters out distant background bystanders relative to
 # whoever is dominant/closest to camera in that frame, without relying on a
 # fragile absolute pixel-size cutoff (subject box size varies a lot with
@@ -103,7 +103,13 @@ def process_video(
     if export_enabled:
         dense_export = True
         os.makedirs(export_dir, exist_ok=True)
-        _export_ok_anonymizers = ("selfie_seg", "yoloseg")
+        # yolo11n_boxfill added to this whitelist 2026-08-14: it wasn't
+        # included when first wired in earlier today, so every export-mode
+        # run made with --anonymizer yolo11n_boxfill up to this point was
+        # SILENTLY forced to selfie_seg1 instead -- confirmed via the log
+        # line this block itself prints ("NOTE: export mode forces
+        # anonymizer=..."), which is exactly what surfaced the bug.
+        _export_ok_anonymizers = ("selfie_seg", "yoloseg", "yolo11n_boxfill")
         if not anonymizer.startswith(_export_ok_anonymizers):
             print(f"  NOTE: export mode forces anonymizer='selfie_seg1' (was '{anonymizer}')")
             anonymizer = "selfie_seg1"
@@ -152,14 +158,27 @@ def process_video(
         print("\n[0/4] Benchmark mode -- skipping TTP public key fetch")
         ttp_public_key = None
 
-    # [1] RTMPose
-    print("\n[1/4] Loading RTMPose (YOLOX-Nano + RTMPose-T)...")
-    apply_detector_patch()
-    body = Body(
-        det='https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/yolox_nano_8xb8-300e_humanart-40f6f0d0.zip',
-        det_input_size=(416, 416),
-        pose='https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-t_simcc-body7_pt-body7_420e-256x192-026a1439_20230504.zip',
-        pose_input_size=(192, 256),
+    # [1] Detector + RTMPose
+    # Single detector for the whole pipeline: YOLO11n (NCNN, box-only, no
+    # segmentation) drives BOTH the person boxes fed to RTMPose AND the
+    # yolo11n_boxfill anonymizer, when selected. Previously this used
+    # rtmlib.Body(), which hardcodes YOLOX-Nano as the detector internally
+    # (rtmlib.tools.solution.body.Body.__init__ always wraps `det=` weights
+    # in a YOLOX-architecture inference class) -- meaning YOLOX-Nano ran on
+    # every frame regardless of --anonymizer, while YOLO11n (when selected)
+    # only ever supplied the anonymization mask, not the pose-driving boxes.
+    # Two detectors running per frame, only one of which matched what the
+    # paper's eval (results/tier1_detection_eval/) actually measures.
+    # RTMPose itself is detector-agnostic (rtmlib.tools.pose_estimation.
+    # rtmpose.RTMPose.__call__ just wants a plain [x1,y1,x2,y2] box list),
+    # so it's constructed standalone here instead of via Body(), and boxes
+    # come from YOLO11nBoxBlur.get_mask_and_boxes() at the call site below.
+    print("\n[1/4] Loading YOLO11n (NCNN, detection) + RTMPose-T...")
+    _y11_pose_ncnn_dir = os.path.join(os.path.dirname(__file__), "..", "..", "models", "ncnn_fp32", "yolo11n_ncnn_model")
+    person_detector = YOLO11nBoxBlur(model_name=_y11_pose_ncnn_dir, infer_size=320, conf=0.4)
+    pose_model = RTMPose(
+        'https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-t_simcc-body7_pt-body7_420e-256x192-026a1439_20230504.zip',
+        model_input_size=(192, 256),
         backend='onnxruntime',
         device='cpu',
     )
@@ -282,6 +301,43 @@ def process_video(
         print(f"\n[3b] Loading YOLO11n-seg NCNN (instance segmentation, infer_size={seg_infer_size})...")
         yolo_seg = YOLOSegBlur(model_name=_y11_ncnn_dir, infer_size=seg_infer_size, conf=0.4)
         print(f"     Anonymizer: yoloseg11ncnn")
+    elif anonymizer == "yolo11n_boxfill":
+        # Plain (detection-only) YOLO11n, NCNN backend -- no segmentation.
+        # Reuses the yolo_seg variable slot: YOLO11nBoxBlur deliberately
+        # implements the same get_mask_and_boxes(frame) -> (mask, boxes)
+        # interface as YOLOSegBlur (see blur_yolo11n.py's class docstring),
+        # so every downstream call site below (skip-frame mask-warp
+        # propagation, apply_mask, export-mode mask writers) works
+        # unmodified -- the "mask" returned is a rasterized rectangle, not
+        # a real per-pixel segmentation, but every consumer only ever
+        # treats it as an opaque bool array.
+        #
+        # This is the detector actually measured for the paper's Table 6/7
+        # AP/AR results (results/tier1_detection_eval/) -- prior to this
+        # wiring it was only ever invoked directly from standalone eval
+        # scripts, never through this CLI-driven pipeline.
+        # (YOLO11nBoxBlur imported at module level, top of file -- no local
+        # import here, a local import anywhere in this function makes the
+        # name local to the WHOLE function per Python scoping rules, which
+        # broke the earlier person_detector = YOLO11nBoxBlur(...) call above.)
+        _y11_box_ncnn_dir = os.path.join(os.path.dirname(__file__), "..", "..", "models", "ncnn_fp32", "yolo11n_ncnn_model")
+        print(f"\n[3b] Loading YOLO11n NCNN (detection-only, box grey-fill, infer_size={seg_infer_size})...")
+        yolo_seg = YOLO11nBoxBlur(model_name=_y11_box_ncnn_dir, infer_size=seg_infer_size, conf=0.4)
+        print(f"     Anonymizer: yolo11n_boxfill")
+        # Same face_canonicalizer wiring as selfie_seg (see that branch above)
+        # -- without this, yolo11n_boxfill produced NO face expression signal
+        # at all: face_canonicalizer stayed None (only ever set for
+        # selfie_seg*), and the separate convexhull-only FaceMesh path
+        # (`elif anonymizer == "convexhull"` further down) doesn't match this
+        # anonymizer either. That's a real functional gap, not just a timing
+        # display issue -- yolo11n_boxfill is the detector actually measured
+        # for the paper's results (results/tier1_detection_eval/), and the
+        # paper's Tier 1 design requires the 12-dim expression vector as one
+        # of the exported signals regardless of which anonymizer produced the
+        # grey-fill. Found 2026-08-14 while investigating why the timing
+        # summary showed 0.0ms for both FaceMesh and Canonical in this mode.
+        print(f"\n[3c] Loading FaceCanonicalizer (expression signal)...")
+        face_canonicalizer = FaceCanonicalizer(model_path='face_landmarker.task')
     else:
         print(f"\n[3b] Anonymizer: convexhull")
 
@@ -382,7 +438,17 @@ def process_video(
     export_valid_smiles       = None   # smile scalar from genuinely-detected (non-held-over) frames only, for the clip baseline
     export_last_face_crop     = None   # transient only: feeds extract_params() + optional diagnostic write, never itself "the" export
     export_last_face_params   = None   # last-good parametric scalars, held across brief absences (mirrors the old face-crop hold-over)
-    export_gender_votes       = None   # per-slot list of (label, confidence) samples -- see manifest write-out for how these collapse to one value
+    # stream_id -> (gender_label, gender_conf), populated once per stream at
+    # flush_to_disk() time (same single-best-frame classification the normal,
+    # non-export path already uses -- see PersonState.flush_to_disk()).
+    # Replaces an earlier per-frame-voting-then-averaging scheme that lived
+    # only in export mode and disagreed with the non-export path's answer;
+    # both paths now derive gender identically, this dict just makes the
+    # single result available to the manifest writer after the owning
+    # PersonState has been deleted from person_states (which happens on
+    # every departure, mid-clip or not -- see the `del person_states[dep_id]`
+    # a few lines below where flush_to_disk() is called).
+    stream_gender_by_id       = {}
     export_slot_stream_id     = None
     export_face_canon         = None
     export_face_writers       = None   # diagnostics-only now (see export_diagnostics gating below)
@@ -403,7 +469,6 @@ def process_video(
         export_valid_smiles     = [[] for _ in range(export_people)]
         export_last_face_crop   = [None] * export_people
         export_last_face_params = [None] * export_people
-        export_gender_votes     = [[] for _ in range(export_people)]
         # Filled in per-frame from the real PersonState.stream_id occupying
         # each slot (see the slot_matches loop below) -- NOT a fresh uuid4
         # minted here. Export slots and PersonState streams are otherwise
@@ -481,20 +546,16 @@ def process_video(
             smile_baseline = (float(np.median(export_valid_smiles[i]))
                                if export_valid_smiles[i] else 0.0)
 
-            # Gender collapses per-frame votes to one stable slot-level value --
-            # summed confidence per label (not majority count), so a handful of
-            # high-confidence frontal frames outweigh many low-confidence
-            # profile/motion-blurred ones. None if the slot never had a frame
-            # with both a face crop and a classifier available.
-            gender_label, gender_conf = None, None
-            if export_gender_votes[i]:
-                label_conf_sum: dict[str, float] = {}
-                for lbl, conf in export_gender_votes[i]:
-                    label_conf_sum[lbl] = label_conf_sum.get(lbl, 0.0) + conf
-                gender_label = max(label_conf_sum, key=label_conf_sum.get)
-                gender_conf  = float(
-                    label_conf_sum[gender_label] / len(export_gender_votes[i])
-                )
+            # Gender: single-best-frame classification from stream_gender_by_id,
+            # populated once per stream at PersonState.flush_to_disk() time --
+            # the exact same value the normal (non-export) path produces for
+            # this stream, not a separate export-only computation. None if
+            # this slot's stream hasn't flushed yet (still mid-clip -- same
+            # timing caveat as packet_file/key_file below) or never had a
+            # classifiable face.
+            gender_label, gender_conf = stream_gender_by_id.get(
+                export_slot_stream_id[i], (None, None)
+            )
 
             # packet_file/key_file: the real crypto bundle (see tracking.py's
             # PersonState.flush_to_disk / __init__) for whichever stream this
@@ -564,7 +625,7 @@ def process_video(
                                     # meaningful via this mapping now that person_states
                                     # is keyed by stable identity_id, not raw index.
     last_bboxes           = None
-    last_scaled_bboxes    = None   # YOLOX bboxes scaled to frame resolution for MobileSAM
+    last_scaled_bboxes    = None   # detector bboxes scaled to frame resolution for MobileSAM
     last_seg_mask         = None   # last selfie-seg mask (bool H×W), propagated on skip frames
     seg_mask_keypoints    = None   # keypoints at the time last_seg_mask was computed/warped
     last_gate_region      = None   # last non-empty bbox_region_mask, held over brief det+pose dropout
@@ -714,12 +775,16 @@ def process_video(
         #
         # Its internal detect head already finds person boxes as part of
         # get_mask_and_boxes() -- confirmed via direct timing that running
-        # rtmlib's separate YOLOX-Nano det_model() on top of that was pure
-        # duplicated detection work (two independent detectors disagreeing
-        # near their own confidence thresholds, ~18ms wasted per full frame
-        # for no accuracy benefit). So when yolo_seg is on, det_model() is
-        # skipped on full frames and yolo_seg's own boxes drive RTMPose-T's
-        # pose_model() instead -- EXCEPT on a frame where segmentation itself
+        # the pipeline's separate person_detector (YOLO11n) on top of that
+        # was pure duplicated detection work (two independent detectors
+        # disagreeing near their own confidence thresholds, ~18ms wasted per
+        # full frame for no accuracy benefit; this was measured back when
+        # the separate detector was rtmlib's YOLOX-Nano, since replaced by
+        # YOLO11n -- see [1] above -- but the same duplication logic applies
+        # regardless of which model person_detector wraps). So when yolo_seg
+        # is on, person_detector's own call is skipped on full frames and
+        # yolo_seg's own boxes drive RTMPose-T's pose_model() instead --
+        # EXCEPT on a frame where segmentation itself
         # is being skipped (seg_skip_n>1): there yolo_seg produces no fresh
         # boxes, so pose falls back to keypoint-derived boxes instead (same
         # bboxes_from_keypoints() pattern MobileSAM already uses for its own
@@ -788,12 +853,19 @@ def process_video(
                     else:
                         bboxes = np.empty((0, 4), dtype=float)
                 else:
-                    # pose_model expects an ndarray (possibly empty), not None --
-                    # matches body.det_model()'s own "nothing detected" convention.
+                    # pose_model expects an ndarray (possibly empty), not None.
                     bboxes = np.empty((0, 4), dtype=float)
             else:
                 t0     = time.time()
-                bboxes = body.det_model(infer_frame)
+                # YOLO11n on the same 320x320 infer_frame the old YOLOX-Nano
+                # det_model ran on -- boxes come back in that same 320x320
+                # space, matching the kp_scale_x/kp_scale_y upscale below
+                # unchanged.
+                _, bboxes = person_detector.get_mask_and_boxes(infer_frame)
+                if bboxes is None or len(bboxes) == 0:
+                    bboxes = np.empty((0, 4), dtype=float)
+                else:
+                    bboxes = np.asarray(bboxes, dtype=float)
                 t_det_total += time.time() - t0
 
             # Reject boxes too small relative to the frame's largest detection
@@ -810,7 +882,7 @@ def process_video(
                 bboxes    = bboxes[box_area >= MIN_BOX_AREA_RATIO * max_area]
 
             last_bboxes = bboxes
-            # scale YOLOX bboxes from infer_frame space to original frame space
+            # scale detector bboxes from infer_frame space to original frame space
             if bboxes is not None and len(bboxes) > 0:
                 sb = bboxes.copy().astype(float)
                 sb[:, 0] *= kp_scale_x; sb[:, 2] *= kp_scale_x
@@ -820,7 +892,7 @@ def process_video(
                 last_scaled_bboxes = []
 
             t2 = time.time()
-            keypoints, scores = body.pose_model(infer_frame, bboxes=bboxes)
+            keypoints, scores = pose_model(infer_frame, bboxes=bboxes)
             t_pose_total += time.time() - t2
 
             if keypoints is not None and len(keypoints) > 0:
@@ -861,11 +933,13 @@ def process_video(
 
             for dep_id in departed:
                 if dep_id in person_states:
-                    enc_t, emb_t = person_states[dep_id].flush_to_disk()
+                    full_sid = person_states[dep_id].stream_id
+                    enc_t, emb_t, gender_label, gender_conf = person_states[dep_id].flush_to_disk()
+                    stream_gender_by_id[full_sid] = (gender_label, gender_conf)
                     t_encrypt_total += enc_t
                     t_embed_total   += emb_t
                     streams_flushed += 1
-                    sid = person_states[dep_id].stream_id[:8]
+                    sid = full_sid[:8]
                     print(f"  [STREAM] Person {dep_id} departed -> "
                           f"stream {sid}... flushed "
                           f"(enc={enc_t*1000:.1f}ms emb={emb_t*1000:.1f}ms)")
@@ -976,13 +1050,13 @@ def process_video(
                     t_facemesh_total += time.time() - t_fm0
 
                     # last_scaled_bboxes[i] is this same person's detector box
-                    # this frame (whichever detector actually ran -- YOLOX-Nano
-                    # or yolo_seg's own detect head, see the is_full_frame block
-                    # above) -- used by derive_body_crop in place of its
-                    # keypoint-only box, since no COCO-17 keypoint reaches the
-                    # head/hair. Index-matched to keypoints/scores since both
-                    # come from the same bboxes array passed into
-                    # body.pose_model(). Guarded since last_scaled_bboxes can be
+                    # this frame (whichever detector actually ran -- YOLO11n
+                    # (person_detector) or yolo_seg's own detect head, see the
+                    # is_full_frame block above) -- used by derive_body_crop in
+                    # place of its keypoint-only box, since no COCO-17 keypoint
+                    # reaches the head/hair. Index-matched to keypoints/scores
+                    # since both come from the same bboxes array passed into
+                    # pose_model(). Guarded since last_scaled_bboxes can be
                     # shorter than keypoints in rare detector/pose-count
                     # mismatches -- falls back to the keypoint-only box via
                     # derive_body_crop's detector_bbox=None in that case.
@@ -1083,18 +1157,17 @@ def process_video(
                             if params_s is not None:
                                 export_last_face_params[s] = params_s
                                 export_valid_smiles[s].append(float(params_s[P_SMILE]))
-                            if gender_classifier is not None:
-                                # predict_from_keypoints (proper eye-line
-                                # rotation alignment) over predict(crop_s)
-                                # (crude bbox-center-scale, no rotation
-                                # correction) -- see gender.py docstrings;
-                                # verified via scripts/verify_gender_100.py
-                                # to visibly fix tilted-head misalignment.
-                                gender_result = gender_classifier.predict_from_keypoints(
-                                    frame, kpts_s[COCO_LEFT_EYE], kpts_s[COCO_RIGHT_EYE], kpts_s[COCO_NOSE]
-                                )
-                                if gender_result is not None:
-                                    export_gender_votes[s].append(gender_result)
+                            # Gender is no longer classified per-frame here.
+                            # It now comes from stream_gender_by_id (see the
+                            # manifest writer below), populated once per
+                            # stream at PersonState.flush_to_disk() time --
+                            # the SAME single-best-frame classification the
+                            # normal (non-export) path already used. Running
+                            # it here too, every frame, was a second,
+                            # independent per-frame-voting scheme that could
+                            # disagree with the non-export path's answer for
+                            # the exact same clip -- removed 2026-08-14 so
+                            # both paths always produce the same result.
                     else:
                         export_kp_rows[s].append(np.zeros((17, 3), dtype=np.float32))
                         export_bbox_rows[s].append([])
@@ -1143,9 +1216,10 @@ def process_video(
                 # detected person regions so nothing outside those regions can
                 # ever be blurred; if no one was detected, apply no mask at all.
                 #
-                # last_scaled_bboxes comes from YOLOX and can be [] even when
-                # keypoints is non-empty: rtmlib's RTMPose silently falls back
-                # to a whole-frame box when given zero detector boxes, so it
+                # last_scaled_bboxes comes from person_detector and can be []
+                # even when keypoints is non-empty: rtmlib's RTMPose silently
+                # falls back to a whole-frame box when given zero detector
+                # boxes, so it
                 # still produces a pose for a real, visible person the
                 # detector merely missed on this frame. Gating on the empty
                 # detector boxes alone would wipe the mask for a real person
@@ -1248,7 +1322,7 @@ def process_video(
                     new, _, _ = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, old_face, None, **LK_PARAMS)
                     return i, new
 
-                # Submit body LK and face LK (if needed) in parallel
+                # Submit body LK and face LK in parallel
                 t_lk0 = time.time()
                 body_futures = [_lk_pool.submit(_body_lk, i) for i in range(n_persons)]
                 face_futures = {i: _lk_pool.submit(_face_lk, i, old)
@@ -1262,6 +1336,26 @@ def process_video(
                     tk[:, :2] = new_pts.reshape(-1, 2)
                     tracked_keypoints[i] = tk
                 t_of_body_total += time.time() - t_lk0
+
+                # NOTE: tried independently LK-tracking the detector's own
+                # box here (either single-center-point via tracking.py's
+                # propagate_bboxes(), or 4-corner) so the anonymization box
+                # would track the same way SITARA's does. Reverted: a
+                # rigid box (however it's tracked) can only translate/scale,
+                # it cannot grow to cover a limb extending outward between
+                # full-detection frames the way a keypoint-derived box does
+                # (bboxes_from_keypoints(), used elsewhere in this file) --
+                # e.g. someone stretching an arm out would get clipped by a
+                # box-tracked region but stay covered by a keypoint-derived
+                # one. Independently-tracked box vs. keypoint-tracked pose
+                # also visibly drifted apart from each other on weak-texture
+                # backgrounds during testing (2026-08-14) -- two independent
+                # LK tracks with nothing keeping them mutually consistent.
+                # last_scaled_bboxes is intentionally left as the last real
+                # detector output on skip frames (not re-tracked); callers
+                # needing an up-to-date skip-frame box already fall back to
+                # bboxes_from_keypoints() (see the is_full_frame block above
+                # and the yolo_seg full-frame-landing case).
 
                 # Collect face LK results (convexhull mode only)
                 t_face0 = time.time()
@@ -1285,7 +1379,7 @@ def process_video(
         tb0 = time.time()
         if blur_bodies:
             if mobile_sam is not None and keypoints is not None and len(keypoints) > 0:
-                # Full frames: use YOLOX bboxes (more accurate, includes head).
+                # Full frames: use detector bboxes (more accurate, includes head).
                 # Skip frames: fall back to keypoint-derived bboxes.
                 if is_full_frame and last_scaled_bboxes:
                     sam_bboxes = last_scaled_bboxes
@@ -1398,7 +1492,8 @@ def process_video(
 
     print(f"\n  Flushing {len(person_states)} remaining active stream(s)...")
     for idx, state in person_states.items():
-        enc_t, emb_t = state.flush_to_disk()
+        enc_t, emb_t, gender_label, gender_conf = state.flush_to_disk()
+        stream_gender_by_id[state.stream_id] = (gender_label, gender_conf)
         t_encrypt_total += enc_t
         t_embed_total   += emb_t
         streams_flushed += 1
@@ -1449,7 +1544,7 @@ def process_video(
             export_gate_writer.release()
             export_bbox_overlay_writer.release()
         print(f"\n  Dense export written -> {export_dir}  "
-              f"({kp_arr.shape[0]} frames x {export_people} slots)")
+              f"({frame_idx} frames x {export_people} slots)")
 
     if not headless:
         cv2.destroyAllWindows()
@@ -1481,11 +1576,30 @@ def process_video(
     print(f"Average FPS         : {avg_fps:.2f}")
     print()
     print(f"-- Per-component (benchmark-clean) ------------------")
-    print(f"Avg Det/full frame  : {t_det_total      / n * 1000:.1f}ms")
-    print(f"Avg Pose/full frame : {t_pose_total     / n * 1000:.1f}ms")
-    print(f"Avg FaceMesh/full   : {t_facemesh_total / n * 1000:.1f}ms")
-    print(f"Avg SelfieSeg/full  : {t_seg_total        / n * 1000:.1f}ms  (parallel w/ det+pose)")
-    print(f"Avg Canonical/full  : {t_canonical_total / n * 1000:.1f}ms  (full frames only, reused on skip)")
+    # Labels below are anonymizer-aware: which code path actually produces
+    # detection/mask/face-signal work differs per --anonymizer (see the
+    # anonymizer-loading block above), so a fixed label set silently showed
+    # 0.0ms for whichever path DIDN'T run under that exact name -- e.g.
+    # yolo11n_boxfill's detection cost was previously invisible under
+    # "Avg Det/full frame" (stayed 0.0ms) because it runs through yolo_seg's
+    # own call, not person_detector's -- and showed up mislabeled under
+    # "Avg SelfieSeg/full" instead, even though no MediaPipe SelfieSegmentation
+    # was involved. Found + fixed 2026-08-14.
+    if yolo_seg is not None:
+        # person_detector's own call is skipped when yolo_seg is active (see
+        # the is_full_frame block's duplicate-detection-avoidance comment) --
+        # detection cost is entirely inside yolo_seg's own get_mask_and_boxes().
+        print(f"Avg Detect+Mask/full: {t_seg_total      / n * 1000:.1f}ms  ({anonymizer}, includes detection -- person_detector not separately called)")
+    else:
+        print(f"Avg Det/full frame  : {t_det_total      / n * 1000:.1f}ms  (person_detector, YOLO11n)")
+        if selfie_seg is not None:
+            print(f"Avg SelfieSeg/full  : {t_seg_total        / n * 1000:.1f}ms  (parallel w/ det+pose)")
+        elif mobile_sam is not None:
+            pass  # MobileSAM's own cost isn't separately timed into t_seg_total
+    if face_canonicalizer is not None:
+        print(f"Avg FaceSignal/full : {t_canonical_total / n * 1000:.1f}ms  (canonical expression -- full frames only, reused/held on skip)")
+    elif anonymizer == "convexhull":
+        print(f"Avg FaceSignal/full : {t_facemesh_total / n * 1000:.1f}ms  (raw FaceMesh for convex-hull blur region)")
     print(f"Avg OF-body/skip    : {t_of_body_total   / s * 1000:.1f}ms  (parallel w/ OF-face)")
     print(f"Avg OF-face/skip    : {t_of_face_total   / s * 1000:.1f}ms  (parallel w/ OF-body)")
     print(f"Avg Blur/frame      : {t_blur_total     / f * 1000:.1f}ms  (mask apply + warp only)")

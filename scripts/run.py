@@ -30,12 +30,15 @@ if __name__ == "__main__":
     parser.add_argument("--no-blur", action="store_true",
                         help="Disable anonymization.")
     parser.add_argument("--anonymizer", type=str, default="convexhull",
-                        choices=["convexhull", "selfie_seg0", "selfie_seg1", "mobilesam", "yoloseg", "yoloseg11", "yoloseg11int8", "yoloseg11ncnn"],
+                        choices=["convexhull", "selfie_seg0", "selfie_seg1", "mobilesam", "yoloseg", "yoloseg11", "yoloseg11int8", "yoloseg11ncnn", "yolo11n_boxfill"],
                         help="Anonymization backend: convexhull (default), "
                              "selfie_seg0 (MediaPipe general), selfie_seg1 (MediaPipe landscape), "
                              "mobilesam (MobileSAM ViT-Tiny), yoloseg (YOLOv8n-seg ONNX), "
                              "yoloseg11 (YOLO11n-seg ONNX FP32), yoloseg11int8 (YOLO11n-seg ONNX INT8, dynamic quant), "
-                             "yoloseg11ncnn (YOLO11n-seg NCNN FP32 -- ~1.96x faster than yoloseg11int8 on Pi 5).")
+                             "yoloseg11ncnn (YOLO11n-seg NCNN FP32 -- ~1.96x faster than yoloseg11int8 on Pi 5), "
+                             "yolo11n_boxfill (plain YOLO11n NCNN, detection-only, no segmentation -- rectangular "
+                             "box grey-fill instead of a per-pixel mask; this is the detector actually measured in "
+                             "the paper's Table 6/7 AP/AR results, see results/tier1_detection_eval/).")
     parser.add_argument("--export-dir", type=str, default=None,
                         help="Dense per-person export mode: write per-frame keypoints/bboxes/"
                              "face-crops/masks into this directory (opt-in, additive).")

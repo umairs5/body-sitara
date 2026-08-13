@@ -95,16 +95,16 @@ class PersonState:
             self.best_bbox_body  = body_bbox
             self.best_face_eyes_nose = face_eyes_nose
 
-    def flush_to_disk(self) -> tuple[float, float]:
+    def flush_to_disk(self) -> tuple[float, float, str | None, float | None]:
         if self._benchmark:
-            return 0.0, 0.0
+            return 0.0, 0.0, None, None
 
         # A stream with no best crops never called append_frame() with a
         # real crop either (both derive from the same per-frame body_crop
         # in pipeline.py's per-person loop), so _frame_records is empty
         # here too -- this guard doesn't need its own separate check.
         if self.best_body_crop is None and self.best_face_crop is None:
-            return 0.0, 0.0
+            return 0.0, 0.0, None, None
 
         t_emb0    = time.time()
         embedding = None
@@ -190,7 +190,7 @@ class PersonState:
                 write_blob(f, nonce, ct)
 
         enc_time = time.time() - t_enc0
-        return enc_time, embed_time
+        return enc_time, embed_time, gender_label, gender_conf
 
 
 def propagate_bboxes(last_bboxes, prev_gray, curr_gray):
