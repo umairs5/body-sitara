@@ -721,11 +721,48 @@ struct BenchmarkView: View {
         appendLog("  Saved reconstructed_background.mp4 to Photos (\(bgReconFrameCount) frames)")
 
         setStage("Illumination Extraction", status: .running)
-        appendLog("[diag] running Illumination Extraction (lightmap)...")
-        let lightmapResult = LightmapExtractor.extract(from: backgroundFinal)
-        appendLog("  Illumination Extraction: \(String(format: "%.1f", lightmapResult.totalMs))ms")
-        addPreview("Lightmap", lightmapResult.lightmap.toCGImage())
-        setStage("Illumination Extraction", status: .done, timings: [("total", lightmapResult.totalMs)])
+        appendLog("[diag] running Illumination Extraction (lightmap, \(n) frames)...")
+        // PAPER PARITY (Table 12): Android's LightmapPhase.run() decodes
+        // background_reconstructed.mp4 and calls lightmapOf() ONCE PER
+        // FRAME (LightmapPhase.kt:162-168), writing a full light_map.mp4 --
+        // not once on a single plate. The previous single-call
+        // `LightmapExtractor.extract(from: backgroundFinal)` under-counted
+        // this stage by ~n x relative to Android (it's why Table 12 showed
+        // 32.1s Android vs 0.009s iOS: a scope mismatch, not a hardware
+        // gap). Now loops renderReconFrame(i) -- frame i's OWN
+        // reconstructed background, the same per-frame content Loop 1 just
+        // streamed to reconstructed_background.mp4 -- through the same
+        // per-frame lightmapOf() Android's loop uses.
+        //
+        // MEMORY: renders frame i, extracts ITS lightmap, and lets frame
+        // i's reconstructed-background RGBBuffer fall out of scope before
+        // the next iteration -- at most one background frame is resident
+        // at a time (same discipline as the bgWriter/silWriter loops
+        // above), never `(0..<n).map { renderReconFrame($0) }` materialized
+        // up front. `lightmaps` itself IS this stage's real output (the
+        // next step composites the silhouette onto it, exactly as Android
+        // writes light_map.mp4 as a real per-frame video) so, like
+        // `backgroundFinal`/`colorBuffers`, it is the one array this
+        // function legitimately needs to keep -- not avoidable scratch.
+        let (lightmaps, totalLightmapMs, lightmapMidPreview): ([RGBBuffer], Double, CGImage?) = await Task.detached(priority: .userInitiated) {
+            let t0 = CFAbsoluteTimeGetCurrent()
+            var out: [RGBBuffer] = []
+            out.reserveCapacity(n)
+            var midPreview: CGImage?
+            for i in 0..<n {
+                let lm = LightmapExtractor.extract(from: renderReconFrame(i)).lightmap
+                out.append(lm)
+                if i == n / 2 { midPreview = lm.toCGImage() }
+            }
+            let totalMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+            return (out, totalMs, midPreview)
+        }.value
+        let msPerFrameLightmap = n > 0 ? totalLightmapMs / Double(n) : 0
+        appendLog("  Illumination Extraction: \(String(format: "%.1f", totalLightmapMs))ms total (\(String(format: "%.2f", msPerFrameLightmap))ms/frame, \(n) frames)")
+        if let lightmapMidPreview {
+            addPreview("Lightmap\n(mid-clip)", lightmapMidPreview)
+        }
+        setStage("Illumination Extraction", status: .done, timings: [("total", totalLightmapMs)])
 
         // Step 4: composite the ORIGINAL grey silhouette (per-frame, real
         // clip content) onto the lightmap -- this is the actual
@@ -735,26 +772,21 @@ struct BenchmarkView: View {
         // opaque, background transparent -- only the silhouette shape
         // itself needs to reach the server, not the reconstructed
         // background around it).
-        appendLog("[diag] compositing original silhouette onto lightmap (outbound-to-server signal, all \(n) frames)...")
-        let lightmapForComposite = lightmapResult.lightmap
-        // Streams to silhouette_on_lightmap.mp4 the same way Loop 1 streams
-        // to reconstructed_background.mp4 above -- opened here (right
-        // before this loop, dimensions/fps already known), appended to
-        // inside the loop, closed right after. Previously this built a
-        // [CGImage] for all n frames (~1.97GB at 300 frames/1280x1280)
-        // purely so it could be handed to VideoEncoder.encode(frames:...)
-        // at export time and to grab index n/2 for the gallery -- neither
-        // need survives the loop now: export is inline via silWriter, and
-        // the n/2 CGImage is captured directly into silMidPreview as it's
-        // produced.
+        appendLog("[diag] compositing original silhouette onto lightmap (outbound-to-server signal, all \(n) frames, each its OWN lightmap)...")
+        // Each frame now uses ITS OWN lightmap (lightmaps[i], from the
+        // per-frame Illumination Extraction pass above) rather than one
+        // shared plate -- matches Android's silhouetteFromMask/
+        // silhouetteFromFill loop in LightmapPhase.kt, which pairs `lmPx`
+        // (that frame's lightmap) with that SAME frame's silhouette at
+        // index t, never a different frame's lightmap.
         let silURL = tmpDir.appendingPathComponent("silhouette_on_lightmap.mp4")
-        let silWriter = try StreamingVideoWriter(outputURL: silURL, width: lightmapForComposite.width, height: lightmapForComposite.height, fps: fps)
+        let silWriter = try StreamingVideoWriter(outputURL: silURL, width: backgroundFinal.width, height: backgroundFinal.height, fps: fps)
         let (silFrameCount, silMidPreview): (Int, CGImage?) = try await Task.detached(priority: .userInitiated) {
             var count = 0
             var midPreview: CGImage?
             for i in 0..<n {
                 let alpha = maskBuffers[i].unpacked().isPerson.map { $0 ? Float(1) : Float(0) }
-                let result = Compositor.compositeOnly(background: lightmapForComposite, character: colorBuffers[i].toFloatRGBBuffer(), alpha: alpha)
+                let result = Compositor.compositeOnly(background: lightmaps[i], character: colorBuffers[i].toFloatRGBBuffer(), alpha: alpha)
                 if let cg = result.composited.toCGImage() {
                     try silWriter.append(cg)
                     count += 1
@@ -878,6 +910,14 @@ struct BenchmarkView: View {
                 let frameBg = renderReconFrame(i)
                 let character: RGBBuffer
                 let alpha: [Float]
+                // derivedFromLuma tracks which branch produced `alpha`:
+                // a real staged synthetic_alpha_pK is an explicit sidecar
+                // (Android's NCompositor path -- clean by construction, no
+                // fillHoles/solidify needed), while the placeholder cutout
+                // stands in for Android's "no explicit alpha" fallback
+                // (alphaFromPersonLuma), which always runs both fixes. See
+                // Compositor.compositeOnly's `derivedFromLuma` doc comment.
+                let derivedFromLuma: Bool
                 if let rc = realCharacterData {
                     // Both arrays already live fully in memory (loaded
                     // above, bounded/compact like colorBuffers) -- indexing
@@ -888,10 +928,12 @@ struct BenchmarkView: View {
                     // function).
                     character = rc.character[i].toFloatRGBBuffer()
                     alpha = rc.alpha[i].alphaChannel8To01()
+                    derivedFromLuma = false
                 } else {
                     (character, alpha) = Compositor.placeholderCharacter(width: backgroundFinal.width, height: backgroundFinal.height, frameIndex: i, totalFrames: nFinal)
+                    derivedFromLuma = true
                 }
-                let result = Compositor.compositeOnly(background: frameBg, character: character, alpha: alpha)
+                let result = Compositor.compositeOnly(background: frameBg, character: character, alpha: alpha, derivedFromLuma: derivedFromLuma)
                 totalMs += result.compositeMs
                 if let cg = result.composited.toCGImage() {
                     try finalWriter.append(cg)
@@ -939,9 +981,9 @@ struct BenchmarkView: View {
 
         appendLog("\n  SUMMARY (RIFE + relight excluded, per scope decision):")
         appendLog("    Background Reconstruction: \(String(format: "%.0f", bgReconTotalMs))ms")
-        appendLog("    Illumination Extraction:   \(String(format: "%.1f", lightmapResult.totalMs))ms")
+        appendLog("    Illumination Extraction:   \(String(format: "%.1f", totalLightmapMs))ms")
         appendLog("    Final Compositing:         \(String(format: "%.1f", totalCompositeMs))ms")
-        let totalMs = bgReconTotalMs + lightmapResult.totalMs + totalCompositeMs
+        let totalMs = bgReconTotalMs + totalLightmapMs + totalCompositeMs
         appendLog("    TOTAL (3 stages):          \(String(format: "%.0f", totalMs))ms for \(nFinal) src frames")
         if realCharacterData != nil {
             appendLog("  NOTE: Final Compositing used the REAL staged synthetic character + alpha matte -- tests both compositing MATH cost AND visual fidelity against Android's reference outputs.")
