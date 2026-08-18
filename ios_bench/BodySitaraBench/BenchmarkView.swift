@@ -793,98 +793,106 @@ struct BenchmarkView: View {
         // light_map.mp4 as a real per-frame video) so, like `backgroundFinal`/
         // `colorBuffers`, it is the one array this function legitimately
         // needs to keep -- just at the compact element type this time.
-        let (lightmaps, totalLightmapMs, lightmapMidPreview): ([RGBBuffer8], Double, CGImage?) = await Task.detached(priority: .userInitiated) {
-            let t0 = CFAbsoluteTimeGetCurrent()
-            var out: [RGBBuffer8] = []
-            out.reserveCapacity(n)
-            var midPreview: CGImage?
-            for i in 0..<n {
-                autoreleasepool {
-                    let lm = LightmapExtractor.extract(from: renderReconFrame(i)).lightmap
-                    if i == n / 2 { midPreview = lm.toCGImage() }
-                    out.append(lm.toRGBBuffer8())
-                }
-            }
-            let totalMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000
-            return (out, totalMs, midPreview)
-        }.value
-        let msPerFrameLightmap = n > 0 ? totalLightmapMs / Double(n) : 0
-        appendLog("  Illumination Extraction: \(String(format: "%.1f", totalLightmapMs))ms total (\(String(format: "%.2f", msPerFrameLightmap))ms/frame, \(n) frames)")
-        if let lightmapMidPreview {
-            addPreview("Lightmap\n(mid-clip)", lightmapMidPreview)
-        }
-        setStage("Illumination Extraction", status: .done, timings: [("total", totalLightmapMs)])
-
-        // Step 4: composite the ORIGINAL grey silhouette (per-frame, real
-        // clip content) onto the lightmap -- this is the actual
-        // outbound-to-server signal per the confirmed pipeline (2026-07-27):
-        // silhouette-over-lightmap is what gets sent, not the raw silhouette
-        // alone. Uses each frame's own person mask as alpha (person region
-        // opaque, background transparent -- only the silhouette shape
-        // itself needs to reach the server, not the reconstructed
-        // background around it).
-        appendLog("[diag] compositing original silhouette onto lightmap (outbound-to-server signal, all \(n) frames, each its OWN lightmap)...")
-        // Each frame now uses ITS OWN lightmap (lightmaps[i], from the
-        // per-frame Illumination Extraction pass above) rather than one
-        // shared plate -- matches Android's silhouetteFromMask/
-        // silhouetteFromFill loop in LightmapPhase.kt, which pairs `lmPx`
-        // (that frame's lightmap) with that SAME frame's silhouette at
-        // index t, never a different frame's lightmap.
-        let silURL = tmpDir.appendingPathComponent("silhouette_on_lightmap.mp4")
-        let silWriter = try StreamingVideoWriter(outputURL: silURL, width: backgroundFinal.width, height: backgroundFinal.height, fps: fps)
-        let (silFrameCount, silMidPreview): (Int, CGImage?) = try await Task.detached(priority: .userInitiated) {
-            var count = 0
-            var midPreview: CGImage?
-            for i in 0..<n {
-                try autoreleasepool {
-                    let alpha = maskBuffers[i].unpacked().isPerson.map { $0 ? Float(1) : Float(0) }
-                    let result = Compositor.compositeOnly(background: lightmaps[i].toFloatRGBBuffer(), character: colorBuffers[i].toFloatRGBBuffer(), alpha: alpha)
-                    if let cg = result.composited.toCGImage() {
-                        try silWriter.append(cg)
-                        count += 1
-                        if i == n / 2 { midPreview = cg }
+        // MEMORY (root-caused 2026-08-19 via the file-log trace: the app
+        // survived Illumination Extraction's own earlier fix but then
+        // crashed partway through loading the real character/alpha video
+        // for Final Compositing). `lightmaps` ([RGBBuffer8], ~1.44GB at
+        // 300f/1264x1264) has exactly one consumer -- the silhouette-on-
+        // lightmap loop just below -- and Final Compositing is about to
+        // add the character (~1.44GB) + alpha (~0.48GB) videos on top of
+        // the already-resident colorBuffers (~1.44GB) + maskBuffers
+        // (~60MB): roughly ~4.85GB of compact arrays simultaneously alive
+        // if `lightmaps` were still around too, comfortably into
+        // jetsam-kill range on a real device.
+        //
+        // FIX: an explicit `do { }` block scopes `lightmaps` (and
+        // `lightmapMidPreview`, also fully consumed inside this block) so
+        // ARC releases them the moment the block ends -- ordinary Swift
+        // scoping, no `var`, no manual nil-out, no shadowing needed.
+        // `totalLightmapMs` is the only value from this block read later
+        // (the final summary), so it alone is declared OUTSIDE the block
+        // and assigned from inside it.
+        //
+        // Two earlier attempts at this exact fix both failed to compile:
+        // (1) making the original binding `var` so it could be reassigned
+        // to `[]` after the silhouette loop hit "reference to captured var
+        // 'lightmaps' in concurrently-executing code" at the loop's own
+        // `Task.detached` read site -- the same error class this file's
+        // `realCharacterData` doc comment already documents hitting once
+        // before; (2) shadowing with a second top-level `let lightmaps`
+        // hit "invalid redeclaration of 'lightmaps'" -- Swift does not
+        // allow re-declaring a `let` in the same scope, only in a nested
+        // one. A `do` block is exactly that nested scope, achieved
+        // properly rather than worked around.
+        let totalLightmapMs: Double
+        do {
+            let (lightmaps, lmMs, lightmapMidPreview): ([RGBBuffer8], Double, CGImage?) = await Task.detached(priority: .userInitiated) {
+                let t0 = CFAbsoluteTimeGetCurrent()
+                var out: [RGBBuffer8] = []
+                out.reserveCapacity(n)
+                var midPreview: CGImage?
+                for i in 0..<n {
+                    autoreleasepool {
+                        let lm = LightmapExtractor.extract(from: renderReconFrame(i)).lightmap
+                        if i == n / 2 { midPreview = lm.toCGImage() }
+                        out.append(lm.toRGBBuffer8())
                     }
                 }
+                let totalMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+                return (out, totalMs, midPreview)
+            }.value
+            totalLightmapMs = lmMs
+            let msPerFrameLightmap = n > 0 ? lmMs / Double(n) : 0
+            appendLog("  Illumination Extraction: \(String(format: "%.1f", lmMs))ms total (\(String(format: "%.2f", msPerFrameLightmap))ms/frame, \(n) frames)")
+            if let lightmapMidPreview {
+                addPreview("Lightmap\n(mid-clip)", lightmapMidPreview)
             }
-            return (count, midPreview)
-        }.value
-        try await silWriter.finish()
-        outputVideos.append((label: "Silhouette on Lightmap", url: silURL))
-        try await VideoEncoder.saveToPhotoLibrary(url: silURL)
-        appendLog("  silhouette-on-lightmap: \(silFrameCount) frames composited, saved to Photos")
-        if let silMidPreview {
-            addPreview("Silhouette-on-Lightmap\n(TO SERVER)", silMidPreview)
-        }
+            setStage("Illumination Extraction", status: .done, timings: [("total", lmMs)])
 
-        // MEMORY (root-caused 2026-08-19 via the file-log trace: the app
-        // survived Illumination Extraction's own fix but then crashed
-        // partway through loading the real character/alpha video for
-        // Final Compositing). `lightmaps` was the last O(N) array this
-        // function still held with no further readers -- its only
-        // consumer was the loop just above. At this point colorBuffers
-        // (~1.44GB) + maskBuffers (~60MB) + lightmaps (~1.44GB post-fix)
-        // are already resident, and Final Compositing is about to add the
-        // character (~1.44GB) + alpha (~0.48GB) videos on top -- roughly
-        // ~4.85GB of compact arrays simultaneously alive on a device with
-        // a real-world usable budget well under that. Explicitly dropping
-        // `lightmaps` here (same "release the moment truly unused, not
-        // merely finished with" principle as `lamaRunner = nil` earlier in
-        // this function) removes ~1.44GB from the peak right before the
-        // character/alpha load, which is exactly where the crash landed.
-        //
-        // SHADOWED with a fresh `let`, not mutated via `var`: an earlier
-        // version of this fix made the original binding `var` so it could
-        // be reassigned to `[]` here, but that made it illegal to capture
-        // inside the `Task.detached` closure above ("reference to captured
-        // var 'lightmaps' in concurrently-executing code" -- a real CI
-        // failure, same error class this file's `realCharacterData` doc
-        // comment already documents hitting once before). A `let`
-        // shadowing an existing `let` needs no var-capture at all and
-        // achieves the identical release: the original array's last
-        // strong reference (this shadowed name) is dropped, and nothing
-        // downstream can accidentally reference the old array by name
-        // since `lightmaps` now unambiguously means the empty one.
-        let lightmaps: [RGBBuffer8] = []
+            // Step 4: composite the ORIGINAL grey silhouette (per-frame,
+            // real clip content) onto the lightmap -- this is the actual
+            // outbound-to-server signal per the confirmed pipeline
+            // (2026-07-27): silhouette-over-lightmap is what gets sent,
+            // not the raw silhouette alone. Uses each frame's own person
+            // mask as alpha (person region opaque, background transparent
+            // -- only the silhouette shape itself needs to reach the
+            // server, not the reconstructed background around it).
+            appendLog("[diag] compositing original silhouette onto lightmap (outbound-to-server signal, all \(n) frames, each its OWN lightmap)...")
+            // Each frame now uses ITS OWN lightmap (lightmaps[i], from the
+            // per-frame Illumination Extraction pass above) rather than
+            // one shared plate -- matches Android's silhouetteFromMask/
+            // silhouetteFromFill loop in LightmapPhase.kt, which pairs
+            // `lmPx` (that frame's lightmap) with that SAME frame's
+            // silhouette at index t, never a different frame's lightmap.
+            let silURL = tmpDir.appendingPathComponent("silhouette_on_lightmap.mp4")
+            let silWriter = try StreamingVideoWriter(outputURL: silURL, width: backgroundFinal.width, height: backgroundFinal.height, fps: fps)
+            let (silFrameCount, silMidPreview): (Int, CGImage?) = try await Task.detached(priority: .userInitiated) {
+                var count = 0
+                var midPreview: CGImage?
+                for i in 0..<n {
+                    try autoreleasepool {
+                        let alpha = maskBuffers[i].unpacked().isPerson.map { $0 ? Float(1) : Float(0) }
+                        let result = Compositor.compositeOnly(background: lightmaps[i].toFloatRGBBuffer(), character: colorBuffers[i].toFloatRGBBuffer(), alpha: alpha)
+                        if let cg = result.composited.toCGImage() {
+                            try silWriter.append(cg)
+                            count += 1
+                            if i == n / 2 { midPreview = cg }
+                        }
+                    }
+                }
+                return (count, midPreview)
+            }.value
+            try await silWriter.finish()
+            outputVideos.append((label: "Silhouette on Lightmap", url: silURL))
+            try await VideoEncoder.saveToPhotoLibrary(url: silURL)
+            appendLog("  silhouette-on-lightmap: \(silFrameCount) frames composited, saved to Photos")
+            if let silMidPreview {
+                addPreview("Silhouette-on-Lightmap\n(TO SERVER)", silMidPreview)
+            }
+            // `lightmaps` and `lightmapMidPreview` fall out of scope here,
+            // at the end of the `do` block -- ARC releases the ~1.44GB
+            // array before Final Compositing's character/alpha load runs.
+        }
 
         // Steps 5-6: the server call (WanAnimate) can't be made from this
         // local benchmark. When the active preset has a real
