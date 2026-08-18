@@ -123,21 +123,51 @@ enum LightmapExtractor {
         return kernel
     }
 
+    /// CRASH FIX (2026-08-19, real on-device SIGSEGV inside
+    /// vVertical_Shear_Planar_Float, thread 479413 of the .ips report --
+    /// `vImageScale_PlanarF` dispatches its resample across a
+    /// `dispatch_apply` worker pool internally, visible in the crash
+    /// stack). The PREVIOUS version built `vImage_Buffer(data: &srcBuf, ...)`
+    /// in one statement and called `vImageScale_PlanarF(&srcVImage, ...)`
+    /// in a LATER statement. `&x` only pins `x`'s storage for the exact
+    /// call it is passed into directly -- storing the resulting raw
+    /// pointer inside a struct field first, then using that struct in a
+    /// separate call, is undefined behavior: Swift is free to have already
+    /// released/moved/CoW'd the array's backing storage by the time
+    /// `vImageScale_PlanarF`'s background dispatch_apply workers actually
+    /// dereference it. This "happened to work" at the small 32x32/128x128
+    /// sizes exercised so far, and faulted the first time a caller fed a
+    /// buffer through a path exercising more concurrent/aggressive
+    /// scheduling. Fixed by using `withUnsafeMutableBufferPointer`, which
+    /// keeps BOTH arrays' storage pinned and exclusively borrowed for the
+    /// programmer-controlled duration of the closure -- the entire
+    /// `vImage_Buffer` construction AND the `vImageScale_PlanarF` call now
+    /// happen inside that single pinned scope, so the background workers
+    /// can never outlive the memory they're reading/writing.
     private static func downscale(_ src: [Float], width: Int, height: Int, newSize: Int) -> [Float] {
         var srcBuf = src
         var dstBuf = [Float](repeating: 0, count: newSize * newSize)
-        var srcVImage = vImage_Buffer(data: &srcBuf, height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: width * MemoryLayout<Float>.size)
-        var dstVImage = vImage_Buffer(data: &dstBuf, height: vImagePixelCount(newSize), width: vImagePixelCount(newSize), rowBytes: newSize * MemoryLayout<Float>.size)
-        vImageScale_PlanarF(&srcVImage, &dstVImage, nil, vImage_Flags(kvImageHighQualityResampling))
+        srcBuf.withUnsafeMutableBufferPointer { srcPtr in
+            dstBuf.withUnsafeMutableBufferPointer { dstPtr in
+                var srcVImage = vImage_Buffer(data: srcPtr.baseAddress, height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: width * MemoryLayout<Float>.size)
+                var dstVImage = vImage_Buffer(data: dstPtr.baseAddress, height: vImagePixelCount(newSize), width: vImagePixelCount(newSize), rowBytes: newSize * MemoryLayout<Float>.size)
+                vImageScale_PlanarF(&srcVImage, &dstVImage, nil, vImage_Flags(kvImageHighQualityResampling))
+            }
+        }
         return dstBuf
     }
 
+    /// See `downscale`'s doc comment -- identical fix, same reasoning.
     private static func upscale(_ src: [Float], fromSize: Int, toW: Int, toH: Int) -> [Float] {
         var srcBuf = src
         var dstBuf = [Float](repeating: 0, count: toW * toH)
-        var srcVImage = vImage_Buffer(data: &srcBuf, height: vImagePixelCount(fromSize), width: vImagePixelCount(fromSize), rowBytes: fromSize * MemoryLayout<Float>.size)
-        var dstVImage = vImage_Buffer(data: &dstBuf, height: vImagePixelCount(toH), width: vImagePixelCount(toW), rowBytes: toW * MemoryLayout<Float>.size)
-        vImageScale_PlanarF(&srcVImage, &dstVImage, nil, vImage_Flags(kvImageHighQualityResampling))
+        srcBuf.withUnsafeMutableBufferPointer { srcPtr in
+            dstBuf.withUnsafeMutableBufferPointer { dstPtr in
+                var srcVImage = vImage_Buffer(data: srcPtr.baseAddress, height: vImagePixelCount(fromSize), width: vImagePixelCount(fromSize), rowBytes: fromSize * MemoryLayout<Float>.size)
+                var dstVImage = vImage_Buffer(data: dstPtr.baseAddress, height: vImagePixelCount(toH), width: vImagePixelCount(toW), rowBytes: toW * MemoryLayout<Float>.size)
+                vImageScale_PlanarF(&srcVImage, &dstVImage, nil, vImage_Flags(kvImageHighQualityResampling))
+            }
+        }
         return dstBuf
     }
 

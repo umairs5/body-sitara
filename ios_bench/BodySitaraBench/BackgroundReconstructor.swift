@@ -353,12 +353,32 @@ enum BackgroundReconstructor {
         return (Double(bestDx) + sx, Double(bestDy) + sy)
     }
 
+    /// CRASH FIX (2026-08-19): `vImage_Buffer(data: &srcBuf, ...)` built in
+    /// one statement, then `vImageScale_PlanarF(&srcVImage, ...)` called in
+    /// a LATER statement, is undefined behavior -- `&x` only pins `x`'s
+    /// storage for the exact call it is passed into directly, and
+    /// `vImageScale_PlanarF` dispatches its resample across a background
+    /// `dispatch_apply` worker pool internally, which can outlive that
+    /// pin. A real on-device SIGSEGV inside `vVertical_Shear_Planar_Float`
+    /// (same underlying vImage call, reached via
+    /// `LightmapExtractor.downscale`'s identical old pattern -- see that
+    /// function's doc comment for the full .ips crash-report trace) root-
+    /// caused this exact shape; `resizeArea` has the same anti-pattern and
+    /// is on an even hotter path (every alignment-pyramid level, every
+    /// frame). Fixed with `withUnsafeMutableBufferPointer`, which keeps
+    /// both arrays pinned for the programmer-controlled duration of the
+    /// closure, so the whole `vImage_Buffer` construction AND the
+    /// `vImageScale_PlanarF` call happen inside one pinned scope.
     private static func resizeArea(_ src: [Float], width: Int, height: Int, newW: Int, newH: Int) -> [Float] {
         var srcBuf = src
         var dstBuf = [Float](repeating: 0, count: newW * newH)
-        var srcVImage = vImage_Buffer(data: &srcBuf, height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: width * MemoryLayout<Float>.size)
-        var dstVImage = vImage_Buffer(data: &dstBuf, height: vImagePixelCount(newH), width: vImagePixelCount(newW), rowBytes: newW * MemoryLayout<Float>.size)
-        vImageScale_PlanarF(&srcVImage, &dstVImage, nil, vImage_Flags(kvImageHighQualityResampling))
+        srcBuf.withUnsafeMutableBufferPointer { srcPtr in
+            dstBuf.withUnsafeMutableBufferPointer { dstPtr in
+                var srcVImage = vImage_Buffer(data: srcPtr.baseAddress, height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: width * MemoryLayout<Float>.size)
+                var dstVImage = vImage_Buffer(data: dstPtr.baseAddress, height: vImagePixelCount(newH), width: vImagePixelCount(newW), rowBytes: newW * MemoryLayout<Float>.size)
+                vImageScale_PlanarF(&srcVImage, &dstVImage, nil, vImage_Flags(kvImageHighQualityResampling))
+            }
+        }
         return dstBuf
     }
 
