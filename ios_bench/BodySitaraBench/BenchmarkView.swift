@@ -793,12 +793,7 @@ struct BenchmarkView: View {
         // light_map.mp4 as a real per-frame video) so, like `backgroundFinal`/
         // `colorBuffers`, it is the one array this function legitimately
         // needs to keep -- just at the compact element type this time.
-        // `var`, not `let`: explicitly released (`lightmaps = []`) right
-        // after its last reader (the silhouette-on-lightmap loop just
-        // below) finishes -- see that release site's comment for why. Safe
-        // to mutate on the main actor between the two `Task.detached`
-        // blocks; nothing captures `lightmaps` by reference across them.
-        var (lightmaps, totalLightmapMs, lightmapMidPreview): ([RGBBuffer8], Double, CGImage?) = await Task.detached(priority: .userInitiated) {
+        let (lightmaps, totalLightmapMs, lightmapMidPreview): ([RGBBuffer8], Double, CGImage?) = await Task.detached(priority: .userInitiated) {
             let t0 = CFAbsoluteTimeGetCurrent()
             var out: [RGBBuffer8] = []
             out.reserveCapacity(n)
@@ -876,7 +871,20 @@ struct BenchmarkView: View {
         // merely finished with" principle as `lamaRunner = nil` earlier in
         // this function) removes ~1.44GB from the peak right before the
         // character/alpha load, which is exactly where the crash landed.
-        lightmaps = []
+        //
+        // SHADOWED with a fresh `let`, not mutated via `var`: an earlier
+        // version of this fix made the original binding `var` so it could
+        // be reassigned to `[]` here, but that made it illegal to capture
+        // inside the `Task.detached` closure above ("reference to captured
+        // var 'lightmaps' in concurrently-executing code" -- a real CI
+        // failure, same error class this file's `realCharacterData` doc
+        // comment already documents hitting once before). A `let`
+        // shadowing an existing `let` needs no var-capture at all and
+        // achieves the identical release: the original array's last
+        // strong reference (this shadowed name) is dropped, and nothing
+        // downstream can accidentally reference the old array by name
+        // since `lightmaps` now unambiguously means the empty one.
+        let lightmaps: [RGBBuffer8] = []
 
         // Steps 5-6: the server call (WanAnimate) can't be made from this
         // local benchmark. When the active preset has a real
