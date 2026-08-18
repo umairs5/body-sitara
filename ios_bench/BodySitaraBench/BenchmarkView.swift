@@ -778,7 +778,23 @@ struct BenchmarkView: View {
             var midPreview: CGImage?
             for i in 0..<n {
                 autoreleasepool {
-                    let lm = LightmapExtractor.extract(from: renderReconFrame(i)).lightmap
+                    // TEMPORARY per-frame tracing (2026-08-19): the app is
+                    // crashing right at Illumination Extraction's start with
+                    // no .ips surfacing, so DiagnosticFileLog is written to
+                    // DIRECTLY (not via the main-actor appendLog) so the last
+                    // line on disk before a hard crash pinpoints which of
+                    // renderReconFrame/LightmapExtractor.extract never
+                    // returned. Safe to call off the main actor -- it's a
+                    // plain singleton with its own internal lock, not
+                    // actor-isolated. Every-frame logging (not every-N) is
+                    // deliberate here: the crash is landing on frame 0 or
+                    // very early, so coarser logging would still show
+                    // nothing between "starting" and "crashed".
+                    DiagnosticFileLog.shared.append("[trace] frame \(i)/\(n): calling renderReconFrame")
+                    let bg = renderReconFrame(i)
+                    DiagnosticFileLog.shared.append("[trace] frame \(i)/\(n): renderReconFrame OK (\(bg.width)x\(bg.height)) -- calling LightmapExtractor.extract")
+                    let lm = LightmapExtractor.extract(from: bg).lightmap
+                    DiagnosticFileLog.shared.append("[trace] frame \(i)/\(n): LightmapExtractor.extract OK")
                     out.append(lm)
                     if i == n / 2 { midPreview = lm.toCGImage() }
                 }
