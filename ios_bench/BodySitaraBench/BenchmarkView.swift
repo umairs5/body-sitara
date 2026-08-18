@@ -793,7 +793,12 @@ struct BenchmarkView: View {
         // light_map.mp4 as a real per-frame video) so, like `backgroundFinal`/
         // `colorBuffers`, it is the one array this function legitimately
         // needs to keep -- just at the compact element type this time.
-        let (lightmaps, totalLightmapMs, lightmapMidPreview): ([RGBBuffer8], Double, CGImage?) = await Task.detached(priority: .userInitiated) {
+        // `var`, not `let`: explicitly released (`lightmaps = []`) right
+        // after its last reader (the silhouette-on-lightmap loop just
+        // below) finishes -- see that release site's comment for why. Safe
+        // to mutate on the main actor between the two `Task.detached`
+        // blocks; nothing captures `lightmaps` by reference across them.
+        var (lightmaps, totalLightmapMs, lightmapMidPreview): ([RGBBuffer8], Double, CGImage?) = await Task.detached(priority: .userInitiated) {
             let t0 = CFAbsoluteTimeGetCurrent()
             var out: [RGBBuffer8] = []
             out.reserveCapacity(n)
@@ -855,6 +860,23 @@ struct BenchmarkView: View {
         if let silMidPreview {
             addPreview("Silhouette-on-Lightmap\n(TO SERVER)", silMidPreview)
         }
+
+        // MEMORY (root-caused 2026-08-19 via the file-log trace: the app
+        // survived Illumination Extraction's own fix but then crashed
+        // partway through loading the real character/alpha video for
+        // Final Compositing). `lightmaps` was the last O(N) array this
+        // function still held with no further readers -- its only
+        // consumer was the loop just above. At this point colorBuffers
+        // (~1.44GB) + maskBuffers (~60MB) + lightmaps (~1.44GB post-fix)
+        // are already resident, and Final Compositing is about to add the
+        // character (~1.44GB) + alpha (~0.48GB) videos on top -- roughly
+        // ~4.85GB of compact arrays simultaneously alive on a device with
+        // a real-world usable budget well under that. Explicitly dropping
+        // `lightmaps` here (same "release the moment truly unused, not
+        // merely finished with" principle as `lamaRunner = nil` earlier in
+        // this function) removes ~1.44GB from the peak right before the
+        // character/alpha load, which is exactly where the crash landed.
+        lightmaps = []
 
         // Steps 5-6: the server call (WanAnimate) can't be made from this
         // local benchmark. When the active preset has a real
