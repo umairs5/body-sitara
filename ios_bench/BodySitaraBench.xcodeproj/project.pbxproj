@@ -31,6 +31,7 @@
 		5D3C6A460A4B43E29F6F8A5F /* ClipPickerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1E4250AB70AD42B4A6D944E0 /* ClipPickerView.swift */; };
 		A16204BE6C92469C8E2CC192 /* PipelineStageView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9C8E14B913046DAAC4DC592 /* PipelineStageView.swift */; };
 		72684FCF875040A782EE8901 /* CompareView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CA3743112814DCFA4FA43DB /* CompareView.swift */; };
+		EB5E6E107CDB9019AC1AD89C /* DiagnosticFileLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = C969A1D7F735275789FE751B /* DiagnosticFileLog.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -41,6 +42,7 @@
 		EF31D71822E44EDF9F4EEB81 /* LamaRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LamaRunner.swift; sourceTree = "<group>"; };
 		915D2299C98D47C89F952113 /* TestFrameProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestFrameProvider.swift; sourceTree = "<group>"; };
 		24D1D2B0591D41058A313829 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		C969A1D7F735275789FE751B /* DiagnosticFileLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticFileLog.swift; sourceTree = "<group>"; };
 		800CB20ADE3C4C389CF82366 /* RifeIFNet.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; path = RifeIFNet.mlpackage; sourceTree = "<group>"; };
 		8A360F55EE96400C80D37E52 /* BigLama.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; path = BigLama.mlpackage; sourceTree = "<group>"; };
 		963DB22D281D4FDF9EE93B36 /* BodySitaraBench.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = BodySitaraBench.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -106,6 +108,7 @@
 				1E4250AB70AD42B4A6D944E0 /* ClipPickerView.swift */,
 				A9C8E14B913046DAAC4DC592 /* PipelineStageView.swift */,
 				1CA3743112814DCFA4FA43DB /* CompareView.swift */,
+				C969A1D7F735275789FE751B /* DiagnosticFileLog.swift */,
 				24D1D2B0591D41058A313829 /* Info.plist */,
 			);
 			path = BodySitaraBench;
@@ -229,6 +232,7 @@
 				5D3C6A460A4B43E29F6F8A5F /* ClipPickerView.swift in Sources */,
 				A16204BE6C92469C8E2CC192 /* PipelineStageView.swift in Sources */,
 				72684FCF875040A782EE8901 /* CompareView.swift in Sources */,
+				EB5E6E107CDB9019AC1AD89C /* DiagnosticFileLog.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -269,6 +269,7 @@ struct BenchmarkView: View {
     private func appendLog(_ line: String) {
         log.append(line)
         print(line)
+        DiagnosticFileLog.shared.append(line)
     }
 
     private func addPreview(_ label: String, _ cgImage: CGImage?) {
