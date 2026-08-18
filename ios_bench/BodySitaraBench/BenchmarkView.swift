@@ -761,42 +761,48 @@ struct BenchmarkView: View {
         // streamed to reconstructed_background.mp4 -- through the same
         // per-frame lightmapOf() Android's loop uses.
         //
-        // MEMORY: renders frame i, extracts ITS lightmap, and lets frame
-        // i's reconstructed-background RGBBuffer fall out of scope before
-        // the next iteration -- at most one background frame is resident
-        // at a time (same discipline as the bgWriter/silWriter loops
-        // above), never `(0..<n).map { renderReconFrame($0) }` materialized
-        // up front. `lightmaps` itself IS this stage's real output (the
-        // next step composites the silhouette onto it, exactly as Android
-        // writes light_map.mp4 as a real per-frame video) so, like
-        // `backgroundFinal`/`colorBuffers`, it is the one array this
-        // function legitimately needs to keep -- not avoidable scratch.
-        let (lightmaps, totalLightmapMs, lightmapMidPreview): ([RGBBuffer], Double, CGImage?) = await Task.detached(priority: .userInitiated) {
+        // MEMORY (root-caused 2026-08-19 via per-frame trace logging to
+        // DiagnosticFileLog -- the on-device crash landed cleanly at frame
+        // 97/300, after 97 fully-successful renderReconFrame +
+        // LightmapExtractor.extract round-trips, which ruled out both
+        // functions themselves and pointed at accumulation instead): the
+        // PREVIOUS version stored this loop's output as `[RGBBuffer]`
+        // (Float32, one array per lightmap). At 1264x1264 that's ~19.17MB
+        // PER FRAME, so by frame 97 alone the retained array was already
+        // ~1.86GB -- stacked on top of the already-resident colorBuffers
+        // (~1.44GB, UInt8) and maskBuffers (~60MB, packed) -- comfortably
+        // into the jetsam-kill range this exact codebase has hit and fixed
+        // before at other input-loading layers (see RGBBuffer8's own doc
+        // comment in PixelBuffer.swift for the same class of bug at the
+        // colorBuffers/character/alpha loading layer). Projected to
+        // ~5.75GB had the loop reached all 300 frames.
+        //
+        // FIX: `lightmaps` is now `[RGBBuffer8]` (UInt8-native, `toRGBBuffer8()`
+        // added to PixelBuffer.swift for this) -- a 4x reduction, matching
+        // the ratio Float32->UInt8 always gives. Only ONE frame's worth of
+        // Float32 lightmap (`LightmapExtractor.extract`'s return value) is
+        // ever resident at a time; it's demoted to UInt8 immediately after
+        // computing, same "promote/demote at the point of use, never
+        // retain N of them" discipline as `RGBBuffer8.toFloatRGBBuffer()`
+        // elsewhere in this codebase. `renderReconFrame(i)`'s own
+        // reconstructed-background RGBBuffer likewise falls out of scope
+        // before the next iteration -- at most one of each is resident at
+        // a time (same discipline as the bgWriter/silWriter loops above).
+        // `lightmaps` itself IS this stage's real output (the next step
+        // composites the silhouette onto it, exactly as Android writes
+        // light_map.mp4 as a real per-frame video) so, like `backgroundFinal`/
+        // `colorBuffers`, it is the one array this function legitimately
+        // needs to keep -- just at the compact element type this time.
+        let (lightmaps, totalLightmapMs, lightmapMidPreview): ([RGBBuffer8], Double, CGImage?) = await Task.detached(priority: .userInitiated) {
             let t0 = CFAbsoluteTimeGetCurrent()
-            var out: [RGBBuffer] = []
+            var out: [RGBBuffer8] = []
             out.reserveCapacity(n)
             var midPreview: CGImage?
             for i in 0..<n {
                 autoreleasepool {
-                    // TEMPORARY per-frame tracing (2026-08-19): the app is
-                    // crashing right at Illumination Extraction's start with
-                    // no .ips surfacing, so DiagnosticFileLog is written to
-                    // DIRECTLY (not via the main-actor appendLog) so the last
-                    // line on disk before a hard crash pinpoints which of
-                    // renderReconFrame/LightmapExtractor.extract never
-                    // returned. Safe to call off the main actor -- it's a
-                    // plain singleton with its own internal lock, not
-                    // actor-isolated. Every-frame logging (not every-N) is
-                    // deliberate here: the crash is landing on frame 0 or
-                    // very early, so coarser logging would still show
-                    // nothing between "starting" and "crashed".
-                    DiagnosticFileLog.shared.append("[trace] frame \(i)/\(n): calling renderReconFrame")
-                    let bg = renderReconFrame(i)
-                    DiagnosticFileLog.shared.append("[trace] frame \(i)/\(n): renderReconFrame OK (\(bg.width)x\(bg.height)) -- calling LightmapExtractor.extract")
-                    let lm = LightmapExtractor.extract(from: bg).lightmap
-                    DiagnosticFileLog.shared.append("[trace] frame \(i)/\(n): LightmapExtractor.extract OK")
-                    out.append(lm)
+                    let lm = LightmapExtractor.extract(from: renderReconFrame(i)).lightmap
                     if i == n / 2 { midPreview = lm.toCGImage() }
+                    out.append(lm.toRGBBuffer8())
                 }
             }
             let totalMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000
@@ -832,7 +838,7 @@ struct BenchmarkView: View {
             for i in 0..<n {
                 try autoreleasepool {
                     let alpha = maskBuffers[i].unpacked().isPerson.map { $0 ? Float(1) : Float(0) }
-                    let result = Compositor.compositeOnly(background: lightmaps[i], character: colorBuffers[i].toFloatRGBBuffer(), alpha: alpha)
+                    let result = Compositor.compositeOnly(background: lightmaps[i].toFloatRGBBuffer(), character: colorBuffers[i].toFloatRGBBuffer(), alpha: alpha)
                     if let cg = result.composited.toCGImage() {
                         try silWriter.append(cg)
                         count += 1

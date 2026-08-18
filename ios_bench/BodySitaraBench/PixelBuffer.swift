@@ -70,6 +70,33 @@ struct RGBBuffer {
             provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent
         )
     }
+
+    /// Demotes this ONE frame to a UInt8-native `RGBBuffer8` -- the
+    /// opposite direction from `RGBBuffer8.toFloatRGBBuffer()`, added
+    /// (2026-08-19) specifically so a per-frame Float32 output (e.g.
+    /// `LightmapExtractor.extract`'s lightmap) can be compacted at the
+    /// point of storage into an N-frame clip-wide array, rather than that
+    /// array accumulating N full Float32 `RGBBuffer`s. See BenchmarkView's
+    /// Illumination Extraction stage for the real crash this fixed: a
+    /// `[RGBBuffer]` (Float32) lightmap array reached ~1.86GB by frame 97
+    /// of 300 at 1264x1264, on top of the already-resident colorBuffers/
+    /// maskBuffers/backgroundFinal -- comfortably into jetsam-kill
+    /// territory, matching the observed on-device SIGSEGV-adjacent hard
+    /// crash. Lossy only in the sense any Float32->UInt8 round-trip is
+    /// (values are already meant to be 0-255 pixel intensities, so this
+    /// is the same "no real precision loss" case `RGBBuffer8.from(cgImage:)`
+    /// documents, not a new source of error).
+    func toRGBBuffer8() -> RGBBuffer8 {
+        var r8 = [UInt8](repeating: 0, count: width * height)
+        var g8 = [UInt8](repeating: 0, count: width * height)
+        var b8 = [UInt8](repeating: 0, count: width * height)
+        for i in 0..<(width * height) {
+            r8[i] = UInt8(max(0, min(255, r[i].rounded())))
+            g8[i] = UInt8(max(0, min(255, g[i].rounded())))
+            b8[i] = UInt8(max(0, min(255, b[i].rounded())))
+        }
+        return RGBBuffer8(r: r8, g: g8, b: b8, width: width, height: height)
+    }
 }
 
 /// Binary person/hole mask, sourced from the Tier1 segmentation output
