@@ -598,15 +598,36 @@ struct BenchmarkView: View {
             // reconMidPreview for the gallery, mirroring how
             // VideoFrameLoader captures specific preview indices during its
             // own streaming decode pass rather than keeping everything.
+            //
+            // PER-ITERATION `autoreleasepool` (added 2026-08-19 after a
+            // real on-device crash on a 300-frame/1264x1264 clip forced
+            // through STATIC via the Reconstruction Mode override): this
+            // loop is a tight back-to-back sequence of
+            // `StreamingVideoWriter.append` calls, each of which drives
+            // `CVPixelBufferPoolCreatePixelBuffer` + `CGContext` (Core
+            // Video/Core Graphics, CFRetain/CFRelease-backed, not plain
+            // Swift ARC) once per frame, 300 times with no pool drain in
+            // between -- the exact "large Objective-C/CF-backed buffers
+            // pile up faster than ARC alone reclaims them" pattern this
+            // same codebase already root-caused and fixed twice elsewhere
+            // (`fillWindowCores`'s per-window pool, `runLamaBenchmark`'s
+            // per-rep pool -- see either's doc comment for the full
+            // writeup). This loop had the identical shape but no pool at
+            // all. `renderReconFrame(i)`'s three transient Float32 arrays
+            // are plain Swift value types (ARC-only, no CF involvement) so
+            // they weren't the driver of this specific crash, but they're
+            // covered for free by wrapping the whole iteration.
             (bgReconFrameCount, reconMidPreview) = try await Task.detached(priority: .userInitiated) {
                 var count = 0
                 var midPreview: CGImage?
                 for i in 0..<n {
-                    let frameBuf = renderReconFrame(i)
-                    if let cg = frameBuf.toCGImage() {
-                        try bgWriter.append(cg)
-                        count += 1
-                        if i == n / 2 { midPreview = cg }
+                    try autoreleasepool {
+                        let frameBuf = renderReconFrame(i)
+                        if let cg = frameBuf.toCGImage() {
+                            try bgWriter.append(cg)
+                            count += 1
+                            if i == n / 2 { midPreview = cg }
+                        }
                     }
                 }
                 return (count, midPreview)
@@ -661,16 +682,21 @@ struct BenchmarkView: View {
             // branch above -- see that branch's comment for the full
             // reasoning. Only the per-frame compute differs (compositeFrame
             // vs. the direct paste, both now behind renderReconFrame); the
-            // write-then-discard discipline is identical.
+            // write-then-discard discipline is identical, including the
+            // per-iteration `autoreleasepool` (same CVPixelBufferPool/
+            // CGContext churn per `bgWriter.append` call -- see the
+            // STATIC/JITTER branch's comment for the full writeup).
             (bgReconFrameCount, reconMidPreview) = try await Task.detached(priority: .userInitiated) {
                 var count = 0
                 var midPreview: CGImage?
                 for i in 0..<n {
-                    let composited = renderReconFrame(i)
-                    if let cg = composited.toCGImage() {
-                        try bgWriter.append(cg)
-                        count += 1
-                        if i == n / 2 { midPreview = cg }
+                    try autoreleasepool {
+                        let composited = renderReconFrame(i)
+                        if let cg = composited.toCGImage() {
+                            try bgWriter.append(cg)
+                            count += 1
+                            if i == n / 2 { midPreview = cg }
+                        }
                     }
                 }
                 return (count, midPreview)
@@ -750,9 +776,11 @@ struct BenchmarkView: View {
             out.reserveCapacity(n)
             var midPreview: CGImage?
             for i in 0..<n {
-                let lm = LightmapExtractor.extract(from: renderReconFrame(i)).lightmap
-                out.append(lm)
-                if i == n / 2 { midPreview = lm.toCGImage() }
+                autoreleasepool {
+                    let lm = LightmapExtractor.extract(from: renderReconFrame(i)).lightmap
+                    out.append(lm)
+                    if i == n / 2 { midPreview = lm.toCGImage() }
+                }
             }
             let totalMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000
             return (out, totalMs, midPreview)
@@ -785,12 +813,14 @@ struct BenchmarkView: View {
             var count = 0
             var midPreview: CGImage?
             for i in 0..<n {
-                let alpha = maskBuffers[i].unpacked().isPerson.map { $0 ? Float(1) : Float(0) }
-                let result = Compositor.compositeOnly(background: lightmaps[i], character: colorBuffers[i].toFloatRGBBuffer(), alpha: alpha)
-                if let cg = result.composited.toCGImage() {
-                    try silWriter.append(cg)
-                    count += 1
-                    if i == n / 2 { midPreview = cg }
+                try autoreleasepool {
+                    let alpha = maskBuffers[i].unpacked().isPerson.map { $0 ? Float(1) : Float(0) }
+                    let result = Compositor.compositeOnly(background: lightmaps[i], character: colorBuffers[i].toFloatRGBBuffer(), alpha: alpha)
+                    if let cg = result.composited.toCGImage() {
+                        try silWriter.append(cg)
+                        count += 1
+                        if i == n / 2 { midPreview = cg }
+                    }
                 }
             }
             return (count, midPreview)
@@ -907,38 +937,40 @@ struct BenchmarkView: View {
             var totalMs = 0.0
             var midPreview: CGImage?
             for i in 0..<nFinal {
-                let frameBg = renderReconFrame(i)
-                let character: RGBBuffer
-                let alpha: [Float]
-                // derivedFromLuma tracks which branch produced `alpha`:
-                // a real staged synthetic_alpha_pK is an explicit sidecar
-                // (Android's NCompositor path -- clean by construction, no
-                // fillHoles/solidify needed), while the placeholder cutout
-                // stands in for Android's "no explicit alpha" fallback
-                // (alphaFromPersonLuma), which always runs both fixes. See
-                // Compositor.compositeOnly's `derivedFromLuma` doc comment.
-                let derivedFromLuma: Bool
-                if let rc = realCharacterData {
-                    // Both arrays already live fully in memory (loaded
-                    // above, bounded/compact like colorBuffers) -- indexing
-                    // frame i here does not decode or allocate a new
-                    // clip-wide array per frame, only per-frame Float32
-                    // promotion of ONE frame (same pattern as
-                    // colorBuffers[i].toFloatRGBBuffer() elsewhere in this
-                    // function).
-                    character = rc.character[i].toFloatRGBBuffer()
-                    alpha = rc.alpha[i].alphaChannel8To01()
-                    derivedFromLuma = false
-                } else {
-                    (character, alpha) = Compositor.placeholderCharacter(width: backgroundFinal.width, height: backgroundFinal.height, frameIndex: i, totalFrames: nFinal)
-                    derivedFromLuma = true
-                }
-                let result = Compositor.compositeOnly(background: frameBg, character: character, alpha: alpha, derivedFromLuma: derivedFromLuma)
-                totalMs += result.compositeMs
-                if let cg = result.composited.toCGImage() {
-                    try finalWriter.append(cg)
-                    count += 1
-                    if i == nFinal / 2 { midPreview = cg }
+                try autoreleasepool {
+                    let frameBg = renderReconFrame(i)
+                    let character: RGBBuffer
+                    let alpha: [Float]
+                    // derivedFromLuma tracks which branch produced `alpha`:
+                    // a real staged synthetic_alpha_pK is an explicit sidecar
+                    // (Android's NCompositor path -- clean by construction, no
+                    // fillHoles/solidify needed), while the placeholder cutout
+                    // stands in for Android's "no explicit alpha" fallback
+                    // (alphaFromPersonLuma), which always runs both fixes. See
+                    // Compositor.compositeOnly's `derivedFromLuma` doc comment.
+                    let derivedFromLuma: Bool
+                    if let rc = realCharacterData {
+                        // Both arrays already live fully in memory (loaded
+                        // above, bounded/compact like colorBuffers) -- indexing
+                        // frame i here does not decode or allocate a new
+                        // clip-wide array per frame, only per-frame Float32
+                        // promotion of ONE frame (same pattern as
+                        // colorBuffers[i].toFloatRGBBuffer() elsewhere in this
+                        // function).
+                        character = rc.character[i].toFloatRGBBuffer()
+                        alpha = rc.alpha[i].alphaChannel8To01()
+                        derivedFromLuma = false
+                    } else {
+                        (character, alpha) = Compositor.placeholderCharacter(width: backgroundFinal.width, height: backgroundFinal.height, frameIndex: i, totalFrames: nFinal)
+                        derivedFromLuma = true
+                    }
+                    let result = Compositor.compositeOnly(background: frameBg, character: character, alpha: alpha, derivedFromLuma: derivedFromLuma)
+                    totalMs += result.compositeMs
+                    if let cg = result.composited.toCGImage() {
+                        try finalWriter.append(cg)
+                        count += 1
+                        if i == nFinal / 2 { midPreview = cg }
+                    }
                 }
             }
             return (count, totalMs, midPreview)
