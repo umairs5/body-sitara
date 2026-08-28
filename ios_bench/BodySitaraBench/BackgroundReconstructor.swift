@@ -100,6 +100,14 @@ import CoreML
 /// N-length Float32/`[Bool]` array alongside the UInt8/packed one. See
 /// PixelBuffer.swift's `RGBBuffer8`/`PackedMaskFrame` doc comments for the
 /// full before/after memory math at this input-loading layer.
+extension Float {
+    /// Clamp to a closed range -- used by the STATIC composite's ring-gain
+    /// and grain-sigma clamps (matches Android's `.coerceIn(lo, hi)`).
+    func clamped(to range: ClosedRange<Float>) -> Float {
+        min(range.upperBound, max(range.lowerBound, self))
+    }
+}
+
 enum BackgroundReconstructor {
     /// px: dilate the person mask OUT before sampling, so codec-bleed /
     /// silhouette-edge pixels never contaminate the plate -- matches
@@ -179,6 +187,19 @@ enum BackgroundReconstructor {
         /// which explanation is correct without the data to distinguish
         /// them.
         let perWindowAlignMs: [Double]
+        /// STATIC/JITTER only (empty in DYNAMIC mode): frame 0's grayscale,
+        /// the exact reference `reconstructStatic` aligned every other
+        /// frame against while building the plate. Retained so the
+        /// composite step can re-align EACH OUTPUT frame against this same
+        /// reference at composite time -- matching Android's `Aligner`,
+        /// which is built once from the reference frame and then called
+        /// statelessly per frame from both `aggregatePlate` (build time)
+        /// and `compositeFrames` (composite time; see `Aligner.shiftOf`'s
+        /// doc comment in BackgroundInpaint.kt). Without this, a composite
+        /// step can only paste the flat, once-aligned plate -- it has no
+        /// way to correct for THIS frame's own residual handheld jitter,
+        /// which is exactly what compositeFrames's per-frame re-warp does.
+        let refGray0: [Float]
     }
 
     // MARK: - Packed / compact storage
@@ -600,7 +621,7 @@ enum BackgroundReconstructor {
             // override is visible in every forced run's output, not just the
             // ones that actually changed the outcome.
             let detail = "devC=\(String(format: "%.1f", traj.devC))px (R_MAX=\(String(format: "%.1f", rMax(width: width)))px) -- would have selected \(wouldHaveSelected.rawValue) -- FORCED to \(forced.rawValue) for comparison testing"
-            return Result(plateBeforeLama: result.plateBeforeLama, core: result.core, union: result.union, neverRevealed: result.neverRevealed, alignMs: result.alignMs, trimmedMeanMs: result.trimmedMeanMs, method: forced, methodDetail: detail, dynamicWindows: result.dynamicWindows, perWindowAlignMs: result.perWindowAlignMs)
+            return Result(plateBeforeLama: result.plateBeforeLama, core: result.core, union: result.union, neverRevealed: result.neverRevealed, alignMs: result.alignMs, trimmedMeanMs: result.trimmedMeanMs, method: forced, methodDetail: detail, dynamicWindows: result.dynamicWindows, perWindowAlignMs: result.perWindowAlignMs, refGray0: result.refGray0)
         }
 
         if traj.needsWindowing && n >= WINDOW_MIN {
@@ -720,7 +741,187 @@ enum BackgroundReconstructor {
 
         let plate = RGBBuffer(r: rPlateOut, g: gPlateOut, b: bPlateOut, width: width, height: height)
         let detail = String(format: "devC=%.1fpx (R_MAX=%.1fpx) -- single plate covers the clip's motion", traj.devC, rMax(width: width))
-        return Result(plateBeforeLama: plate, core: core, union: union, neverRevealed: neverRevealed, alignMs: alignMs, trimmedMeanMs: trimmedMeanMs, method: .staticJitter, methodDetail: detail, dynamicWindows: nil, perWindowAlignMs: [])
+        return Result(plateBeforeLama: plate, core: core, union: union, neverRevealed: neverRevealed, alignMs: alignMs, trimmedMeanMs: trimmedMeanMs, method: .staticJitter, methodDetail: detail, dynamicWindows: nil, perWindowAlignMs: [], refGray0: refGray)
+    }
+
+    // MARK: - STATIC/JITTER per-frame composite (quality parity with Android's compositeFrames)
+
+    /// px: soften the per-frame composite seam -- matches Android's `FEATHER` (BackgroundInpaint.kt).
+    private static let feather = 2
+    /// Fill the FULL contaminated ring from the plate (mask dilation + feather), matching Android's
+    /// `COMPOSITE_DILATE = MASK_DILATE + FEATHER`.
+    private static let compositeDilate = maskDilate + feather
+    private static let grainMin: Float = 0.4
+    private static let grainMax: Float = 6.0
+
+    /// STATIC/JITTER composite for ONE frame, matching Android's `compositeFrames` (BackgroundInpaint.kt):
+    /// re-align the frame against the SAME reference used to build the plate (not a flat, unwarped
+    /// paste), gain-match the plate to this frame's own exposure via a ring sample around the hole,
+    /// alpha-blend across a feathered boundary (not a hard mask cutover), and add a small amount of
+    /// per-frame grain so the filled region doesn't read as suspiciously smooth next to real camera
+    /// noise. Previously this stage was a direct, unwarped, ungained, unfeathered plate paste --
+    /// visually much rougher than Android's hardened implementation; this closes that gap.
+    ///
+    /// GRAIN NOTE: Android's STATIC path measures `grainSigma` once per clip via `staticGrainSigma`,
+    /// a homography-based estimator matched pairwise across sampled frames (BackgroundInpaint.kt
+    /// line ~1958) -- a substantial, separate piece of machinery. Porting that exactly is deferred;
+    /// this uses a simpler, still real per-frame noise estimate (measured from the ACTUAL sampled
+    /// real-vs-plate residual in the ring, not a guessed constant), clamped to the same
+    /// [grainMin, grainMax] range Android uses, so a real texture cue is present even though the
+    /// estimator itself is not yet the homography-based one. Flagged here rather than silently
+    /// matched, so it's not mistaken for a full port.
+    static func compositeStaticFrame(
+        frame: RGBBuffer, mask: MaskBuffer, plate: RGBBuffer, refGray0: [Float], frameIndex: Int
+    ) -> RGBBuffer {
+        let w = frame.width, h = frame.height
+        let np = w * h
+        let hole = dilate(mask.isPerson, width: w, height: h, radius: compositeDilate)
+        guard hole.contains(true) else { return frame }
+
+        // Re-align THIS frame against the plate's reference (frame 0), exactly as Android's
+        // Aligner.shiftOf() recomputes alignment fresh at composite time rather than reusing a
+        // build-time cache -- corrects for this specific frame's own residual handheld jitter, which
+        // the once-aligned plate alone cannot (see `Result.refGray0`'s doc comment).
+        let tgtGray = frame.grayscale()
+        let (dx, dy) = alignPyramid(ref: refGray0, tgt: tgtGray, width: w, height: h)
+
+        // Feathered alpha: a hard mask cutover produces a visible seam; a smoothed ramp (matching
+        // Android's boxBlur(alpha, ablur, w, h, FEATHER)) blends the plate in gradually at the edge.
+        let holeF = hole.map { $0 ? Float(1) : Float(0) }
+        let ablur = boxBlur2D(holeF, width: w, height: h, radius: feather)
+
+        // Warp the plate into this frame's coordinates using the freshly-computed shift -- the
+        // per-frame re-warp Android's compositeFrames does, replacing the flat unwarped paste.
+        let warpedR = warpTranslate(plate.r, width: w, height: h, dx: dx, dy: dy, nearest: false)
+        let warpedG = warpTranslate(plate.g, width: w, height: h, dx: dx, dy: dy, nearest: false)
+        let warpedB = warpTranslate(plate.b, width: w, height: h, dx: dx, dy: dy, nearest: false)
+        let warped = RGBBuffer(r: warpedR, g: warpedG, b: warpedB, width: w, height: h)
+
+        // Ring exposure gain: matches the plate's brightness/color to THIS frame's actual lighting,
+        // sampled from real (non-hole) pixels only -- matches Android's ringGain.
+        let gain = ringGain(frame: frame, plate: warped, hole: hole)
+
+        // Per-frame grain, scaled by the feather alpha so it fades out through the ring exactly as
+        // Android's does -- never added to untouched real pixels. Sigma is measured from the ACTUAL
+        // residual between this frame's real ring pixels and the plate at the same locations (a
+        // genuine noise estimate, not a fixed guess), clamped to Android's [grainMin, grainMax].
+        let grainSigma = estimateRingGrainSigma(frame: frame, plate: warped, hole: hole)
+
+        var outR = frame.r, outG = frame.g, outB = frame.b
+        for p in 0..<np {
+            let a = ablur[p]
+            if a <= 0 { continue }
+            let pr = min(255, max(0, warped.r[p] * gain.r))
+            let pg = min(255, max(0, warped.g[p] * gain.g))
+            let pb = min(255, max(0, warped.b[p] * gain.b))
+            let nz = grainSigma > 0 ? grainAt(p, frameIndex) * grainSigma * a : 0
+            if a >= 1 {
+                outR[p] = min(255, max(0, pr + nz))
+                outG[p] = min(255, max(0, pg + nz))
+                outB[p] = min(255, max(0, pb + nz))
+            } else {
+                outR[p] = min(255, max(0, frame.r[p] * (1 - a) + pr * a + nz))
+                outG[p] = min(255, max(0, frame.g[p] * (1 - a) + pg * a + nz))
+                outB[p] = min(255, max(0, frame.b[p] * (1 - a) + pb * a + nz))
+            }
+        }
+        return RGBBuffer(r: outR, g: outG, b: outB, width: w, height: h)
+    }
+
+    /// Per-channel exposure gain matching the plate to the real frame, sampled at non-hole pixels
+    /// only, clamped to [0.75, 1.35] -- direct port of Android's `ringGain` (BackgroundInpaint.kt).
+    /// Returns (1,1,1) if fewer than 50 valid samples exist (too little real-pixel context to trust).
+    private static func ringGain(frame: RGBBuffer, plate: RGBBuffer, hole: [Bool]) -> (r: Float, g: Float, b: Float) {
+        var fr = 0.0, fg = 0.0, fb = 0.0, pr = 0.0, pg = 0.0, pb = 0.0
+        var cnt = 0
+        var p = 0
+        while p < hole.count {
+            if !hole[p] {
+                fr += Double(frame.r[p]); fg += Double(frame.g[p]); fb += Double(frame.b[p])
+                pr += Double(plate.r[p]); pg += Double(plate.g[p]); pb += Double(plate.b[p])
+                cnt += 1
+            }
+            p += 4
+        }
+        guard cnt >= 50 else { return (1, 1, 1) }
+        func g(_ a: Double, _ b: Double) -> Float {
+            guard b > 1 else { return 1 }
+            return Float(a / b).clamped(to: 0.75...1.35)
+        }
+        return (g(fr, pr), g(fg, pg), g(fb, pb))
+    }
+
+    /// Per-frame noise sigma measured from the REAL ring around the hole: the residual between this
+    /// frame's actual pixels and the (already gain-matched) warped plate at the same non-hole
+    /// locations. A simpler stand-in for Android's homography-based `staticGrainSigma` (see
+    /// `compositeStaticFrame`'s doc comment) -- still a genuine per-frame measurement, not a fixed
+    /// constant, clamped to the same [grainMin, grainMax] range.
+    private static func estimateRingGrainSigma(frame: RGBBuffer, plate: RGBBuffer, hole: [Bool]) -> Float {
+        var bin = [Int](repeating: 0, count: 768)
+        var cnt = 0
+        var p = 0
+        while p < hole.count {
+            if !hole[p] {
+                let d = abs(frame.r[p] - plate.r[p]) + abs(frame.g[p] - plate.g[p]) + abs(frame.b[p] - plate.b[p])
+                bin[min(767, max(0, Int(d)))] += 1
+                cnt += 1
+            }
+            p += 3
+        }
+        guard cnt >= 500 else { return 0 }
+        var acc = 0, med = 0
+        for v in 0..<768 { acc += bin[v]; if acc * 2 >= cnt { med = v; break } }
+        // Same half-normal rescale Android's estimateGrainSigma uses: median|d| = 0.6745*sigma_d,
+        // sigma_d = sigma_frame*sqrt(2), so sigma_frame = median|d| / (0.6745*sqrt(2)) = median|d| * 1.0483.
+        let sigma = Float(med) / 3.0 * 1.0483
+        return sigma.isFinite ? sigma.clamped(to: grainMin...grainMax) : 0
+    }
+
+    /// Deterministic per-pixel pseudo-noise in roughly [-1, 1], seeded by frame index so the grain
+    /// pattern differs frame to frame (avoiding a static "printed on top" look) while staying
+    /// reproducible -- matches Android's `grainAt` (a fixed lookup table indexed by a hashed
+    /// pixel/frame key). Uses a simple splitmix-style hash rather than porting Android's exact
+    /// 8192-entry table, since the goal (real per-frame texture, not a specific noise distribution)
+    /// doesn't require bit-identical values between platforms.
+    private static func grainAt(_ p: Int, _ frameIndex: Int) -> Float {
+        var h = UInt64(bitPattern: Int64(p) &* -1_640_531_527) ^ UInt64(bitPattern: Int64(frameIndex) &* 0x9E3779B1)
+        h ^= h >> 33; h = h &* 0xff51afd7ed558ccd; h ^= h >> 33
+        return Float(Int64(bitPattern: h) % 2001) / 1000.0 - 1.0
+    }
+
+    /// Separable box blur (2D, edge-clamped average), matching Android's `boxBlur` -- used here for
+    /// the feathered composite alpha ramp.
+    private static func boxBlur2D(_ src: [Float], width: Int, height: Int, radius: Int) -> [Float] {
+        guard radius > 0 else { return src }
+        var tmp = [Float](repeating: 0, count: src.count)
+        for y in 0..<height {
+            let row = y * width
+            for x in 0..<width {
+                var acc: Float = 0; var c = 0
+                var d = -radius
+                while d <= radius {
+                    let xx = x + d
+                    if xx >= 0, xx < width { acc += src[row + xx]; c += 1 }
+                    d += 1
+                }
+                tmp[row + x] = acc / Float(c)
+            }
+        }
+        var out = [Float](repeating: 0, count: src.count)
+        for y in 0..<height {
+            let row = y * width
+            for x in 0..<width {
+                var acc: Float = 0; var c = 0
+                var d = -radius
+                while d <= radius {
+                    let yy = y + d
+                    if yy >= 0, yy < height { acc += tmp[yy * width + x]; c += 1 }
+                    d += 1
+                }
+                out[row + x] = acc / Float(c)
+            }
+        }
+        return out
     }
 
     // MARK: - Motion detection (STATIC vs DYNAMIC self-decision)
@@ -1070,7 +1271,7 @@ enum BackgroundReconstructor {
         // DYNAMIC mode does NOT, by construction).
         let previewPlate = windows.first?.plate ?? colorFrames[0].toFloatRGBBuffer()
         let detail = "devC=\(String(format: "%.1f", traj.devC))px > R_MAX=\(String(format: "%.1f", rMaxW))px -- \(windows.count) window(s), len=\(len) overlap=\(overlap) hop=\(hop)"
-        return Result(plateBeforeLama: previewPlate, core: coreAll, union: unionAll, neverRevealed: coreAll, alignMs: alignMs, trimmedMeanMs: trimmedMeanMs, method: .dynamicWindowed, methodDetail: detail, dynamicWindows: windows, perWindowAlignMs: perWindowMs)
+        return Result(plateBeforeLama: previewPlate, core: coreAll, union: unionAll, neverRevealed: coreAll, alignMs: alignMs, trimmedMeanMs: trimmedMeanMs, method: .dynamicWindowed, methodDetail: detail, dynamicWindows: windows, perWindowAlignMs: perWindowMs, refGray0: [])
     }
 
     /// Aligns every frame within [start, end) to the window's MIDDLE frame

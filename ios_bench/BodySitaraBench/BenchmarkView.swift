@@ -567,25 +567,32 @@ struct BenchmarkView: View {
             // backgroundFinal plate (which represents "what's really
             // behind wherever the person was, aggregated across the whole
             // clip"), everywhere else uses that frame's real pixels.
-            // renderReconFrame for this branch: promote frame i's UInt8
-            // color to Float32 and paste backgroundFinal into its mask
-            // region -- exactly the per-frame computation this branch
-            // always did, just factored out so Loop 3 (Final Compositing)
-            // can call it again later instead of reading back a stored
-            // array. `backgroundFinal` is captured by reference to the
-            // already-assigned `let` above (Swift allows this since it's
-            // definitely-initialized by this point in the branch).
+            // renderReconFrame for this branch: PAPER-QUALITY PARITY FIX
+            // (2026-08-20) -- this used to be a flat, unwarped, ungained,
+            // unfeathered paste of `backgroundFinal` into frame i's mask
+            // region. Compared against Android's `compositeFrames`
+            // (BackgroundInpaint.kt), that skipped four real steps Android
+            // treats as load-bearing for visual quality: per-frame
+            // re-alignment against the plate's reference (corrects THIS
+            // frame's own residual jitter), a feathered blend at the hole
+            // boundary (no hard seam), a per-frame ring exposure gain
+            // (matches the plate's brightness/color to this frame's real
+            // lighting), and per-frame grain (avoids a "too smooth to be
+            // real" tell). `compositeStaticFrame` (BackgroundReconstructor.
+            // swift) now does all four, closing the visible quality gap
+            // reported against the Android S25 Ultra reference on the same
+            // clip. `reconResult.refGray0` is frame 0's grayscale,
+            // captured once when the plate was built (see `Result.
+            // refGray0`'s doc comment) -- re-supplied here rather than
+            // recomputed, since `reconResult` is already in scope.
             renderReconFrame = { i in
-                var outR = colorBuffers[i].r.map { Float($0) }
-                var outG = colorBuffers[i].g.map { Float($0) }
-                var outB = colorBuffers[i].b.map { Float($0) }
-                let frameMask = maskBuffers[i].unpacked().isPerson
-                for p in 0..<(backgroundFinal.width * backgroundFinal.height) where frameMask[p] {
-                    outR[p] = backgroundFinal.r[p]
-                    outG[p] = backgroundFinal.g[p]
-                    outB[p] = backgroundFinal.b[p]
-                }
-                return RGBBuffer(r: outR, g: outG, b: outB, width: backgroundFinal.width, height: backgroundFinal.height)
+                BackgroundReconstructor.compositeStaticFrame(
+                    frame: colorBuffers[i].toFloatRGBBuffer(),
+                    mask: maskBuffers[i].unpacked(),
+                    plate: backgroundFinal,
+                    refGray0: reconResult.refGray0,
+                    frameIndex: i
+                )
             }
 
             // Streams straight to bgWriter instead of building a [CGImage]
